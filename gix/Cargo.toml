@@ -187,7 +187,9 @@ worktree-archive = ["gix-archive", "worktree-stream", "attributes"]
 ## Make `gix-protocol` available along with an async client.
 async-network-client = [
     "gix-protocol/async-client",
+    "gix-protocol/push",
     "gix-pack/streaming-input",
+    "gix-pack/generate",
     "dep:gix-transport",
     "attributes",
     "credentials",
@@ -201,7 +203,9 @@ async-network-client-async-std = [
 ## Make `gix-protocol` available along with a blocking client, providing access to the `file://`, `git://` and `ssh://` transports.
 blocking-network-client = [
     "gix-protocol/blocking-client",
+    "gix-protocol/push",
     "gix-pack/streaming-input",
+    "gix-pack/generate",
     "dep:gix-transport",
     "attributes",
     "credentials",

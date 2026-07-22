@@ -6,6 +6,12 @@ use crate::{
 impl Push {
     /// The `push.default` key
     pub const DEFAULT: Default = Default::new_with_validate("default", &config::Tree::PUSH, validate::Default);
+    /// The `push.thin` key -- push-porcelain fork addition (gpx03/E4), flagged for the upstream PR.
+    pub const THIN: keys::Boolean = keys::Boolean::new_boolean("thin", &config::Tree::PUSH);
+    /// The `push.pushOption` key (multi-valued) -- push-porcelain fork addition (gpx10/E6), flagged for the upstream PR.
+    pub const PUSH_OPTION: keys::String = keys::String::new_string("pushOption", &config::Tree::PUSH);
+    /// The `push.atomic` key -- push-porcelain fork addition (gpx10/E6), flagged for the upstream PR.
+    pub const ATOMIC: keys::Boolean = keys::Boolean::new_boolean("atomic", &config::Tree::PUSH);
 }
 
 impl Section for Push {
@@ -14,7 +20,7 @@ impl Section for Push {
     }
 
     fn keys(&self) -> &[&dyn Key] {
-        &[&Self::DEFAULT]
+        &[&Self::DEFAULT, &Self::THIN, &Self::PUSH_OPTION, &Self::ATOMIC]
     }
 }
 

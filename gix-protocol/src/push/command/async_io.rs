@@ -6,8 +6,9 @@
 //! exists so the command seam is type-checked under `async-client` — the same per-build seam the M0
 //! async spike proved.
 
-use futures_lite::io::AsyncWriteExt;
+use bstr::BString;
 use futures_io::AsyncWrite;
+use futures_lite::io::AsyncWriteExt;
 
 use crate::push::{
     Error, RefUpdate,
@@ -29,6 +30,14 @@ pub(crate) async fn write_command_list<W: AsyncWrite + Unpin>(
             line.extend_from_slice(caps.to_wire_bytes().as_slice());
         }
         w.write_all(&line).await?;
+    }
+    Ok(())
+}
+
+/// Async twin of [`write_push_options`](super::blocking_io::write_push_options) (plan §1.3, M3).
+pub(crate) async fn write_push_options<W: AsyncWrite + Unpin>(w: &mut W, options: &[BString]) -> Result<(), Error> {
+    for option in options {
+        w.write_all(option).await?;
     }
     Ok(())
 }

@@ -61,9 +61,7 @@ impl RefUpdate {
     /// The fully-qualified name this command targets.
     pub fn name(&self) -> &FullName {
         match self {
-            RefUpdate::Create { name, .. }
-            | RefUpdate::Update { name, .. }
-            | RefUpdate::Delete { name, .. } => name,
+            RefUpdate::Create { name, .. } | RefUpdate::Update { name, .. } | RefUpdate::Delete { name, .. } => name,
         }
     }
 
@@ -108,14 +106,19 @@ pub struct Options {
     pub atomic: Atomicity,
     /// Prefer `report-status-v2` when the server advertises it. M1 parses the v1 subset either way.
     pub report_status_v2: bool,
-    /// Push-options to send after the command-list flush. The wire block is an **M3** feature
-    /// (§1.3); in M1 leave this empty — a non-empty value is refused with
-    /// [`Error::MissingServerFeature`](crate::push::Error).
+    /// Push-options to send after the command-list flush (§1.3, M3). Each becomes one pkt-line,
+    /// terminated by the block's own flush before the pack. Requires the server to advertise
+    /// `push-options`: a non-empty value against an unadvertised cap is refused with
+    /// [`Error::MissingServerFeature`](crate::push::Error), never silently dropped (F5). Empty (the
+    /// default) sends no block and echoes no cap, so the push is byte-identical to one without it.
     pub push_options: Vec<BString>,
     /// Echo `quiet` when the server advertises it.
     pub quiet: bool,
-    /// Request `side-band-64k` for the report. An **M3** feature; M1 keeps this `false` so the
-    /// report arrives as plain pkt-lines.
+    /// Request `side-band-64k` for the report (§3.5, M3). When set **and** advertised, the report is
+    /// band-multiplexed (band 1 = report, band 2 = progress, band 3 = remote error) and demuxed by
+    /// the response reader. Opting in against an unadvertised cap is refused with
+    /// [`Error::MissingServerFeature`](crate::push::Error). `false` (the default) keeps the report as
+    /// plain pkt-lines, byte-identical to a push that never negotiates it.
     pub sideband: bool,
 }
 

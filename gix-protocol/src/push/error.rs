@@ -22,10 +22,7 @@ pub enum Error {
         "The server's object-format {server:?} does not match the local object hash kind {local}; \
          refusing before any bytes are sent"
     )]
-    HashKindMismatch {
-        local: gix_hash::Kind,
-        server: BString,
-    },
+    HashKindMismatch { local: gix_hash::Kind, server: BString },
     #[error(transparent)]
     Response(#[from] crate::push::response::Error),
     #[error(transparent)]

@@ -28,9 +28,13 @@ pub mod exclude;
 #[cfg(feature = "blocking-client")]
 pub mod fetch;
 #[cfg(feature = "blocking-client")]
+pub mod push;
+#[cfg(feature = "blocking-client")]
 pub use clone::function::clone;
 #[cfg(feature = "blocking-client")]
 pub use fetch::function::fetch;
+#[cfg(feature = "blocking-client")]
+pub use push::function::push;
 
 pub mod commitgraph;
 mod fsck;

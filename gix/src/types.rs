@@ -262,6 +262,17 @@ pub(crate) struct RemoteDetached {
     pub(crate) url_aliases: Vec<Option<gix_url::Url>>,
     /// Refspecs for use when fetching.
     pub(crate) fetch_specs: Vec<gix_refspec::RefSpec>,
+    // gpx01: detached push state (flagged non-additive for the upstream PR). Constructed by
+    // `From<Remote>` (carrying the multi-URL push state upstream #2696 added) and read by the gpx01
+    // accessors (`push_url()` / `push_refspecs()` in remote/push.rs), mirroring the fetch-side.
+    /// Rewrite aliases for `urls` when used as push fallbacks (pushInsteadOf), one-for-one with `urls`.
+    pub(crate) url_push_aliases: Vec<Option<gix_url::Url>>,
+    /// The explicit urls to use specifically for pushing, in configuration order.
+    pub(crate) push_urls: Vec<gix_url::Url>,
+    /// Rewrite aliases corresponding one-for-one with explicit `push_urls`.
+    pub(crate) push_url_aliases: Vec<Option<gix_url::Url>>,
+    /// Refspecs for use when pushing.
+    pub(crate) push_specs: Vec<gix_refspec::RefSpec>,
     /// Tell us what to do with tags when fetched.
     pub(crate) fetch_tags: remote::fetch::Tags,
 }

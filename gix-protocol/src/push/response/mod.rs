@@ -19,6 +19,16 @@ mod blocking_io;
 #[cfg(feature = "blocking-client")]
 pub(crate) use blocking_io::parse;
 
+#[cfg(feature = "async-client")]
+mod async_io;
+#[cfg(feature = "async-client")]
+pub(crate) use async_io::parse;
+
+/// The progress id for the `remote` child progress a side-band-64k report demux routes band 2 (and
+/// band 3, as an error) into (§3.5, M3) — the push analogue of fetch's `ProgressId::RemoteProgress`.
+#[allow(dead_code)] // consumed by the sideband reader twins only
+pub(crate) const REMOTE_PROGRESS_ID: gix_features::progress::Id = *b"PSRP";
+
 /// Extra per-ref detail from report-status-v2 `option` lines — informational, never branched on.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RefUpdateDetails {
@@ -76,7 +86,7 @@ pub fn classify(reason: &BStr) -> RefRejectReason {
 /// `lines` are the payloads between the request and the terminating flush-pkt (trailing LFs are
 /// tolerated). `sent` is the command list, used to correlate reported names and to detect a missing
 /// per-ref status. Returns the unpack status and one [`RefUpdateStatus`] per reported ref.
-#[allow(dead_code)] // consumed by the M3 async orchestrator; the M1 reader is blocking-only
+#[allow(dead_code)] // consumed by both reader twins (blocking_io + async_io); allow covers the push-only (no client feature) build
 pub(crate) fn parse_report(
     lines: &[BString],
     sent: &[RefUpdate],
@@ -85,9 +95,7 @@ pub(crate) fn parse_report(
     let first = iter.next().ok_or(Error::MissingUnpackStatus)?;
     let unpack = {
         let payload = trimmed(first);
-        let rest = payload
-            .strip_prefix(b"unpack ")
-            .ok_or(Error::MissingUnpackStatus)?;
+        let rest = payload.strip_prefix(b"unpack ").ok_or(Error::MissingUnpackStatus)?;
         if rest == b"ok" {
             UnpackStatus::Ok
         } else {
@@ -130,24 +138,70 @@ pub(crate) fn parse_report(
     for update in sent {
         let name = update.name().as_bstr();
         if !statuses.iter().any(|s| status_name(s) == name) {
-            return Err(Error::MissingRefStatus {
-                name: name.to_owned(),
-            });
+            return Err(Error::MissingRefStatus { name: name.to_owned() });
         }
     }
     for status in &statuses {
         let name = status_name(status);
         if !sent.iter().any(|u| u.name().as_bstr() == name) {
-            return Err(Error::MissingRefStatus {
-                name: name.to_owned(),
-            });
+            return Err(Error::MissingRefStatus { name: name.to_owned() });
         }
     }
 
     Ok((unpack, statuses))
 }
 
-#[allow(dead_code)] // consumed by the M3 async orchestrator; the M1 reader is blocking-only
+/// Split a raw byte stream into pkt-line payloads, stopping at the first flush-pkt (§3.5, M3).
+///
+/// When `side-band-64k` is negotiated the server multiplexes the report onto band 1, so the reader
+/// hands back the band-1 payload as an opaque byte stream — a sequence of report pkt-lines the reader
+/// no longer splits for us (unlike the plain path, where each `readline_str` is one pkt-line). This
+/// re-frames that stream: `<4-hex-len><payload>` repeated, a `0000` flush-pkt ends the report, and a
+/// non-data length (`0001`/`0002`) is skipped. Payloads keep their trailing LF (the shared
+/// [`parse_report`] trims it, exactly as on the plain path).
+#[allow(dead_code)] // consumed by the sideband reader twins (blocking_io + async_io)
+pub(crate) fn split_report_pkt_lines(buf: &[u8]) -> Result<Vec<BString>, Error> {
+    let mut lines = Vec::new();
+    let mut pos = 0usize;
+    let mut terminated = false;
+    while pos + 4 <= buf.len() {
+        let len = parse_hex4(&buf[pos..pos + 4]).ok_or_else(|| Error::Malformed {
+            line: buf[pos..pos + 4].into(),
+        })?;
+        if len == 0 {
+            terminated = true;
+            break; // flush-pkt terminates the report
+        }
+        if len < 4 {
+            pos += 4; // delimiter / response-end special pkt — not part of the report
+            continue;
+        }
+        if pos + len > buf.len() {
+            return Err(Error::Malformed {
+                line: buf[pos..].into(),
+            });
+        }
+        lines.push(buf[pos + 4..pos + len].into());
+        pos += len;
+    }
+    // 1-3 trailing bytes with no terminating flush-pkt = a truncated band-1 stream; surface it as
+    // Malformed instead of silently shortening the report (review: glm LOW x2).
+    if !terminated && pos < buf.len() {
+        return Err(Error::Malformed {
+            line: buf[pos..].into(),
+        });
+    }
+    Ok(lines)
+}
+
+#[allow(dead_code)] // consumed by split_report_pkt_lines (sideband path only)
+fn parse_hex4(bytes: &[u8]) -> Option<usize> {
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|s| usize::from_str_radix(s, 16).ok())
+}
+
+#[allow(dead_code)] // consumed by both reader twins (blocking_io + async_io); allow covers the push-only (no client feature) build
 fn status_name(status: &RefUpdateStatus) -> &BStr {
     match status {
         RefUpdateStatus::Ok { name, .. } | RefUpdateStatus::Rejected { name, .. } => name.as_bstr(),
@@ -155,7 +209,7 @@ fn status_name(status: &RefUpdateStatus) -> &BStr {
 }
 
 /// Strip a single trailing `\n` (and `\r`) that report-status lines carry.
-#[allow(dead_code)] // consumed by the M3 async orchestrator; the M1 reader is blocking-only
+#[allow(dead_code)] // consumed by both reader twins (blocking_io + async_io); allow covers the push-only (no client feature) build
 fn trimmed(line: &BString) -> &[u8] {
     let mut s = line.as_slice();
     if let Some(stripped) = s.strip_suffix(b"\n") {
@@ -167,7 +221,7 @@ fn trimmed(line: &BString) -> &[u8] {
     s
 }
 
-#[allow(dead_code)] // consumed by the M3 async orchestrator; the M1 reader is blocking-only
+#[allow(dead_code)] // consumed by both reader twins (blocking_io + async_io); allow covers the push-only (no client feature) build
 fn split_once_space(payload: &[u8]) -> (&[u8], &[u8]) {
     match payload.iter().position(|b| *b == b' ') {
         Some(pos) => (&payload[..pos], &payload[pos + 1..]),
@@ -177,7 +231,7 @@ fn split_once_space(payload: &[u8]) -> (&[u8], &[u8]) {
 
 // `rest` is already trailing-LF-trimmed by `trimmed()` in the caller, so the oid bytes need no
 // further stripping.
-#[allow(dead_code)] // consumed by the M3 async orchestrator; the M1 reader is blocking-only
+#[allow(dead_code)] // consumed by both reader twins (blocking_io + async_io); allow covers the push-only (no client feature) build
 fn apply_option(details: &mut RefUpdateDetails, rest: &[u8]) {
     let rest = rest.as_bstr();
     if let Some(oid) = rest.strip_prefix(b"old-oid ") {

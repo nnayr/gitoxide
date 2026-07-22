@@ -55,7 +55,11 @@ mod push {
                 ok_report(REF),
             );
             let cmd = scan_command_list(&sent);
-            assert_eq!(cmd.triples(), once(expected), "our create triple == git's, byte for byte");
+            assert_eq!(
+                cmd.triples(),
+                once(expected),
+                "our create triple == git's, byte for byte"
+            );
             assert_eq!(cmd.lines_with_caps(), 1, "capabilities appear on the FIRST line only");
         }
 
@@ -73,7 +77,11 @@ mod push {
 
             let git_triples = git_push_triples(&src, &oracle, &format!("{b_hex}:{REF}"));
             let expected = format!("{a_hex} {b_hex} {REF}");
-            assert_eq!(git_triples, once(expected.clone()), "git's own update triple is the oracle");
+            assert_eq!(
+                git_triples,
+                once(expected.clone()),
+                "git's own update triple is the oracle"
+            );
 
             let sent = run_push_capture(
                 caps("report-status ofs-delta object-format=sha1"),
@@ -82,7 +90,11 @@ mod push {
                 dummy_pack(),
                 ok_report(REF),
             );
-            assert_eq!(scan_command_list(&sent).triples(), once(expected), "our update triple == git's");
+            assert_eq!(
+                scan_command_list(&sent).triples(),
+                once(expected),
+                "our update triple == git's"
+            );
         }
 
         /// A `delete` command triple (old-oid → zero) byte-matches git's own, and sends NO pack.
@@ -98,7 +110,11 @@ mod push {
 
             let git_triples = git_push_triples(&src, &oracle, &format!(":{REF}"));
             let expected = format!("{a_hex} {} {REF}", zeros(40));
-            assert_eq!(git_triples, once(expected.clone()), "git's own delete triple is the oracle");
+            assert_eq!(
+                git_triples,
+                once(expected.clone()),
+                "git's own delete triple is the oracle"
+            );
 
             let sent = run_push_capture(
                 caps("report-status delete-refs ofs-delta object-format=sha1"),
@@ -173,6 +189,109 @@ mod push {
     }
 
     // -----------------------------------------------------------------------------------------
+    // push::full_name_ctor — FullName rejects framing-hostile names at construction (§6.2:820)
+    // -----------------------------------------------------------------------------------------
+    mod full_name_ctor {
+        /// `FullName::try_from` REJECTS names carrying a space or a NUL — the §6.2:820 negative
+        /// obligation. Both are invalid ref bytes (`gix-validate`), so a validated
+        /// [`RefUpdate::name`](gix_protocol::push::RefUpdate) can never smuggle either into the
+        /// `command NUL capability-list` framing (types.rs): the space would split the triple and the
+        /// NUL would forge the caps boundary. This is the construction-time guard the encoder relies
+        /// on, asserted directly (every other suite only ever builds VALID names).
+        #[test]
+        fn rejects_space_and_nul_bearing_names() {
+            assert!(
+                gix_ref::FullName::try_from("refs/a b").is_err(),
+                "a space is an invalid ref byte — rejected at construction, so it can never split a triple"
+            );
+            assert!(
+                gix_ref::FullName::try_from("refs/a\0b").is_err(),
+                "a NUL is an invalid ref byte — rejected at construction, so it can never forge the caps boundary"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // push::capability_echo — opt-in caps appear on the wire on their SUCCESS paths (§3.4)
+    // -----------------------------------------------------------------------------------------
+    mod capability_echo {
+        use crate::support::*;
+        use gix_protocol::push::{Atomicity, Options};
+
+        fn a() -> gix_hash::ObjectId {
+            oid_sha1("1234123412341234123412341234123412341234")
+        }
+
+        /// `quiet` is echoed when `Options.quiet` is set AND the server advertised it
+        /// (command/mod.rs:114-116) — the opt-in success path (the opt-OUT default, no `quiet`, rides
+        /// every other golden).
+        #[test]
+        fn quiet_echoed_when_opted_in_and_advertised() {
+            let opts = Options {
+                quiet: true,
+                ..Default::default()
+            };
+            let sent = run_push_capture_opts(
+                caps("report-status quiet object-format=sha1"),
+                advertise(&[]),
+                &[create(REF, &a())],
+                dummy_pack(),
+                ok_report(REF),
+                opts,
+            );
+            assert!(
+                scan_command_list(&sent).first_line_caps().contains("quiet"),
+                "quiet is echoed when opted in and advertised"
+            );
+        }
+
+        /// `atomic` is echoed under `Atomicity::WhenAdvertised` when the server advertised the cap
+        /// (command/mod.rs:120-124) — the success side of the advertised branch.
+        #[test]
+        fn atomic_echoed_under_when_advertised_and_advertised() {
+            let opts = Options {
+                atomic: Atomicity::WhenAdvertised,
+                ..Default::default()
+            };
+            let sent = run_push_capture_opts(
+                caps("report-status atomic object-format=sha1"),
+                advertise(&[]),
+                &[create(REF, &a())],
+                dummy_pack(),
+                ok_report(REF),
+                opts,
+            );
+            assert!(
+                scan_command_list(&sent).first_line_caps().contains("atomic"),
+                "atomic is echoed under WhenAdvertised when the server advertised it"
+            );
+        }
+
+        /// `atomic` is echoed (and the push SUCCEEDS) under `Atomicity::Required` when the server
+        /// advertised the cap (command/mod.rs:125-133 success path) — complements the
+        /// Required-WITHOUT-cap failure test in `empty_and_shapes`.
+        #[test]
+        fn atomic_echoed_under_required_when_advertised() {
+            let opts = Options {
+                atomic: Atomicity::Required,
+                ..Default::default()
+            };
+            let sent = run_push_capture_opts(
+                caps("report-status atomic object-format=sha1"),
+                advertise(&[]),
+                &[create(REF, &a())],
+                dummy_pack(),
+                ok_report(REF),
+                opts,
+            );
+            assert!(
+                scan_command_list(&sent).first_line_caps().contains("atomic"),
+                "atomic is echoed on the Required success path when the server advertised it"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
     // push::empty_and_shapes — early refusals are Err VALUES, before any wire bytes (F2, F5)
     // -----------------------------------------------------------------------------------------
     mod empty_and_shapes {
@@ -182,15 +301,20 @@ mod push {
         #[test]
         fn empty_updates_is_no_commands() {
             let (err, sent) = run_push_err(caps("report-status"), advertise(&[]), &[], no_report());
-            assert!(matches!(err, Error::NoCommands), "push(&[]) -> Error::NoCommands, got {err:?}");
+            assert!(
+                matches!(err, Error::NoCommands),
+                "push(&[]) -> Error::NoCommands, got {err:?}"
+            );
             assert!(sent.is_empty(), "no bytes written for an empty command list");
         }
 
         #[test]
         fn push_options_without_cap_is_missing_server_feature() {
             let a = oid_sha1("1234123412341234123412341234123412341234");
-            let mut opts = gix_protocol::push::Options::default();
-            opts.push_options = vec!["do-thing".into()];
+            let opts = gix_protocol::push::Options {
+                push_options: vec!["do-thing".into()],
+                ..Default::default()
+            };
             let (err, sent) = run_push_err_opts(
                 caps("report-status"), // no push-options advertised
                 advertise(&[]),
@@ -217,7 +341,13 @@ mod push {
                 no_report(),
             );
             assert!(
-                matches!(err, Error::MissingServerFeature { feature: "delete-refs", .. }),
+                matches!(
+                    err,
+                    Error::MissingServerFeature {
+                        feature: "delete-refs",
+                        ..
+                    }
+                ),
                 "delete without delete-refs -> MissingServerFeature, got {err:?}"
             );
         }
@@ -225,8 +355,10 @@ mod push {
         #[test]
         fn atomicity_required_without_cap_is_missing_server_feature() {
             let a = oid_sha1("1234123412341234123412341234123412341234");
-            let mut opts = gix_protocol::push::Options::default();
-            opts.atomic = gix_protocol::push::Atomicity::Required;
+            let opts = gix_protocol::push::Options {
+                atomic: gix_protocol::push::Atomicity::Required,
+                ..Default::default()
+            };
             let (err, _sent) = run_push_err_opts(
                 caps("report-status"), // no atomic
                 advertise(&[]),
@@ -240,21 +372,32 @@ mod push {
             );
         }
 
+        /// Opting into side-band-64k when the server did NOT advertise it is refused (never silently
+        /// ignored), before any bytes hit the wire. (The advertised-and-negotiated success path is an
+        /// M3 feature law, proven in `push_m3feat`/`push_m3`.)
         #[test]
-        fn sideband_opt_in_is_missing_server_feature() {
+        fn sideband_opt_in_without_cap_is_missing_server_feature() {
             let a = oid_sha1("1234123412341234123412341234123412341234");
-            let mut opts = gix_protocol::push::Options::default();
-            opts.sideband = true;
+            let opts = gix_protocol::push::Options {
+                sideband: true,
+                ..Default::default()
+            };
             let (err, sent) = run_push_err_opts(
-                caps("report-status side-band-64k"),
+                caps("report-status"), // side-band-64k NOT advertised
                 advertise(&[]),
                 &[create(REF, &a)],
                 no_report(),
                 opts,
             );
             assert!(
-                matches!(err, Error::MissingServerFeature { feature: "side-band-64k", .. }),
-                "Options::sideband is refused, not silently ignored, got {err:?}"
+                matches!(
+                    err,
+                    Error::MissingServerFeature {
+                        feature: "side-band-64k",
+                        ..
+                    }
+                ),
+                "opting into side-band-64k without the cap is refused, not silently ignored, got {err:?}"
             );
             assert!(sent.is_empty(), "refused before any bytes hit the wire");
         }
@@ -294,7 +437,10 @@ mod push {
             );
             let cmd = scan_command_list(&sent);
             assert_eq!(cmd.flushes, 1, "delete-only sends EXACTLY one flush-pkt");
-            assert!(cmd.pack.is_none(), "delete-only sends no pack (no bytes after the flush)");
+            assert!(
+                cmd.pack.is_none(),
+                "delete-only sends no pack (no bytes after the flush)"
+            );
         }
 
         #[test]
@@ -308,9 +454,16 @@ mod push {
                 ok_report(REF),
             );
             let cmd = scan_command_list(&sent);
-            assert_eq!(cmd.flushes, 1, "exactly one flush terminates the command list before the pack");
+            assert_eq!(
+                cmd.flushes, 1,
+                "exactly one flush terminates the command list before the pack"
+            );
             let pack = cmd.pack.expect("a create sends a pack");
-            assert_eq!(&pack[..4], b"PACK", "the raw pack follows immediately after the single flush");
+            assert_eq!(
+                &pack[..4],
+                b"PACK",
+                "the raw pack follows immediately after the single flush"
+            );
         }
     }
 
@@ -384,7 +537,7 @@ mod push {
             assert_eq!(adv.boundary, Some(a), "boundary is OUR ref's advertised oid");
             assert!(adv.thin_bases.contains(&a), "thin_bases is the full advertised set");
             assert!(
-                adv.boundary.map_or(true, |bnd| adv.thin_bases.contains(&bnd)),
+                adv.boundary.is_none_or(|bnd| adv.thin_bases.contains(&bnd)),
                 "INVARIANT: boundary ∈ thin_bases when Some"
             );
         }
@@ -463,6 +616,113 @@ mod push {
             assert!(adv.thin_bases.contains(&c), "the foreign head oid is a thin base");
             assert!(adv.thin_bases.contains(&a), "our ref oid is also a thin base");
         }
+
+        /// An annotated-tag advertisement is a `Ref::Peeled` whose STORED value is the tag oid, not
+        /// the peeled commit. A force-with-lease UPDATE must compare `expected_old` against the TAG
+        /// oid — leasing against the peeled commit is a false [`StaleLease`] (rolfdb-gpx00).
+        #[test]
+        fn annotated_tag_update_leases_against_tag_oid_not_peeled_commit() {
+            let tag = oid_sha1("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+            let commit = oid_sha1("cccccccccccccccccccccccccccccccccccccccc");
+            let new = oid_sha1("2222222222222222222222222222222222222222");
+            let hs = handshake(caps("report-status"), vec![peeled(REF, &tag, &commit)]);
+
+            // expected_old == the TAG oid (the ref's real value) → the lease holds, update validates.
+            let adv = plan_from_advertisement(&[update(REF, &tag, &new)], &hs).expect("lease matches the tag oid");
+            assert_eq!(
+                adv.boundary,
+                Some(tag),
+                "boundary is the advertised TAG oid, not the peeled commit"
+            );
+            assert!(
+                adv.thin_bases.contains(&tag) && adv.thin_bases.contains(&commit),
+                "advertised_oids audit: BOTH the tag and its peeled commit are server-known thin bases"
+            );
+
+            // expected_old == the PEELED commit oid → stale (the ref does not point AT the commit).
+            let err = plan_from_advertisement(&[update(REF, &commit, &new)], &hs).unwrap_err();
+            assert!(
+                matches!(err, ValidateError::StaleLease { actual: Some(act), expected: Some(exp), .. } if act == tag && exp == commit),
+                "leasing an annotated tag against its peeled commit is stale; actual is the tag oid, got {err:?}"
+            );
+        }
+
+        /// The delete twin of the above: a force-with-lease DELETE of an annotated tag leases against
+        /// the tag oid, and leasing against the peeled commit is stale (rolfdb-gpx00).
+        #[test]
+        fn annotated_tag_delete_leases_against_tag_oid_not_peeled_commit() {
+            let tag = oid_sha1("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+            let commit = oid_sha1("cccccccccccccccccccccccccccccccccccccccc");
+            let hs = handshake(caps("report-status"), vec![peeled(REF, &tag, &commit)]);
+
+            // delete leasing against the tag oid (the ref's real value) validates.
+            plan_from_advertisement(&[delete(REF, &tag)], &hs).expect("delete leases against the tag oid");
+
+            // delete leasing against the peeled commit is a false lease → stale.
+            let err = plan_from_advertisement(&[delete(REF, &commit)], &hs).unwrap_err();
+            assert!(
+                matches!(err, ValidateError::StaleLease { actual: Some(act), expected: Some(exp), .. } if act == tag && exp == commit),
+                "deleting an annotated tag leased against its peeled commit is stale, got {err:?}"
+            );
+        }
+
+        /// A symbolic ref resolving through an annotated tag advertises as `Ref::Symbolic { tag:
+        /// Some(..), object }` — the same law as `Ref::Peeled`: its STORED value (what it directly
+        /// refers to) is the TAG oid, not the peeled commit (`Ref::unpack` returns
+        /// `tag.unwrap_or(object)`). A force-with-lease UPDATE must compare `expected_old` against
+        /// the TAG oid; leasing against the peeled commit is a false [`StaleLease`]
+        /// (rolfdb-gpx00b, the `Symbolic` sibling of rolfdb-gpx00).
+        #[test]
+        fn symref_to_annotated_tag_update_leases_against_tag_oid_not_peeled_commit() {
+            let tag = oid_sha1("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+            let commit = oid_sha1("cccccccccccccccccccccccccccccccccccccccc");
+            let new = oid_sha1("2222222222222222222222222222222222222222");
+            let hs = handshake(
+                caps("report-status"),
+                vec![symref_tag("HEAD", "refs/tags/v1", &tag, &commit)],
+            );
+
+            // expected_old == the TAG oid (the symref's real value) → the lease holds, update validates.
+            let adv = plan_from_advertisement(&[update("HEAD", &tag, &new)], &hs).expect("lease matches the tag oid");
+            assert_eq!(
+                adv.boundary,
+                Some(tag),
+                "boundary is the advertised TAG oid, not the peeled commit"
+            );
+            assert!(
+                adv.thin_bases.contains(&tag) && adv.thin_bases.contains(&commit),
+                "advertised_oids audit: BOTH the tag and its peeled commit are server-known thin bases"
+            );
+
+            // expected_old == the PEELED commit oid → stale (the symref does not point AT the commit).
+            let err = plan_from_advertisement(&[update("HEAD", &commit, &new)], &hs).unwrap_err();
+            assert!(
+                matches!(err, ValidateError::StaleLease { actual: Some(act), expected: Some(exp), .. } if act == tag && exp == commit),
+                "leasing a symref-to-annotated-tag against its peeled commit is stale; actual is the tag oid, got {err:?}"
+            );
+        }
+
+        /// The delete twin: a force-with-lease DELETE of a symref-to-annotated-tag leases against the
+        /// tag oid, and leasing against the peeled commit is stale (rolfdb-gpx00b).
+        #[test]
+        fn symref_to_annotated_tag_delete_leases_against_tag_oid_not_peeled_commit() {
+            let tag = oid_sha1("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+            let commit = oid_sha1("cccccccccccccccccccccccccccccccccccccccc");
+            let hs = handshake(
+                caps("report-status"),
+                vec![symref_tag("HEAD", "refs/tags/v1", &tag, &commit)],
+            );
+
+            // delete leasing against the tag oid (the symref's real value) validates.
+            plan_from_advertisement(&[delete("HEAD", &tag)], &hs).expect("delete leases against the tag oid");
+
+            // delete leasing against the peeled commit is a false lease → stale.
+            let err = plan_from_advertisement(&[delete("HEAD", &commit)], &hs).unwrap_err();
+            assert!(
+                matches!(err, ValidateError::StaleLease { actual: Some(act), expected: Some(exp), .. } if act == tag && exp == commit),
+                "deleting a symref-to-annotated-tag leased against its peeled commit is stale, got {err:?}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------------------------
@@ -502,9 +762,17 @@ mod push {
             ] {
                 let report = report_lines(&["unpack ok", &format!("ng {REF} {reason}")]);
                 let out = push_delete_with_report(report).expect("ng report parses");
-                assert_eq!(out.unpack_status, UnpackStatus::Ok, "unpack still ok for a ref-level ng");
+                assert_eq!(
+                    out.unpack_status,
+                    UnpackStatus::Ok,
+                    "unpack still ok for a ref-level ng"
+                );
                 match &out.refs[0] {
-                    RefUpdateStatus::Rejected { name, reason: got, class: got_class } => {
+                    RefUpdateStatus::Rejected {
+                        name,
+                        reason: got,
+                        class: got_class,
+                    } => {
                         assert_eq!(name, REF);
                         assert_eq!(got, reason.as_bytes(), "reason preserved VERBATIM");
                         assert_eq!(*got_class, class, "class is the advisory classification");
@@ -550,7 +818,10 @@ mod push {
             let report = report_lines(&["unpack ok"]);
             let err = push_delete_with_report(report).unwrap_err();
             assert!(
-                matches!(err, Error::Response(gix_protocol::push::response::Error::MissingRefStatus { .. })),
+                matches!(
+                    err,
+                    Error::Response(gix_protocol::push::response::Error::MissingRefStatus { .. })
+                ),
                 "a sent command with no reported status -> MissingRefStatus, got {err:?}"
             );
         }
@@ -565,8 +836,76 @@ mod push {
             let report = report_lines(&["garbage line with no unpack"]);
             let err = push_delete_with_report(report).unwrap_err();
             assert!(
-                matches!(err, Error::Response(gix_protocol::push::response::Error::MissingUnpackStatus)),
+                matches!(
+                    err,
+                    Error::Response(gix_protocol::push::response::Error::MissingUnpackStatus)
+                ),
                 "a report without an unpack line -> MissingUnpackStatus, got {err:?}"
+            );
+        }
+
+        /// The REVERSE correlation branch (`response/mod.rs:144-149`): a server that reports a status
+        /// for a ref we NEVER sent is `Error::Response(MissingRefStatus)`. Reporting `ok {REF}` first
+        /// makes the FORWARD check (every sent ref has a status) pass, so it is specifically the
+        /// reverse (server-reported-unsent-name) branch that fires — proven by the error naming the
+        /// UNSENT ref, not our REF. The only-previously-tested branch was the forward one
+        /// (`missing_per_ref_status_is_error`). `parse_report` is transport-generic and shared by the
+        /// async reader (`response/mod.rs`), so this pure-core law needs no async duplicate.
+        #[test]
+        fn reported_status_for_unsent_ref_is_error() {
+            let report = report_lines(&["unpack ok", &format!("ok {REF}"), "ok refs/rolfdb/other"]);
+            match push_delete_with_report(report).unwrap_err() {
+                Error::Response(gix_protocol::push::response::Error::MissingRefStatus { name }) => {
+                    assert_eq!(
+                        name, "refs/rolfdb/other",
+                        "the reverse branch names the server-reported ref that was never sent, not our REF"
+                    );
+                }
+                other => panic!("expected Response(MissingRefStatus) for an unsent reported ref, got {other:?}"),
+            }
+        }
+
+        /// Report MUTATION sweep (testplan G12/L3): a deterministic, RNG-free single-byte sweep over a
+        /// well-formed `ok_report(REF)` — EVERY byte position × EVERY alternative value — must never
+        /// panic the parser. The invariant is panic-freedom, not universal rejection: the parser is
+        /// deliberately lenient (unknown lines are tolerated for forward-compat, §response) and models
+        /// the `unpack` line as a VALUE not an error channel, so a handful of single-byte mutants
+        /// (e.g. corrupting the `ok` of `unpack ok` into an `unpack <err>` value while our sent REF is
+        /// still reported) legitimately parse to a well-formed `Outcome`. Wherever a mutation breaks
+        /// the pkt-line framing or the ref correlation the result is additionally an `Err` — the sweep
+        /// asserts BOTH populations are non-empty, so it is a real robustness probe, not a trivial
+        /// accept/reject. No proptest dep; a full single-byte sweep needs no seed. Shares
+        /// `parse_report` with the async reader, so no async duplicate.
+        #[test]
+        fn single_byte_report_mutations_never_panic() {
+            let pristine = ok_report(REF);
+            // Control: the un-mutated report is a clean parse, so any Err below is a mutation's doing.
+            push_delete_with_report(pristine.clone()).expect("the pristine ok_report parses");
+
+            let (mut errored, mut parsed) = (0usize, 0usize);
+            for pos in 0..pristine.len() {
+                let original = pristine[pos];
+                for byte in 0..=u8::MAX {
+                    if byte == original {
+                        continue;
+                    }
+                    let mut mutant = pristine.clone();
+                    mutant[pos] = byte;
+                    match std::panic::catch_unwind(move || push_delete_with_report(mutant)) {
+                        Ok(Ok(_)) => parsed += 1,
+                        Ok(Err(_)) => errored += 1,
+                        Err(_) => panic!(
+                            "report parser PANICKED on a single-byte mutation: pos={pos} \
+                             original={original:#04x} mutated={byte:#04x} (report len {})",
+                            pristine.len()
+                        ),
+                    }
+                }
+            }
+            assert!(errored > 0, "some mutations must break framing/correlation into an Err");
+            assert!(
+                parsed > 0,
+                "the lenient parser tolerates some single-byte mutations (the unpack line is a value)"
             );
         }
     }
@@ -589,7 +928,11 @@ mod push {
             let a = oid_sha1(&a_hex);
             let full_pack = git_pack(&src, &[a_hex.as_str()], &[]);
             let out = push_over_file(&remote, &[create(REF, &a)], Some(full_pack));
-            assert_eq!(out.unpack_status, gix_protocol::push::UnpackStatus::Ok, "create accepted");
+            assert_eq!(
+                out.unpack_status,
+                gix_protocol::push::UnpackStatus::Ok,
+                "create accepted"
+            );
             assert_eq!(remote_ref(&remote, REF), a_hex, "ref created at A");
 
             // Seed a foreign head on the remote so the next advertisement carries an unrelated oid.
@@ -602,10 +945,13 @@ mod push {
             let b_hex = commit_file(&src, "a.txt", "two");
             let b = oid_sha1(&b_hex);
             let hs = handshake_over_file(&remote);
-            let adv = gix_protocol::push::plan_from_advertisement(&[update(REF, &a, &b)], &hs)
-                .expect("lease matches A");
+            let adv =
+                gix_protocol::push::plan_from_advertisement(&[update(REF, &a, &b)], &hs).expect("lease matches A");
             assert_eq!(adv.boundary, Some(a), "boundary is our ref (A), not the foreign head");
-            assert!(adv.thin_bases.contains(&c), "the foreign refs/heads/main oid is a thin base");
+            assert!(
+                adv.thin_bases.contains(&c),
+                "the foreign refs/heads/main oid is a thin base"
+            );
 
             // The incremental pack (B minus the A boundary) carries FEWER objects than a full B pack:
             // it excludes A's history — the F1 walk realized by the caller.
@@ -619,8 +965,72 @@ mod push {
             );
 
             let out = push_over_file(&remote, &[update(REF, &a, &b)], Some(incremental));
-            assert_eq!(out.unpack_status, gix_protocol::push::UnpackStatus::Ok, "incremental update accepted");
+            assert_eq!(
+                out.unpack_status,
+                gix_protocol::push::UnpackStatus::Ok,
+                "incremental update accepted"
+            );
             assert_eq!(remote_ref(&remote, REF), b_hex, "ref advanced to B");
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // push::file_annotated_tag — real git-receive-pack over file://: force-with-lease DELETE of an
+    // annotated tag (FOLLOWUPS §1 residual; the integration companion to the gpx00 unit lease tests)
+    // -----------------------------------------------------------------------------------------
+    mod file_annotated_tag {
+        use crate::support::*;
+
+        /// A force-with-lease DELETE of an ANNOTATED tag over a real `git-receive-pack` (file://):
+        /// the lease is against the tag OBJECT oid (the ref's advertised stored value), so
+        /// `plan_from_advertisement` validates it and the server removes the ref. `gpx00` proved the
+        /// annotated-tag lease law only at the unit level (against a constructed advertisement,
+        /// `push_m1.rs::validate`); this is the live-server integration FOLLOWUPS §1 named — a direct
+        /// `plan_from_advertisement` + `push()` caller against a real annotated tag.
+        #[test]
+        fn delete_over_file_leases_against_tag_oid_and_removes_ref() {
+            let base = Scratch::new();
+            let (src, remote) = (base.join("src"), base.join("remote.git"));
+            init_bare(&base, &remote);
+            init_work(&base, &src);
+
+            // Commit, annotate it (a real tag OBJECT), and push the tag + its objects to the remote.
+            let commit_hex = commit_file(&src, "a.txt", "one");
+            let tag_hex = tag_annotated(&src, "v1");
+            assert_ne!(
+                tag_hex, commit_hex,
+                "an annotated tag is its own object, distinct from the commit it peels to"
+            );
+            push_git(&src, &remote, "refs/tags/v1:refs/tags/v1");
+            assert_eq!(
+                remote_ref(&remote, "refs/tags/v1"),
+                tag_hex,
+                "the remote ref stores the annotated-tag object oid"
+            );
+            let tag = oid_sha1(&tag_hex);
+
+            // Lease against the TAG oid (the ref's stored value): plan_from_advertisement must accept
+            // it — leasing the peeled commit would be a false StaleLease (the gpx00 bug).
+            let hs = handshake_over_file(&remote);
+            let adv = gix_protocol::push::plan_from_advertisement(&[delete("refs/tags/v1", &tag)], &hs)
+                .expect("delete leases against the advertised tag oid");
+            assert!(adv.boundary.is_none(), "a delete has no walk boundary");
+            assert!(
+                adv.thin_bases.contains(&tag),
+                "the advertised tag oid is a server-known thin base"
+            );
+
+            // Drive the delete through a real receive-pack: unpack ok and the ref is gone.
+            let out = push_over_file(&remote, &[delete("refs/tags/v1", &tag)], None);
+            assert_eq!(
+                out.unpack_status,
+                gix_protocol::push::UnpackStatus::Ok,
+                "the server accepted the tag delete"
+            );
+            assert!(
+                !remote_has_ref(&remote, "refs/tags/v1"),
+                "the annotated tag ref was removed on the server"
+            );
         }
     }
 }

@@ -49,6 +49,10 @@ pub mod init;
 ///
 pub mod fetch;
 
+/// Push support (porcelain), sibling of [`fetch`]. -- gpx-p0 porcelain skeleton, additive module gate.
+#[cfg(any(feature = "async-network-client", feature = "blocking-network-client"))]
+pub mod push;
+
 ///
 #[cfg(any(feature = "async-network-client", feature = "blocking-network-client"))]
 pub mod connect;

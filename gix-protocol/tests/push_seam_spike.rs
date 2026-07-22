@@ -164,7 +164,11 @@ fn m0_write_seam_create_over_file() {
     line.extend_from_slice(b"report-status");
     // Byte-level self-check: the command triple carries NO trailing LF; the byte right after the
     // ref name is the NUL (0x00), never 0x0A. This is the client half of the trailing-LF question.
-    assert_eq!(line[triple.len()], 0x00, "NUL directly follows the ref name (no trailing LF)");
+    assert_eq!(
+        line[triple.len()],
+        0x00,
+        "NUL directly follows the ref name (no trailing LF)"
+    );
     assert!(!line[..triple.len()].contains(&0x0A), "command triple contains no LF");
 
     // --- drive the real transport: request(Binary) → command → flush → into_parts → pack → drop → read ---
@@ -209,7 +213,10 @@ fn m0_write_seam_create_over_file() {
         report.push_str(&l);
         l.clear();
     }
-    assert!(report.contains("unpack ok"), "server accepted the pack; report:\n{report}");
+    assert!(
+        report.contains("unpack ok"),
+        "server accepted the pack; report:\n{report}"
+    );
     assert!(
         report.contains(&format!("ok {REF}")),
         "server reported the ref updated; report:\n{report}"
@@ -223,7 +230,11 @@ fn m0_write_seam_create_over_file() {
         c.args(["rev-parse", REF]);
         c
     });
-    assert_eq!(String::from_utf8(out).unwrap().trim(), new_oid, "ref created at pushed oid");
+    assert_eq!(
+        String::from_utf8(out).unwrap().trim(),
+        new_oid,
+        "ref created at pushed oid"
+    );
     let (heads, _) = run({
         let mut c = git(&remote);
         c.args(["for-each-ref", "--format=%(refname)", "refs/heads/"]);
@@ -250,7 +261,10 @@ fn m0_write_seam_create_over_file() {
         .lines()
         .filter(|ln| ln.contains(REF) && ln.contains("\\0"))
         .map(|ln| {
-            let payload = ln.rsplit_once("> ").or_else(|| ln.rsplit_once("< ")).map_or(ln, |(_, r)| r);
+            let payload = ln
+                .rsplit_once("> ")
+                .or_else(|| ln.rsplit_once("< "))
+                .map_or(ln, |(_, r)| r);
             payload.split("\\0").next().unwrap().trim().to_owned()
         })
         .collect();

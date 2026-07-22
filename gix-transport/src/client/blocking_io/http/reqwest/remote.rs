@@ -28,6 +28,12 @@ pub enum Error {
     ConfigureRequest(#[from] Box<dyn std::error::Error + Send + Sync + 'static>),
     #[error(transparent)]
     Redirect(#[from] redirect::Error),
+    /// fu4 (rolfdb fork): reading the `ssl_ca_info` CA bundle failed.
+    #[error("Could not read CA info file at '{}'", path.display())]
+    ReadCaInfo {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
 }
 
 impl crate::IsSpuriousError for Error {
@@ -58,54 +64,16 @@ impl Default for Remote {
             let redirect_action = Arc::new(Mutex::new(RedirectAction::Stop));
             let redirect_tail = Arc::new(Mutex::new(String::new()));
 
-            // We may error while configuring, which is expected as part of the internal protocol. The error will be
-            // received and the sender of the request might restart us.
-            let client = reqwest::blocking::ClientBuilder::new()
-                .connect_timeout(std::time::Duration::from_secs(20))
-                .http1_title_case_headers()
-                .redirect(reqwest::redirect::Policy::custom({
-                    let redirect_action = redirect_action.clone();
-                    let redirect_tail = redirect_tail.clone();
-                    move |attempt| {
-                        match *redirect_action.lock() {
-                            RedirectAction::Follow => {
-                                let curr_url = attempt.url();
-                                let prev_urls = attempt.previous();
-                                // emulate default git behaviour which relies on curl default behaviour apparently.
-                                const CURL_DEFAULT_REDIRS: usize = 50;
-                                if prev_urls.len() >= CURL_DEFAULT_REDIRS {
-                                    return attempt.error("too many redirects");
-                                }
-
-                                match prev_urls.last() {
-                                    Some(prev_url) if !redirect::scheme_is_safe(curr_url.as_str(), prev_url.as_str()) => {
-                                        // Don't follow insecure protocol redirects, particularly https-to-http downgrades.
-                                        attempt.stop()
-                                    }
-                                    Some(prev_url) if authority_changed(curr_url, prev_url) => {
-                                        // Allowed only if the tail doesn't change.
-                                        let redirect_tail = redirect_tail.lock();
-                                        if curr_url.as_str().ends_with(redirect_tail.as_str()) {
-                                            attempt.follow()
-                                        } else {
-                                            let curr_url = curr_url.as_str().to_owned();
-                                            let redirect_tail = redirect_tail.to_string();
-                                            attempt.error(format!(
-                                                "redirect url {curr_url:?} does not end with expected request suffix {redirect_tail:?}",
-                                            ))
-                                        }
-                                    }
-                                    _ => attempt.follow(),
-                                }
-                            }
-                            RedirectAction::RejectConfiguredHeaders => {
-                                attempt.error("refusing to follow redirect after request headers were configured")
-                            }
-                            RedirectAction::Stop => attempt.stop(),
-                        }
-                    }
-                }))
-                .build()?;
+            // fu4 (rolfdb fork): build the client LAZILY, per request, so the TLS-trust options
+            // that travel on each request's `config` are honored, matching the curl backend for
+            // `http.sslCAInfo`, `gitoxide.http.sslVerify` and the ssl-version range, which this
+            // backend previously ignored entirely. TLS-trust parity only; connect_timeout and
+            // http_version stay unwired (out of fu4 scope).
+            // Upstream gap: https://github.com/GitoxideLabs/gitoxide/issues/1109 (the curl side
+            // landed in PR #1142; the reqwest/`max-pure` side is the open remainder).
+            // We may error while building, which is expected as part of the internal protocol.
+            // The error will be received and the sender of the request might restart us.
+            let mut client_and_tls: Option<(reqwest::blocking::Client, TlsTrustKey)> = None;
 
             for Request {
                 url,
@@ -115,6 +83,14 @@ impl Default for Remote {
                 config,
             } in req_recv
             {
+                // fu4 (rolfdb fork): (re)build the client when the TLS-trust options change.
+                let tls_key: TlsTrustKey =
+                    (config.ssl_ca_info.clone(), config.ssl_verify, config.ssl_version);
+                if !client_and_tls.as_ref().is_some_and(|(_, key)| key == &tls_key) {
+                    client_and_tls =
+                        Some((build_client(&redirect_action, &redirect_tail, &tls_key)?, tls_key));
+                }
+                let client = &client_and_tls.as_ref().expect("client built above").0;
                 let redirected_base_url = redirected_base_url_shared.lock().clone();
                 let effective_url = redirect::swap_tails(redirected_base_url.as_deref(), &base_url, url.clone());
                 let has_configured_extra_headers = !config.extra_headers.is_empty();
@@ -386,4 +362,138 @@ pub(crate) struct Response {
     pub headers: pipe::Reader,
     pub body: pipe::Reader,
     pub upload_body: pipe::Writer,
+}
+
+// fu4 (rolfdb fork): TLS-trust helpers giving the reqwest backend TLS-trust parity with the curl
+// backend for the trust options carried on each request's `http::Options` (connect_timeout and
+// http_version stay unwired, out of fu4 scope). https://github.com/GitoxideLabs/gitoxide/issues/1109
+type TlsTrustKey = (Option<std::path::PathBuf>, bool, Option<http::options::SslVersionRangeInclusive>);
+
+fn build_client(
+    redirect_action: &Arc<Mutex<RedirectAction>>,
+    redirect_tail: &Arc<Mutex<String>>,
+    tls: &TlsTrustKey,
+) -> Result<reqwest::blocking::Client, Error> {
+    // The builder chain is copied verbatim from the upstream eager build (its redirect state machine
+    // reads the shared `redirect_action`/`redirect_tail` the request loop mutates per request); fu4
+    // only splices in `apply_tls_options` before `.build()`. Kept in lockstep with the upstream
+    // closure — if this drifts, re-copy it from reqwest/remote.rs's `Default for Remote`.
+    let builder = reqwest::blocking::ClientBuilder::new()
+        .connect_timeout(std::time::Duration::from_secs(20))
+        .http1_title_case_headers()
+        .redirect(reqwest::redirect::Policy::custom({
+            let redirect_action = redirect_action.clone();
+            let redirect_tail = redirect_tail.clone();
+            move |attempt| {
+                match *redirect_action.lock() {
+                    RedirectAction::Follow => {
+                        let curr_url = attempt.url();
+                        let prev_urls = attempt.previous();
+                        // emulate default git behaviour which relies on curl default behaviour apparently.
+                        const CURL_DEFAULT_REDIRS: usize = 50;
+                        if prev_urls.len() >= CURL_DEFAULT_REDIRS {
+                            return attempt.error("too many redirects");
+                        }
+
+                        match prev_urls.last() {
+                            Some(prev_url) if !redirect::scheme_is_safe(curr_url.as_str(), prev_url.as_str()) => {
+                                // Don't follow insecure protocol redirects, particularly https-to-http downgrades.
+                                attempt.stop()
+                            }
+                            Some(prev_url) if authority_changed(curr_url, prev_url) => {
+                                // Allowed only if the tail doesn't change.
+                                let redirect_tail = redirect_tail.lock();
+                                if curr_url.as_str().ends_with(redirect_tail.as_str()) {
+                                    attempt.follow()
+                                } else {
+                                    let curr_url = curr_url.as_str().to_owned();
+                                    let redirect_tail = redirect_tail.to_string();
+                                    attempt.error(format!(
+                                        "redirect url {curr_url:?} does not end with expected request suffix {redirect_tail:?}",
+                                    ))
+                                }
+                            }
+                            _ => attempt.follow(),
+                        }
+                    }
+                    RedirectAction::RejectConfiguredHeaders => {
+                        attempt.error("refusing to follow redirect after request headers were configured")
+                    }
+                    RedirectAction::Stop => attempt.stop(),
+                }
+            }
+        }));
+    let builder = apply_tls_options(builder, tls)?;
+    Ok(builder.build()?)
+}
+
+#[cfg(any(
+    feature = "http-client-reqwest-rust-tls",
+    feature = "http-client-reqwest-rust-tls-trust-dns",
+    feature = "http-client-reqwest-native-tls",
+))]
+fn apply_tls_options(
+    mut builder: reqwest::blocking::ClientBuilder,
+    (ssl_ca_info, ssl_verify, ssl_version): &TlsTrustKey,
+) -> Result<reqwest::blocking::ClientBuilder, Error> {
+    if let Some(path) = ssl_ca_info {
+        let pem = std::fs::read(path).map_err(|source| Error::ReadCaInfo {
+            path: path.clone(),
+            source,
+        })?;
+        // Replace (not augment) the trust store: `http.sslCAInfo` — like curl's CAINFO — makes the
+        // supplied bundle the ONLY trusted roots. `tls_certs_only` both installs it and disables
+        // reqwest's built-in/native roots (reqwest 0.13.4; the older per-cert `add_root_certificate`
+        // merely augmented, leaving the public CA set trusted alongside it).
+        builder = builder.tls_certs_only(reqwest::Certificate::from_pem_bundle(&pem)?);
+    }
+    if !ssl_verify {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    if let Some(range) = ssl_version {
+        // Fail-closed vs curl: on a rustls backend a floor below TLS 1.2 makes the `.build()` in
+        // `build_client` error (rustls speaks only 1.2/1.3), surfacing as `http::Error::InitHttpClient`
+        // rather than connecting on a weaker protocol as curl+OpenSSL might. Deliberate — we refuse the
+        // downgrade instead of silently honoring it.
+        let (min, max) = range.min_max();
+        if let Some(v) = to_reqwest_tls_version(min) {
+            builder = builder.min_tls_version(v);
+        }
+        if let Some(v) = to_reqwest_tls_version(max) {
+            builder = builder.max_tls_version(v);
+        }
+    }
+    Ok(builder)
+}
+
+// No reqwest TLS stack compiled in => nothing to apply (https is unsupported on such builds anyway).
+#[cfg(not(any(
+    feature = "http-client-reqwest-rust-tls",
+    feature = "http-client-reqwest-rust-tls-trust-dns",
+    feature = "http-client-reqwest-native-tls",
+)))]
+fn apply_tls_options(
+    builder: reqwest::blocking::ClientBuilder,
+    _tls: &TlsTrustKey,
+) -> Result<reqwest::blocking::ClientBuilder, Error> {
+    Ok(builder)
+}
+
+// The reqwest twin of curl's `to_curl_ssl_version`: map a gitoxide SSL version to a reqwest TLS
+// version, or `None` for versions with no reqwest equivalent (Default/SslV2/SslV3). A sub-1.2 floor
+// (TlsV1/TlsV1_0/TlsV1_1) then fails closed at client build on a rustls backend — see apply_tls_options.
+#[cfg(any(
+    feature = "http-client-reqwest-rust-tls",
+    feature = "http-client-reqwest-rust-tls-trust-dns",
+    feature = "http-client-reqwest-native-tls",
+))]
+fn to_reqwest_tls_version(vers: http::options::SslVersion) -> Option<reqwest::tls::Version> {
+    use http::options::SslVersion::*;
+    Some(match vers {
+        TlsV1 | TlsV1_0 => reqwest::tls::Version::TLS_1_0,
+        TlsV1_1 => reqwest::tls::Version::TLS_1_1,
+        TlsV1_2 => reqwest::tls::Version::TLS_1_2,
+        TlsV1_3 => reqwest::tls::Version::TLS_1_3,
+        Default | SslV2 | SslV3 => return None,
+    })
 }

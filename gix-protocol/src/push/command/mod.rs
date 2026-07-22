@@ -6,8 +6,6 @@
 //! write side is [`std::io::Write`], under `async-client` it is `futures_io::AsyncWrite`, so the two
 //! cannot share one sync signature. §3.3 calls the twin from the orchestrator.
 
-use std::borrow::Cow;
-
 use bstr::BString;
 use gix_hash::Kind;
 
@@ -16,15 +14,16 @@ use crate::push::{Atomicity, Error, Options, RefUpdate};
 #[cfg(feature = "blocking-client")]
 mod blocking_io;
 #[cfg(feature = "blocking-client")]
-pub(crate) use blocking_io::write_command_list;
+pub(crate) use blocking_io::{write_command_list, write_push_options};
 
 #[cfg(feature = "async-client")]
 mod async_io;
 #[cfg(feature = "async-client")]
 #[allow(unused_imports)]
-pub(crate) use async_io::write_command_list;
+pub(crate) use async_io::{write_command_list, write_push_options};
 
-/// The client's selection from the advertised capabilities, plus the negotiated object hash.
+/// The client's selection from the advertised capabilities, plus the negotiated object hash and the
+/// M3 wire features (push-options + side-band-64k) that were negotiated.
 ///
 /// The capabilities are stored **wire-ordered**; [`to_wire_bytes`](Self::to_wire_bytes) space-joins
 /// them for the NUL-suffix of the first command line.
@@ -33,6 +32,13 @@ pub(crate) struct SelectedCaps {
     pub(crate) object_hash: Kind,
     /// The capabilities to echo, in wire order.
     features: Vec<BString>,
+    /// The push-options to send after the command-list flush (§1.3, M3). Empty when the caller
+    /// requested none; non-empty only when the server advertised `push-options` (else preflight
+    /// already refused with [`Error::MissingServerFeature`]). Drives the orchestrator's option block.
+    pub(crate) push_options: Vec<BString>,
+    /// Whether `side-band-64k` was negotiated (opted in **and** advertised, M3). When set, the report
+    /// stream is band-multiplexed and the response reader must demux it (§3.5).
+    pub(crate) sideband: bool,
 }
 
 impl SelectedCaps {
@@ -52,23 +58,22 @@ impl SelectedCaps {
 /// Select the capabilities to echo: the intersection of what we want with what the server
 /// advertised (plan §3.4). Errors early — before any bytes hit the wire — on an impossible request.
 ///
-/// M1 echo-set: `report-status` (required), `object-format=<algo>` (matching the local kind, when
+/// Echo-set: `report-status` (required), `object-format=<algo>` (matching the local kind, when
 /// advertised), `ofs-delta` (when advertised), `delete-refs` (iff a delete is present), `quiet`
-/// (opt-in), `atomic` (opt-in), and `agent=<ua>`. Never echoes `side-band-64k`, `push-options`, or
-/// `push-cert` in M1.
+/// (opt-in), `atomic` (opt-in), `agent=<ua>`, and — M3 wire features, opt-in AND advertised only —
+/// `push-options` (when `Options::push_options` is non-empty) and `side-band-64k` (when
+/// `Options::sideband`). Never echoes `push-cert` (out of scope).
 #[allow(dead_code)] // consumed by the M3 async orchestrator; the M1 orchestrator is blocking-only
 pub(crate) fn select_capabilities(
     caps: &crate::transport::client::Capabilities,
     updates: &[RefUpdate],
     opts: &Options,
-    user_agent: (&'static str, Option<Cow<'static, str>>),
+    user_agent: crate::command::Feature,
 ) -> Result<SelectedCaps, Error> {
     // Hash-kind precheck (F3): the negotiated object-format MUST equal the local ODB kind, inferred
     // from the oids the caller passed. Refuse an SHA-256 remote against an SHA-1 ODB cleanly, before
     // any bytes are sent — exactly as git's send-pack die()s on a hash-algorithm mismatch.
-    let local = updates
-        .first()
-        .map_or(Kind::Sha1, |u| u.representative_oid().kind());
+    let local = updates.first().map_or(Kind::Sha1, |u| u.representative_oid().kind());
     let object_hash = match caps.capability("object-format").and_then(|c| c.value()) {
         None => local,
         Some(advertised) if advertised == local.to_string().as_bytes() => local,
@@ -135,24 +140,39 @@ pub(crate) fn select_capabilities(
         }
     }
 
-    // push-options are an M3 wire feature; M1 refuses a non-empty request rather than silently
-    // dropping it (F5). The no-cap case is the primary tested law.
-    if !opts.push_options.is_empty() {
+    // side-band-64k (M3): when opted in, echo the cap so the server multiplexes the report onto the
+    // side-band and the response reader demuxes it (§3.5). An opt-in against an unadvertised cap is
+    // refused rather than silently dropped — parity with push-options, keeping Options::sideband an
+    // honest field. Left `false` (the default) it is never echoed, so the report arrives as plain
+    // pkt-lines exactly as in M1.
+    let sideband = if opts.sideband {
+        if !caps.contains("side-band-64k") {
+            return Err(Error::MissingServerFeature {
+                feature: "side-band-64k",
+                description: "Options::sideband was requested but the server did not advertise side-band-64k",
+            });
+        }
+        features.push("side-band-64k".into());
+        true
+    } else {
+        false
+    };
+
+    // push-options (M3): send the caller's options as their own pkt-line block after the command-list
+    // flush (§1.3). A non-empty request requires the server to advertise `push-options`; otherwise it
+    // is refused, never silently dropped (F5) — the primary tested law. An empty request sends no
+    // block and echoes no cap, so an M1 push is byte-identical.
+    let push_options = if opts.push_options.is_empty() {
+        Vec::new()
+    } else if caps.contains("push-options") {
+        features.push("push-options".into());
+        opts.push_options.clone()
+    } else {
         return Err(Error::MissingServerFeature {
             feature: "push-options",
-            description: "push-options are not implemented before M3; leave Options::push_options empty",
+            description: "Options::push_options is non-empty but the server did not advertise push-options",
         });
-    }
-
-    // side-band demux of the report is an M3 feature; refuse an opt-in rather than silently ignoring
-    // it (parity with push_options above), keeping Options::sideband a §3.2-named field with an
-    // honest failure mode.
-    if opts.sideband {
-        return Err(Error::MissingServerFeature {
-            feature: "side-band-64k",
-            description: "side-band demux is not implemented before M3; leave Options::sideband false",
-        });
-    }
+    };
 
     if caps.contains("object-format") {
         features.push(format!("object-format={object_hash}").into());
@@ -165,6 +185,8 @@ pub(crate) fn select_capabilities(
     Ok(SelectedCaps {
         object_hash,
         features,
+        push_options,
+        sideband,
     })
 }
 
@@ -185,10 +207,11 @@ pub(crate) fn command_line(update: &RefUpdate, zero: &str) -> Vec<u8> {
             debug_assert!(!new.is_null(), "null object id in a Create command");
             (zero.to_owned(), new.to_hex().to_string())
         }
-        RefUpdate::Update {
-            expected_old, new, ..
-        } => {
-            debug_assert!(!expected_old.is_null(), "null object id in an Update command (expected_old)");
+        RefUpdate::Update { expected_old, new, .. } => {
+            debug_assert!(
+                !expected_old.is_null(),
+                "null object id in an Update command (expected_old)"
+            );
             debug_assert!(!new.is_null(), "null object id in an Update command (new)");
             (expected_old.to_hex().to_string(), new.to_hex().to_string())
         }

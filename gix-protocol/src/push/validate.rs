@@ -19,12 +19,14 @@ use crate::push::RefUpdate;
 #[derive(Debug, Clone)]
 pub struct Advertised {
     /// The advertised oid of **our** ref — the pack-build BOUNDARY (the last state we synced).
-    /// Locally present when `Some` (a manifest commit the caller holds). `None` means create /
-    /// empty remote, and the pack walk runs to genesis.
+    /// Locally present when `Some` (a manifest object the caller holds: a commit, or the tag oid
+    /// for an annotated-tag ref — the walk peels it). `None` means create / empty remote, and the
+    /// pack walk runs to genesis.
     ///
     /// M1 is single-ref: this reflects the one boundary-bearing (`Update`/`Delete`) command. With a
     /// multi-ref `updates` slice it would reflect only the last such command — multi-ref pack
-    /// planning is M3.
+    /// planning is upstream-generality only (Q5 / `dec-gixpush-ratify` item 3: rolfdb rides a single
+    /// `refs/rolfdb/data`, so it is not on rolfdb's milestone track), not a scheduled M3 deliverable.
     pub boundary: Option<ObjectId>,
     /// The **full** advertised oid set — the server-known `DeltaOid` bases for thin packs (§3.6).
     /// May include host-repo refs that are not in the local ODB; never resolved locally, never a
@@ -36,9 +38,7 @@ pub struct Advertised {
 #[derive(Debug, thiserror::Error)]
 #[allow(missing_docs)]
 pub enum Error {
-    #[error(
-        "stale lease for {name}: expected the server to advertise {expected:?}, but it advertised {actual:?}"
-    )]
+    #[error("stale lease for {name}: expected the server to advertise {expected:?}, but it advertised {actual:?}")]
     StaleLease {
         name: FullName,
         expected: Option<ObjectId>,
@@ -60,10 +60,7 @@ impl crate::transport::IsSpuriousError for Error {
 /// A **hidden** ref (absent from the advertisement though it exists on a `hideRefs` host) reads as
 /// "does not exist": an `Update` then surfaces as `StaleLease { actual: None }` rather than a blind
 /// overwrite (F11).
-pub fn plan_from_advertisement(
-    updates: &[RefUpdate],
-    handshake: &crate::Handshake,
-) -> Result<Advertised, Error> {
+pub fn plan_from_advertisement(updates: &[RefUpdate], handshake: &crate::Handshake) -> Result<Advertised, Error> {
     let refs = handshake.refs.as_deref().unwrap_or(&[]);
 
     // The full advertised oid set (server-known thin-delta bases). Includes every commit/tag oid a
@@ -90,9 +87,7 @@ pub fn plan_from_advertisement(
                     });
                 }
             }
-            RefUpdate::Update {
-                name, expected_old, ..
-            } => {
+            RefUpdate::Update { name, expected_old, .. } => {
                 if advertised != Some(*expected_old) {
                     return Err(Error::StaleLease {
                         name: name.clone(),
@@ -102,9 +97,7 @@ pub fn plan_from_advertisement(
                 }
                 boundary = Some(*expected_old);
             }
-            RefUpdate::Delete {
-                name, expected_old, ..
-            } => {
+            RefUpdate::Delete { name, expected_old, .. } => {
                 if advertised != Some(*expected_old) {
                     return Err(Error::StaleLease {
                         name: name.clone(),
@@ -116,10 +109,7 @@ pub fn plan_from_advertisement(
         }
     }
 
-    Ok(Advertised {
-        boundary,
-        thin_bases,
-    })
+    Ok(Advertised { boundary, thin_bases })
 }
 
 /// The oid(s) a single advertised ref contributes to the server-known set. An unborn ref
@@ -127,7 +117,19 @@ pub fn plan_from_advertisement(
 fn advertised_oids(r: &crate::handshake::Ref) -> Vec<ObjectId> {
     use crate::handshake::Ref::*;
     match r {
+        // A `Peeled` (annotated tag) contributes BOTH oids: `tag` is the ref's stored value and
+        // `object` is the commit it dereferences to — the server holds both, so both are valid
+        // thin-delta bases. (This is the FULL set; `advertised_oid_of` below returns the single
+        // *lease* oid, which is `tag` alone — the value the ref points AT.)
         Peeled { tag, object, .. } => vec![*tag, *object],
+        // A `Symbolic` resolving through an annotated tag (`tag: Some`, e.g. `HEAD` → an annotated
+        // `refs/tags/*`) is the same shape as `Peeled`: `tag` is what the ref refers to and
+        // `object` is the peeled commit — the server holds both (`Ref::unpack` returns
+        // `tag.unwrap_or(object)` / `object` as peeled). A `tag: None` symref (lightweight tag or a
+        // plain branch target) contributes just its `object`, like `Direct` (rolfdb-gpx00b).
+        Symbolic {
+            tag: Some(tag), object, ..
+        } => vec![*tag, *object],
         Direct { object, .. } | Symbolic { object, .. } => vec![*object],
         Unborn { .. } => Vec::new(),
     }
@@ -138,22 +140,26 @@ fn advertised_oid_of(refs: &[crate::handshake::Ref], name: &BStr) -> Option<Obje
     use crate::handshake::Ref::*;
     for r in refs {
         let (full, object) = match r {
-            Peeled {
-                full_ref_name,
-                object,
-                ..
-            } => (full_ref_name, Some(*object)),
-            Direct {
-                full_ref_name,
-                object,
-            } => (full_ref_name, Some(*object)),
+            // For an annotated tag, `tag` is the ref's STORED value (what the ref points AT) and
+            // `object` is the peeled commit. A force-with-lease compares `expected_old` to the
+            // ref's stored value, so we must return `tag`, not the peeled `object` (rolfdb-gpx00).
+            Peeled { full_ref_name, tag, .. } => (full_ref_name, Some(*tag)),
+            Direct { full_ref_name, object } => (full_ref_name, Some(*object)),
+            // A `Symbolic` resolving through an annotated tag (`tag: Some`) has the tag oid as its
+            // STORED value — the same law as `Peeled`. `Ref::unpack` returns `tag.unwrap_or(object)`
+            // as the oid the ref directly refers to, so the lease must compare against `tag` when
+            // present and the peeled `object` otherwise (a `tag: None` symref) (rolfdb-gpx00b).
             Symbolic {
                 full_ref_name,
+                tag,
                 object,
                 ..
-            } => (full_ref_name, Some(*object)),
+            } => (full_ref_name, Some(tag.unwrap_or(*object))),
             Unborn { full_ref_name, .. } => (full_ref_name, None),
         };
+        // Matching is by `full_ref_name` ONLY — `Symbolic.target` is never consulted, so a caller
+        // that expanded a symref to its TARGET name resolves through the target's own advertisement
+        // line (`Peeled`/`Direct`), not this arm (rolfdb-gpx00b review note).
         if full.as_bstr() == name {
             return object;
         }

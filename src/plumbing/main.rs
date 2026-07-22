@@ -702,6 +702,51 @@ pub fn main() -> Result<()> {
                 },
             )
         }
+        #[cfg(feature = "gitoxide-core-blocking-client")]
+        Subcommands::Push(crate::plumbing::options::push::Platform {
+            dry_run,
+            remote,
+            force,
+            force_with_lease,
+            atomic,
+            no_atomic,
+            push_option,
+            sideband,
+            no_sideband,
+            handshake_info,
+            set_upstream,
+            ref_spec,
+        }) => {
+            let opts = core::repository::push::Options {
+                format,
+                dry_run,
+                remote,
+                ref_specs: ref_spec,
+                force,
+                force_with_lease,
+                atomic,
+                no_atomic,
+                push_options: push_option,
+                sideband: match (sideband, no_sideband) {
+                    (_, true) => Some(false),
+                    (true, _) => Some(true),
+                    (false, false) => None,
+                },
+                handshake_info,
+                set_upstream,
+            };
+            prepare_and_run(
+                "push",
+                trace,
+                auto_verbose,
+                progress,
+                progress_keep_open,
+                core::repository::push::PROGRESS_RANGE,
+                move |progress, out, err| {
+                    core::repository::push(repository(Mode::LenientWithGitInstallConfig)?, progress, out, err, opts)
+                },
+            )
+        }
         Subcommands::ConfigTree => show_progress(),
         Subcommands::Credential(cmd) => core::repository::credential(
             repository(Mode::StrictWithGitInstallConfig).ok(),

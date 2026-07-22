@@ -170,12 +170,12 @@ impl From<Remote<'_>> for RemoteDetached {
             name,
             urls,
             url_aliases,
-            url_push_aliases: _,
+            url_push_aliases,
             fetch_specs,
             fetch_tags,
-            push_urls: _,
-            push_url_aliases: _,
-            push_specs: _,
+            push_urls,
+            push_url_aliases,
+            push_specs,
             repo: _,
         }: Remote<'_>,
     ) -> Self {
@@ -185,6 +185,10 @@ impl From<Remote<'_>> for RemoteDetached {
             url_aliases,
             fetch_specs,
             fetch_tags,
+            url_push_aliases,
+            push_urls,
+            push_url_aliases,
+            push_specs,
         }
     }
 }

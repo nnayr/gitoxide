@@ -120,6 +120,9 @@ pub enum Subcommands {
     /// Fetch data from remotes and store it in the repository.
     #[cfg(feature = "gitoxide-core-blocking-client")]
     Fetch(fetch::Platform),
+    /// Push data to a remote from the repository.
+    #[cfg(feature = "gitoxide-core-blocking-client")]
+    Push(push::Platform),
     /// Clone a repository into a new directory.
     #[cfg(feature = "gitoxide-core-blocking-client")]
     Clone(clone::Platform),
@@ -744,6 +747,70 @@ pub mod fetch {
                 Shallow::default()
             }
         }
+    }
+}
+
+#[cfg(feature = "gitoxide-core-blocking-client")]
+pub mod push {
+    #[derive(Debug, clap::Parser)]
+    pub struct Platform {
+        /// Don't change the remote, but otherwise try to be as accurate as possible.
+        #[clap(long, short = 'n')]
+        pub dry_run: bool,
+
+        /// The name of the remote to push to, or the url of the remote to push to directly.
+        ///
+        /// If unset, the push configuration and current branch determine the remote.
+        #[clap(long, short = 'r')]
+        pub remote: Option<String>,
+
+        /// Force the push: rewrite each effective ref-spec to its `+`-form before sending it.
+        ///
+        /// Even so, the update still CAS-es against the server's advertisement on the wire, so a
+        /// concurrent change is still refused per-ref (stronger than C-git's `--force`).
+        #[clap(long)]
+        pub force: bool,
+
+        /// Force the push only if the remote refs are still at their locally-known tracking value
+        /// (a compare-and-swap lease); a violated lease aborts the whole push.
+        #[clap(long, conflicts_with = "force")]
+        pub force_with_lease: bool,
+
+        /// Require the `atomic` capability: apply all ref updates or none. Refused before any wire
+        /// bytes if the server does not advertise it.
+        #[clap(long, conflicts_with = "no_atomic")]
+        pub atomic: bool,
+
+        /// Disable atomic pushes, overriding a `push.atomic = true` configuration.
+        #[clap(long)]
+        pub no_atomic: bool,
+
+        /// Send a push-option to the server, repeatable and in order. Replaces the `push.pushOption`
+        /// configuration; requires the server to advertise `push-options`.
+        #[clap(long, short = 'o', value_parser = crate::shared::AsBString)]
+        pub push_option: Vec<gix::bstr::BString>,
+
+        /// Request `side-band-64k` so the server's `remote:` output is shown (the default is to use
+        /// it only when advertised).
+        #[clap(long, conflicts_with = "no_sideband")]
+        pub sideband: bool,
+
+        /// Disable `side-band-64k`, suppressing the server's `remote:` output.
+        #[clap(long)]
+        pub no_sideband: bool,
+
+        /// Output additional information provided by the server as part of the connection handshake.
+        #[clap(long, short = 'H')]
+        pub handshake_info: bool,
+
+        /// For every branch that was pushed (or found up to date), add an upstream (tracking)
+        /// reference: set `branch.<name>.remote` and `branch.<name>.merge` in the local config.
+        #[clap(long, short = 'u')]
+        pub set_upstream: bool,
+
+        /// The ref-specs to push; if given, these override the ref-specs configured for the remote.
+        #[clap(value_parser = crate::shared::AsBString)]
+        pub ref_spec: Vec<gix::bstr::BString>,
     }
 }
 
