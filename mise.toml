@@ -14,5 +14,5 @@ version = "1.98"
 components = "clippy,rustfmt,llvm-tools"
 
 [tasks.gate]
-run = [ "cargo fmt --all -- --check", "just clippy -D warnings -A unknown-lints --no-deps", "just doc", "cargo machete", "cargo deny --workspace --all-features check bans licenses sources", "just check", "GIX_TEST_IGNORE_ARCHIVES=1 just unit-tests", "just check-mode", "just doc-tests", "just ci-journey-tests" ]
+run = [ "cargo fmt --all -- --check", "just clippy -D warnings -A unknown-lints --no-deps", "just doc", "cargo machete", "cargo deny --workspace --all-features check bans licenses sources", "just check", "CI=1 GIX_TEST_IGNORE_ARCHIVES=1 just unit-tests", "just check-mode", "CI=1 just doc-tests", "CI=1 just ci-journey-tests" ]
 dir = "{{env.DITTO_CODE_ROOT}}"
