@@ -1,0 +1,18 @@
+[tools]
+node = "26"
+"github:gastownhall/beads" = "1.3.1"
+pi = "1.0.0"
+sccache = "latest"
+"github:obi1kenobi/cargo-semver-checks" = "0.51.0"
+just = "1.59.0"
+"github:nextest-rs/nextest" = "cargo-nextest-0.9.150"
+"cargo:cargo-machete" = "0.9.1"
+"cargo:cargo-deny" = "0.20.2"
+
+[tools.rust]
+version = "1.98"
+components = "clippy,rustfmt,llvm-tools"
+
+[tasks.gate]
+run = [ "cargo fmt --all -- --check", "just clippy -D warnings -A unknown-lints --no-deps", "just doc", "cargo machete", "cargo deny --workspace --all-features check bans licenses sources", "just check", "GIX_TEST_IGNORE_ARCHIVES=1 just unit-tests", "just check-mode", "just doc-tests", "just ci-journey-tests" ]
+dir = "{{env.DITTO_CODE_ROOT}}"

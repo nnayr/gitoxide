@@ -1,0 +1,15 @@
+types = ["rust"]
+stability = "unstable"
+
+[[review.focus]]
+paths = "**"
+file = "docs/review/layout.md"
+lenses = ["placement"]
+
+[overlay]
+upstream = "origin/main"
+integration = "main"
+prefix = "gix"
+
+[update]
+track = "main"
