@@ -128,7 +128,7 @@ pub(crate) fn update(
     let edits = if dry_run || edits.is_empty() {
         edits
     } else {
-        repo.edit_references(edits)?
+        repo.edit_references(edits).map_err(update::Error::EditReferences)?
     };
 
     Ok(update::Outcome { edits, updates })
@@ -171,12 +171,12 @@ fn tracking_ref_disposition(
     let existing = repo
         .refs
         .try_find(tracking.as_ref())
-        .map_err(|err| update::Error::FindReference(err.into()))?;
-    if let Some(existing) = &existing {
-        if matches!(existing.target, Target::Symbolic(_)) {
-            // Refuse to overwrite a symbolic tracking ref with a direct object id.
-            return Ok((Mode::TrackingRefSkipped(SkipReason::SymbolicTrackingRef), None));
-        }
+        .map_err(update::Error::FindReference)?;
+    if let Some(existing) = &existing
+        && matches!(existing.target, Target::Symbolic(_))
+    {
+        // Refuse to overwrite a symbolic tracking ref with a direct object id.
+        return Ok((Mode::TrackingRefSkipped(SkipReason::SymbolicTrackingRef), None));
     }
 
     if mapping.local.is_none() {

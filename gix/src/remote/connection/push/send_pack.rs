@@ -150,7 +150,7 @@ where
         // Atomicity. Both are the initial values the with_push_options/with_atomic builders override.
         // Reading them here (before the builders run) is what makes the builder an override of config.
         let push_options = config::push_options(repo);
-        let atomicity = config::atomic(repo)?; // strict-config parse failure ⇒ prepare::Error::AtomicConfig
+        let atomicity = config::atomic(repo).map_err(prepare::Error::AtomicConfig)?; // strict-config parse failure ⇒ prepare::Error::AtomicConfig
         Ok(PrepareDetached {
             con: Some(self),
             plan,
@@ -281,7 +281,7 @@ where
     /// Request `side-band-64k` for the report (gpx10). When enabled **and** advertised, the server
     /// band-multiplexes its response and the plumbing demux routes band 2 (progress) and band 3
     /// (remote errors) to the `progress` passed to [`send`](Self::send) — a real
-    /// [`NestedProgress`](gix_features::progress::NestedProgress) sink then observes the server's
+    /// [`NestedProgress`](gix_utils::progress::NestedProgress) sink then observes the server's
     /// `remote:` output. Enabled against a server that does not advertise `side-band-64k` fails
     /// `send()` with [`Error::MissingServerFeature`](super::Error::MissingServerFeature) before any
     /// wire bytes. `false` (the default) keeps the report as plain pkt-lines, byte-identical to a push
@@ -306,7 +306,7 @@ where
     #[cfg(feature = "blocking-network-client")]
     pub fn send<P>(self, progress: P, should_interrupt: &AtomicBool) -> Result<Outcome, super::Error>
     where
-        P: gix_features::progress::NestedProgress,
+        P: gix_utils::progress::NestedProgress,
         P::SubProgress: 'static,
     {
         let Prepare { inner, repo } = self;
@@ -326,7 +326,7 @@ where
         should_interrupt: &AtomicBool,
     ) -> Result<Outcome, super::Error>
     where
-        P: gix_features::progress::NestedProgress,
+        P: gix_utils::progress::NestedProgress,
         P::SubProgress: 'static,
     {
         // Take the connection + handshake once (mirror receive_pack.rs); neither touches the wire.
@@ -348,13 +348,13 @@ where
             .and_then(|c| c.value())
         {
             let parsed: Option<gix_hash::Kind> = std::str::from_utf8(advertised).ok().and_then(|s| s.parse().ok());
-            if let Some(remote) = parsed {
-                if remote != local_hash {
-                    return Err(super::Error::IncompatibleObjectHash {
-                        local: local_hash,
-                        remote,
-                    });
-                }
+            if let Some(remote) = parsed
+                && remote != local_hash
+            {
+                return Err(super::Error::IncompatibleObjectHash {
+                    local: local_hash,
+                    remote,
+                });
             }
         }
 
@@ -411,7 +411,7 @@ where
         // Step: assemble the gpx06 pack driver's `write_pack` closure. Build a DEDICATED pack-capable
         // odb handle (repo.objects is a memory::Proxy that does NOT implement gix_pack::Find — see
         // pack::write_pack's rustdoc) with prevent_pack_unload() set, as the pack pipeline requires.
-        let mut db = gix_odb::at(repo.git_dir().join("objects"))
+        let mut db = gix_odb::at(repo.git_dir().join("objects"), repo.object_hash())
             .and_then(gix_odb::Handle::into_arc)
             .map_err(super::Error::OpenObjectStore)?;
         db.prevent_pack_unload();
@@ -426,7 +426,7 @@ where
             std::rc::Rc::new(std::cell::RefCell::new(None));
         let pack_error_in = std::rc::Rc::clone(&pack_error);
         let write_pack = move |out: &mut dyn std::io::Write,
-                               progress: &mut dyn gix_features::progress::DynNestedProgress,
+                               progress: &mut dyn gix_utils::progress::DynNestedProgress,
                                should_interrupt: &std::sync::atomic::AtomicBool|
               -> Result<(), std::io::Error> {
             write_pack_inner(out, progress, should_interrupt).map_err(|e| {
@@ -696,7 +696,7 @@ mod tests {
             // stateful transports) — the Drop path must not touch `request()` either.
             false
         }
-        fn configure(&mut self, _config: &dyn Any) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+        fn configure(&mut self, _config: &dyn Any) -> gix_error::Result<()> {
             Ok(())
         }
     }
@@ -1007,7 +1007,7 @@ mod tests {
 
     // ── gpx10 push-options + sideband surface ───────────────────────────────────────────────────
 
-    /// A [`NestedProgress`](gix_features::progress::NestedProgress) that RECORDS what reaches it — the
+    /// A [`NestedProgress`](gix_utils::progress::NestedProgress) that RECORDS what reaches it — the
     /// porcelain twin of the plumbing suite's `CaptureProgress`, proving that a side-band-64k push
     /// routes the server's band-2 (`remote:`) output all the way to the caller's progress sink (via
     /// the plumbing demux's `translate_to_progress` → `set_name` on a "remote" child). Children share
@@ -1028,19 +1028,19 @@ mod tests {
         }
     }
 
-    impl gix_features::progress::Count for CaptureProgress {
+    impl gix_utils::progress::Count for CaptureProgress {
         fn set(&self, _step: usize) {}
         fn step(&self) -> usize {
             0
         }
         fn inc_by(&self, _step: usize) {}
-        fn counter(&self) -> gix_features::progress::StepShared {
+        fn counter(&self) -> gix_utils::progress::StepShared {
             std::sync::Arc::new(std::sync::atomic::AtomicUsize::default())
         }
     }
 
-    impl gix_features::progress::Progress for CaptureProgress {
-        fn init(&mut self, _max: Option<usize>, _unit: Option<gix_features::progress::Unit>) {}
+    impl gix_utils::progress::Progress for CaptureProgress {
+        fn init(&mut self, _max: Option<usize>, _unit: Option<gix_utils::progress::Unit>) {}
         fn set_max(&mut self, _max: Option<usize>) -> Option<usize> {
             None
         }
@@ -1050,20 +1050,20 @@ mod tests {
         fn name(&self) -> Option<String> {
             None
         }
-        fn id(&self) -> gix_features::progress::Id {
-            gix_features::progress::UNKNOWN
+        fn id(&self) -> gix_utils::progress::Id {
+            gix_utils::progress::UNKNOWN
         }
-        fn message(&self, level: gix_features::progress::MessageLevel, message: String) {
+        fn message(&self, level: gix_utils::progress::MessageLevel, message: String) {
             self.record(&format!("msg:{level:?}"), message);
         }
     }
 
-    impl gix_features::progress::NestedProgress for CaptureProgress {
+    impl gix_utils::progress::NestedProgress for CaptureProgress {
         type SubProgress = Self;
         fn add_child(&mut self, _name: impl Into<String>) -> Self {
             self.clone()
         }
-        fn add_child_with_id(&mut self, _name: impl Into<String>, _id: gix_features::progress::Id) -> Self {
+        fn add_child_with_id(&mut self, _name: impl Into<String>, _id: gix_utils::progress::Id) -> Self {
             self.clone()
         }
     }
@@ -1081,7 +1081,7 @@ mod tests {
         progress: P,
     ) -> Result<Outcome, PushFailure>
     where
-        P: gix_features::progress::NestedProgress,
+        P: gix_utils::progress::NestedProgress,
         P::SubProgress: 'static,
     {
         let mut prepared = repo

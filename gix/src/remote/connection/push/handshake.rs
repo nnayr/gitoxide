@@ -15,16 +15,16 @@
 //!
 //! # Errors
 //!
-//! Unlike fetch — whose standalone `ref_map` operation owns a [`ref_map::Error`][crate::remote::connection::ref_map::Error]
+//! Unlike fetch — whose standalone `ref_map` operation reports through the erased [`gix::Error`](crate::Error)
 //! — the receive-pack handshake is not a public operation of its own (it exists only inside `prepare_push`),
 //! so it reports through the flat [`prepare::Error`][super::prepare::Error] that `gpx02` defined for exactly
 //! this reason. There is deliberately no `handshake::Error` twin.
 
-use gix_features::progress::Progress;
 #[cfg(feature = "async-network-client")]
 use gix_transport::client::async_io::Transport;
 #[cfg(feature = "blocking-network-client")]
 use gix_transport::client::blocking_io::Transport;
+use gix_utils::progress::Progress;
 
 use crate::remote::connection::ConnectionDetached;
 
@@ -88,13 +88,16 @@ where
         if self.transport_options.is_none() {
             self.transport_options = repo
                 .transport_options(url.as_ref(), self.remote.name().map(crate::remote::Name::as_bstr))
-                .map_err(|err| super::prepare::Error::GatherTransportConfig {
-                    source: err,
+                .map_err(|source| super::prepare::Error::GatherTransportConfig {
+                    source,
                     url: url.into_owned(),
                 })?;
         }
         if let Some(config) = self.transport_options.as_ref() {
-            self.transport.inner.configure(&**config)?;
+            self.transport
+                .inner
+                .configure(&**config)
+                .map_err(super::prepare::Error::ConfigureTransport)?;
         }
         let mut handshake = gix_protocol::handshake(
             &mut self.transport.inner,
@@ -103,7 +106,8 @@ where
             handshake_parameters,
             &mut progress,
         )
-        .await?;
+        .await
+        .map_err(super::prepare::Error::Handshake)?;
 
         let refs = advertisement_from_handshake(&mut handshake)?;
         self.handshake = Some(handshake);

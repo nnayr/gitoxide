@@ -278,56 +278,115 @@ pub struct Mapping {
 }
 
 /// The error returned by the push plan. Every variant is a prepare-time abort (C-git parity: these
-/// abort the whole push before a byte is sent). [`IsSpuriousError`](gix_protocol::transport::IsSpuriousError)
-/// is `false` for every variant.
-#[derive(Debug, thiserror::Error)]
-#[allow(missing_docs)]
+/// abort the whole push before a byte is sent), so none is retryable.
+#[derive(Debug)]
+#[expect(missing_docs)]
 pub enum Error {
-    #[error("src refspec {spec:?} does not match any local ref")]
-    SourceMatchesNothing { spec: BString },
-    #[error("unable to delete {destination:?}: remote ref does not exist")]
-    DeleteAbsentRef { destination: BString },
-    #[error(
-        "destination {destination:?} is not a full ref name and its type could not be inferred from source {source_spec:?}"
-    )]
+    SourceMatchesNothing {
+        spec: BString,
+    },
+    DeleteAbsentRef {
+        destination: BString,
+    },
     UnqualifiedDestination {
         destination: BString,
-        // NB: not named `source` — thiserror treats a `source` field as the error `#[source]`.
         source_spec: BString,
     },
-    #[error("HEAD is detached; pushing it requires an explicit destination, like HEAD:refs/heads/main")]
     DetachedHeadNeedsDestination,
-    #[error("destination {destination} would be written by more than one source: {sources:?}")]
     Conflict {
         destination: FullName,
         /// Display strings of the conflicting sources (object ids or ref names).
         sources: Vec<BString>,
     },
-    #[error("source object {id} for {spec:?} does not exist locally")]
-    SourceObjectMissing { id: ObjectId, spec: BString },
-    #[error("stale lease for {destination}: expected the remote to be at {expected:?}, but it advertised {actual:?}")]
+    SourceObjectMissing {
+        id: ObjectId,
+        spec: BString,
+    },
     StaleLease {
         destination: FullName,
         expected: Option<ObjectId>,
         actual: Option<ObjectId>,
     },
-    #[error("an exact lease can only be used when exactly one ref is updated, but {candidates} would be")]
-    LeaseRequiresSingleUpdate { candidates: usize },
-    #[error("no remote-tracking ref is known for {destination} to lease against")]
-    LeaseTrackingRefMissing { destination: FullName },
-    #[error(transparent)]
-    InvalidRefName(#[from] gix_validate::reference::name::Error),
+    LeaseRequiresSingleUpdate {
+        candidates: usize,
+    },
+    LeaseTrackingRefMissing {
+        destination: FullName,
+    },
+    InvalidRefName(gix_validate::reference::name::Error),
     /// A failure while snapshotting the local repository state (references, `HEAD`, object lookups)
     /// that the `plan()` repo adapter feeds into the pure `plan_inner` core. Boxed so a single
     /// prepare-time variant absorbs the several distinct gix error types the snapshot can raise; like
-    /// the rest of [`Error`] it is a whole-push abort and non-spurious.
-    #[error("failed to snapshot the local repository for the push plan")]
-    Snapshot(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+    /// the rest of [`Error`] it is a whole-push abort and non-retryable.
+    Snapshot(Box<dyn std::error::Error + Send + Sync + 'static>),
 }
 
-impl gix_protocol::transport::IsSpuriousError for Error {
-    fn is_spurious(&self) -> bool {
-        false
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::SourceMatchesNothing { spec } => write!(f, "src refspec {spec:?} does not match any local ref"),
+            Error::DeleteAbsentRef { destination } => {
+                write!(f, "unable to delete {destination:?}: remote ref does not exist")
+            }
+            Error::UnqualifiedDestination {
+                destination,
+                source_spec,
+            } => write!(
+                f,
+                "destination {destination:?} is not a full ref name and its type could not be inferred from source {source_spec:?}"
+            ),
+            Error::DetachedHeadNeedsDestination => {
+                f.write_str("HEAD is detached; pushing it requires an explicit destination, like HEAD:refs/heads/main")
+            }
+            Error::Conflict { destination, sources } => write!(
+                f,
+                "destination {destination} would be written by more than one source: {sources:?}"
+            ),
+            Error::SourceObjectMissing { id, spec } => {
+                write!(f, "source object {id} for {spec:?} does not exist locally")
+            }
+            Error::StaleLease {
+                destination,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "stale lease for {destination}: expected the remote to be at {expected:?}, but it advertised {actual:?}"
+            ),
+            Error::LeaseRequiresSingleUpdate { candidates } => write!(
+                f,
+                "an exact lease can only be used when exactly one ref is updated, but {candidates} would be"
+            ),
+            Error::LeaseTrackingRefMissing { destination } => {
+                write!(f, "no remote-tracking ref is known for {destination} to lease against")
+            }
+            Error::InvalidRefName(err) => std::fmt::Display::fmt(err, f),
+            Error::Snapshot(_) => f.write_str("failed to snapshot the local repository for the push plan"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::SourceMatchesNothing { .. }
+            | Error::DeleteAbsentRef { .. }
+            | Error::UnqualifiedDestination { .. }
+            | Error::DetachedHeadNeedsDestination
+            | Error::Conflict { .. }
+            | Error::LeaseRequiresSingleUpdate { .. }
+            | Error::LeaseTrackingRefMissing { .. } => Some(const { &gix_error::ClassificationMarker::VALIDATION }),
+            Error::SourceObjectMissing { .. } => Some(const { &gix_error::ClassificationMarker::NOT_FOUND }),
+            Error::StaleLease { .. } => Some(const { &gix_error::ClassificationMarker::CONFLICT }),
+            Error::InvalidRefName(err) => std::error::Error::source(err),
+            Error::Snapshot(err) => Some(&**err),
+        }
+    }
+}
+
+impl From<gix_validate::reference::name::Error> for Error {
+    fn from(err: gix_validate::reference::name::Error) -> Self {
+        Error::InvalidRefName(err)
     }
 }
 
@@ -555,10 +614,10 @@ pub(crate) fn plan_inner(
     // `match_lhs` dedups `(lhs, rhs)` across specs, so an exact-duplicate spec whose mapping was
     // collapsed would otherwise look "unmatched" and trip step 4's must-match error (E28).
     for (si, spec) in all_specs.iter().enumerate() {
-        if let Some(src) = spec.to_ref().source() {
-            if source_matches_item(src, item_data.iter().map(|it| it.name.as_bstr())) {
-                spec_matched[si] = true;
-            }
+        if let Some(src) = spec.to_ref().source()
+            && source_matches_item(src, item_data.iter().map(|it| it.name.as_bstr()))
+        {
+            spec_matched[si] = true;
         }
     }
 
@@ -705,35 +764,35 @@ pub(crate) fn plan_inner(
             continue; // glob matching nothing is fine (like fetch).
         }
         // A rev-spec source is only admissible with an explicit destination (parser guarantee).
-        if let Some(dst_text) = sr.destination() {
-            if let Some(id) = resolve_rev(src) {
-                let (is_branch_src, is_tag_src) = (false, false);
-                pre.push(PreCand {
-                    spec_index: si,
-                    local: Some(Source::ObjectId(id)),
-                    new: Some(id),
-                    dest: RawDest::Qualify {
-                        text: dst_text.to_owned(),
-                        is_branch_src,
-                        is_tag_src,
-                    },
-                    force_spec: spec.allow_non_fast_forward(),
-                });
-                continue;
-            }
+        if let Some(dst_text) = sr.destination()
+            && let Some(id) = resolve_rev(src)
+        {
+            let (is_branch_src, is_tag_src) = (false, false);
+            pre.push(PreCand {
+                spec_index: si,
+                local: Some(Source::ObjectId(id)),
+                new: Some(id),
+                dest: RawDest::Qualify {
+                    text: dst_text.to_owned(),
+                    is_branch_src,
+                    is_tag_src,
+                },
+                force_spec: spec.allow_non_fast_forward(),
+            });
+            continue;
         }
         return Err(Error::SourceMatchesNothing { spec: src.to_owned() });
     }
 
     // ODB-verify every object-id / rev-spec source (the hex-needle path never touched the ODB).
     for c in &pre {
-        if let Some(Source::ObjectId(id)) = &c.local {
-            if !has_object(id.as_ref()) {
-                return Err(Error::SourceObjectMissing {
-                    id: *id,
-                    spec: c.local.as_ref().map(display_source).unwrap_or_default(),
-                });
-            }
+        if let Some(Source::ObjectId(id)) = &c.local
+            && !has_object(id.as_ref())
+        {
+            return Err(Error::SourceObjectMissing {
+                id: *id,
+                spec: c.local.as_ref().map(display_source).unwrap_or_default(),
+            });
         }
     }
 
@@ -1208,7 +1267,7 @@ mod adapter {
         let platform = repo.references().map_err(boxed)?;
         let mut out = Vec::new();
         for reference in platform.all().map_err(boxed)? {
-            let reference = reference.map_err(Error::Snapshot)?;
+            let reference = reference.map_err(boxed)?;
             let name = reference.name().to_owned();
             let target = match reference.target() {
                 gix_ref::TargetRef::Object(id) => id.to_owned(),
@@ -1249,7 +1308,7 @@ mod adapter {
     /// A best merge-base equal to `old` is exactly "`old` is an ancestor of `new`"; a missing merge
     /// base (disjoint histories) is [`Ancestry::NotAncestor`].
     /// NB (fused review): the oracle seam is infallible, so every `merge_base` failure must fold
-    /// into an `Ancestry` value. Disjoint histories (`NoMergeBase`) are genuinely `NotAncestor`;
+    /// into an `Ancestry` value. Disjoint histories (no merge base, `Ok(None)`) are genuinely `NotAncestor`;
     /// any OTHER error — a broken ODB/commit-graph, or a SHALLOW local history whose ancestor lies
     /// beyond the graft boundary — folds to `NotComparable` (surfacing as `RejectedNeedsForce`,
     /// never a silent non-FF) and is logged, so an infrastructure fault cannot masquerade as an
@@ -1259,14 +1318,14 @@ mod adapter {
             return Ancestry::NotComparable;
         }
         match repo.merge_base(old.to_owned(), new.to_owned()) {
-            Ok(base) => {
+            Ok(Some(base)) => {
                 if base.detach().as_ref() == old {
                     Ancestry::Ancestor
                 } else {
                     Ancestry::NotAncestor
                 }
             }
-            Err(crate::repository::merge_base::Error::NotFound { .. }) => Ancestry::NotAncestor,
+            Ok(None) => Ancestry::NotAncestor,
             Err(_) => {
                 gix_trace::coarse!("push::plan::ancestry_oracle_fault");
                 Ancestry::NotComparable

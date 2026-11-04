@@ -49,13 +49,14 @@ use crate::{
 /// key). Malformed values are `Ok(None)` under lenient config (the default for opened repos) and
 /// [`Error::PackThreads`] under a strict open.
 pub fn index_threads(repo: &Repository) -> Result<Option<usize>, Error> {
-    Ok(Pack::THREADS
+    Pack::THREADS
         .try_into_usize(
             repo.config
                 .resolved
                 .integer_filter(Pack::THREADS, &mut repo.filter_config_section()),
         )
-        .with_leniency(repo.options.lenient_config)?)
+        .with_leniency(repo.options.lenient_config)
+        .map_err(Error::PackThreads)
 }
 
 /// Whether the user asked for thin packs via `push.thin`.
@@ -73,7 +74,8 @@ pub fn thin(repo: &Repository) -> Result<bool, Error> {
                 .resolved
                 .boolean_filter(Push::THIN, &mut repo.filter_config_section()),
         )
-        .with_leniency(repo.options.lenient_config)?
+        .with_leniency(repo.options.lenient_config)
+        .map_err(Error::ThinConfig)?
         .unwrap_or(false))
 }
 
@@ -91,7 +93,8 @@ pub fn push_default(repo: &Repository) -> Result<crate::push::Default, Error> {
         .string_filter(Push::DEFAULT, &mut repo.filter_config_section())
         .map(|value| Push::DEFAULT.try_into_default(value))
         .transpose()
-        .with_leniency(repo.options.lenient_config)?
+        .with_leniency(repo.options.lenient_config)
+        .map_err(Error::PushDefaultConfig)?
         .unwrap_or_default())
 }
 
@@ -130,10 +133,10 @@ pub fn push_options(repo: &Repository) -> Vec<BString> {
 /// does not advertise `atomic`, so the config default is a hard requirement, not a soft
 /// [`WhenAdvertised`](Atomicity::WhenAdvertised)); unset or `false` maps to the rolfdb default
 /// [`Atomicity::Disabled`]. A malformed value is `Disabled` under lenient config (the default for
-/// opened repos) and the raw [`boolean::Error`](crate::config::boolean::Error) under a strict open —
+/// opened repos) and the raw boolean parse [`Error`](crate::Error) under a strict open —
 /// the caller ([`prepare_push`](crate::remote::Connection::prepare_push)) lifts it into
 /// [`prepare::Error::AtomicConfig`](super::prepare::Error::AtomicConfig).
-pub fn atomic(repo: &Repository) -> Result<Atomicity, crate::config::boolean::Error> {
+pub fn atomic(repo: &Repository) -> crate::Result<Atomicity> {
     let enabled = Push::ATOMIC
         .enrich_error(
             repo.config

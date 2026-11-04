@@ -104,15 +104,39 @@ pub struct Outcome {
 
 mod error {
     /// The error returned when writing local tracking refs after a push.
-    #[derive(Debug, thiserror::Error)]
-    #[allow(missing_docs)]
+    #[derive(Debug)]
+    #[expect(missing_docs)]
     pub enum Error {
-        #[error("Failed to update the local tracking references to match the pushed refs")]
-        EditReferences(#[from] crate::reference::edit::Error),
-        #[error("Failed to read a local tracking reference while bookkeeping the push")]
-        FindReference(#[from] crate::reference::find::Error),
-        #[error("A tracking ref reverse-mapped from a pushed destination had an invalid name")]
-        InvalidRefName(#[from] gix_validate::reference::name::Error),
+        EditReferences(gix_error::Error),
+        FindReference(gix_error::Error),
+        InvalidRefName(gix_validate::reference::name::Error),
+    }
+
+    impl std::fmt::Display for Error {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(match self {
+                Error::EditReferences(_) => "Failed to update the local tracking references to match the pushed refs",
+                Error::FindReference(_) => "Failed to read a local tracking reference while bookkeeping the push",
+                Error::InvalidRefName(_) => {
+                    "A tracking ref reverse-mapped from a pushed destination had an invalid name"
+                }
+            })
+        }
+    }
+
+    impl std::error::Error for Error {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Error::EditReferences(err) | Error::FindReference(err) => Some(err),
+                Error::InvalidRefName(err) => Some(err),
+            }
+        }
+    }
+
+    impl From<gix_validate::reference::name::Error> for Error {
+        fn from(err: gix_validate::reference::name::Error) -> Self {
+            Error::InvalidRefName(err)
+        }
     }
 }
 pub use error::Error;

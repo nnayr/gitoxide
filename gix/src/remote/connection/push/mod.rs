@@ -44,68 +44,99 @@ pub mod prepare {
 
     /// The error returned by the push `prepare_push()` step.
     ///
-    /// A deliberate structural divergence from [`fetch::prepare::Error`](crate::remote::fetch::prepare::Error):
-    /// fetch keeps a single `RefMap(#[from] ref_map::Error)` because its handshake/ls-refs step is a
-    /// standalone public operation, whereas push has no standalone advertisement op (the ReceivePack
-    /// handshake exists only inside `prepare_push`), so the transport/credential/handshake variants
-    /// `fetch` keeps inside `ref_map::Error` are **inlined flat** here. The `Plan` variant (stale
-    /// leases surface at prepare time) is appended by gpx05.
+    /// A deliberate structural divergence from `fetch`'s prepare step, which reports through the
+    /// erased [`gix::Error`](crate::Error): push keeps this typed enum because callers recover from
+    /// [`MissingRefSpecs`](Error::MissingRefSpecs) and a stale lease in [`Plan`](Error::Plan) specifically.
+    /// Unlike fetch, whose handshake/ls-refs step is a standalone public operation, push has no
+    /// standalone advertisement op (the ReceivePack handshake exists only inside `prepare_push`), so the
+    /// transport/credential/handshake failures are **inlined flat** here, each carrying the erased
+    /// [`gix::Error`](crate::Error) of the failing step. The `Plan` variant (stale leases surface at
+    /// prepare time) is appended by gpx05.
     ///
     /// gpx07 handshake-path audit (gpx02 owed note): every fallible call in
     /// `receive_pack_handshake_by_ref` is already wrapped —
-    /// `Transport::configure` returns `Box<dyn Error>` (⇒ [`ConfigureTransport`](Error::ConfigureTransport)),
-    /// `gix_protocol::handshake` returns [`handshake::Error`](gix_protocol::handshake::Error)
-    /// (⇒ [`Handshake`](Error::Handshake)), credential/transport-config each have their own variant,
-    /// and the missing-advertisement guard is [`MissingRefAdvertisement`](Error::MissingRefAdvertisement).
-    /// No bare [`transport::client::Error`](gix_protocol::transport::client::Error) escapes the prepare
+    /// `Transport::configure` ⇒ [`ConfigureTransport`](Error::ConfigureTransport),
+    /// `gix_protocol::handshake` ⇒ [`Handshake`](Error::Handshake),
+    /// credential/transport-config each have their own variant, and the missing-advertisement guard is
+    /// [`MissingRefAdvertisement`](Error::MissingRefAdvertisement). No bare
+    /// [`transport::client::Error`](gix_protocol::transport::client::Error) escapes the prepare
     /// path (it only appears on the *send* terminal, [`push::Error::Client`](super::Error)), so no
     /// `Client` variant is needed here.
-    #[derive(Debug, thiserror::Error)]
-    #[allow(missing_docs)]
+    ///
+    /// Retryability is exposed through [`gix_error::classify()`] on the source chain, so a retryable
+    /// handshake failure stays retryable.
+    #[derive(Debug)]
+    #[expect(missing_docs)]
     pub enum Error {
-        #[error("Cannot perform a meaningful push operation without any configured ref-specs")]
         MissingRefSpecs,
-        #[error("Failed to configure the transport before connecting to {url:?}")]
         GatherTransportConfig {
             url: BString,
-            source: crate::config::transport::Error,
+            source: gix_error::Error,
         },
-        #[error("Failed to configure the transport layer")]
-        ConfigureTransport(#[from] Box<dyn std::error::Error + Send + Sync + 'static>),
-        #[error(transparent)]
-        Handshake(#[from] gix_protocol::handshake::Error),
-        #[error(transparent)]
-        ConfigureCredentials(#[from] crate::config::credential_helpers::Error),
-        #[error(
-            "Refusing to push without an inline ref advertisement — receive-pack always speaks \
-             protocol V0/V1, but the server answered with {version:?}"
-        )]
-        MissingRefAdvertisement { version: gix_protocol::transport::Protocol },
+        ConfigureTransport(gix_error::Error),
+        Handshake(gix_error::Error),
+        ConfigureCredentials(gix_error::Error),
+        MissingRefAdvertisement {
+            version: gix_protocol::transport::Protocol,
+        },
         /// A stale force-with-lease or a malformed refspec set surfaces from the sync `plan()` step
         /// (gpx05) as a prepare-time abort — C-git parity for whole-push failures.
-        #[error(transparent)]
-        Plan(#[from] super::plan::Error),
+        Plan(super::plan::Error),
         /// The local reference snapshot (or `HEAD` state) that feeds the plan could not be read.
         /// Additive gpx08 variant so the self-contained plan adapter (`send_pack::plan_from_repo`)
         /// can surface a ref-store failure rather than swallow it; gpx07's `plan()` adapter shares it.
-        #[error("Failed to read the local references while planning the push")]
-        CollectRefs(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+        CollectRefs(Box<dyn std::error::Error + Send + Sync + 'static>),
         /// The `push.atomic` configuration default (read at prepare time to seed the [`Atomicity`]
         /// the `with_atomic` builder overrides) could not be parsed under a strict-config open.
         /// Additive gpx10 variant — `push.pushOption` has no parse error, so only `push.atomic`
         /// contributes a fallible config read to the prepare path.
         ///
         /// [`Atomicity`]: gix_protocol::push::Atomicity
-        #[error("Could not read the 'push.atomic' configuration")]
-        AtomicConfig(#[from] crate::config::boolean::Error),
+        AtomicConfig(gix_error::Error),
     }
 
-    impl gix_protocol::transport::IsSpuriousError for Error {
-        fn is_spurious(&self) -> bool {
+    impl std::fmt::Display for Error {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
-                Error::Handshake(err) => err.is_spurious(),
-                _ => false,
+                Error::MissingRefSpecs => {
+                    f.write_str("Cannot perform a meaningful push operation without any configured ref-specs")
+                }
+                Error::GatherTransportConfig { url, .. } => {
+                    write!(f, "Failed to configure the transport before connecting to {url:?}")
+                }
+                Error::ConfigureTransport(_) => f.write_str("Failed to configure the transport layer"),
+                Error::Handshake(err) | Error::ConfigureCredentials(err) => std::fmt::Display::fmt(err, f),
+                Error::MissingRefAdvertisement { version } => write!(
+                    f,
+                    "Refusing to push without an inline ref advertisement — receive-pack always speaks \
+                     protocol V0/V1, but the server answered with {version:?}"
+                ),
+                Error::Plan(err) => std::fmt::Display::fmt(err, f),
+                Error::CollectRefs(_) => f.write_str("Failed to read the local references while planning the push"),
+                Error::AtomicConfig(_) => f.write_str("Could not read the 'push.atomic' configuration"),
             }
+        }
+    }
+
+    impl std::error::Error for Error {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Error::MissingRefSpecs => Some(const { &gix_error::ClassificationMarker::VALIDATION }),
+                Error::GatherTransportConfig { source, .. } => Some(source),
+                Error::ConfigureTransport(err)
+                | Error::Handshake(err)
+                | Error::ConfigureCredentials(err)
+                | Error::AtomicConfig(err) => Some(err),
+                Error::MissingRefAdvertisement { .. } => Some(const { &gix_error::ClassificationMarker::UNSUPPORTED }),
+                Error::Plan(err) => std::error::Error::source(err),
+                Error::CollectRefs(err) => Some(&**err),
+            }
+        }
+    }
+
+    impl From<super::plan::Error> for Error {
+        fn from(err: super::plan::Error) -> Self {
+            Error::Plan(err)
         }
     }
 }
@@ -158,7 +189,7 @@ pub enum ProgressId {
     WritePack,
 }
 
-impl From<ProgressId> for gix_features::progress::Id {
+impl From<ProgressId> for gix_utils::progress::Id {
     fn from(v: ProgressId) -> Self {
         match v {
             ProgressId::CountObjects => *b"PSCO",
@@ -170,12 +201,15 @@ impl From<ProgressId> for gix_features::progress::Id {
 #[cfg(test)]
 mod tests {
     use crate::remote::push;
-    use gix_protocol::transport::IsSpuriousError;
+
+    fn is_spurious(err: &(dyn std::error::Error + 'static)) -> bool {
+        gix_error::classify(err).can_retry()
+    }
 
     #[test]
     fn prepare_missing_ref_specs_is_not_spurious_and_reads_like_fetch() {
         let err = push::prepare::Error::MissingRefSpecs;
-        assert!(!err.is_spurious());
+        assert!(!is_spurious(&err));
         assert_eq!(
             err.to_string(),
             "Cannot perform a meaningful push operation without any configured ref-specs"
@@ -185,7 +219,7 @@ mod tests {
     #[test]
     fn client_errors_forward_spuriousness() {
         let err = push::Error::Client(std::io::Error::from(std::io::ErrorKind::ConnectionReset).into());
-        assert!(err.is_spurious());
+        assert!(is_spurious(&err));
     }
 
     #[test]
@@ -194,7 +228,7 @@ mod tests {
         // error via `#[from]`; it is a local fault, so it never reports as spurious.
         let err: push::Error = super::pack::Error::Interrupted.into();
         assert!(matches!(err, push::Error::Pack(super::pack::Error::Interrupted)));
-        assert!(!err.is_spurious());
+        assert!(!is_spurious(&err));
     }
 
     #[test]
@@ -203,7 +237,7 @@ mod tests {
             local: gix_hash::Kind::Sha1,
             remote: gix_hash::Kind::Sha256,
         };
-        assert!(!err.is_spurious());
+        assert!(!is_spurious(&err));
     }
 
     #[test]
@@ -215,8 +249,8 @@ mod tests {
 
     #[test]
     fn progress_ids_are_distinct() {
-        let count: gix_features::progress::Id = push::ProgressId::CountObjects.into();
-        let write: gix_features::progress::Id = push::ProgressId::WritePack.into();
+        let count: gix_utils::progress::Id = push::ProgressId::CountObjects.into();
+        let write: gix_utils::progress::Id = push::ProgressId::WritePack.into();
         assert_ne!(count, write);
     }
 

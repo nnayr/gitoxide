@@ -40,58 +40,83 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use gix_features::progress::{Count, DynNestedProgress, Progress};
 use gix_hash::ObjectId;
 use gix_pack::data::output::{Count as OutputCount, bytes::FromEntriesIter, count, entry};
 use gix_protocol::handshake::Ref;
+use gix_utils::progress::{Count, DynNestedProgress, Progress};
 
 use super::ProgressId;
 
 /// The error produced while building a pack for a push.
 ///
 /// Later units append their own variants as the driver grows; the enum is intentionally not
-/// `#[non_exhaustive]`, matching gitoxide's evolution mode for error types.
-#[derive(Debug, thiserror::Error)]
-#[allow(missing_docs)]
+/// `#[non_exhaustive]`, matching gitoxide's evolution mode for error types. The wrapped
+/// [`gix::Error`](crate::Error)s are the erased failures of the respective `gix-traverse`, `gix-pack`
+/// and `gix-object` step.
+#[derive(Debug)]
 pub enum Error {
-    #[error("Interrupted while building the pack")]
     Interrupted,
-    // NB: a mid-count interrupt arrives as Count(objects::Error::Interrupted) via the #[from]
-    // conversion; write_pack remaps it to the uniform Interrupted above (review F3).
-    #[error(transparent)]
-    Traverse(#[from] gix_traverse::commit::simple::Error),
-    #[error(transparent)]
-    Count(#[from] count::objects::Error),
-    #[error(transparent)]
-    IterEntries(#[from] entry::iter_from_counts::Error),
-    #[error(transparent)]
-    PackWrite(#[from] gix_hash::io::Error),
-    #[error(transparent)]
-    Find(#[from] gix_object::find::Error),
-    #[error(transparent)]
-    Decode(#[from] gix_object::decode::Error),
-    #[error("Failed to diff a merge parent's tree during the merge-undercount repair")]
-    MergeRepairDiff(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
-    #[error("The object {id} to be pushed is missing from the local object database")]
+    // NB: a mid-count interrupt arrives as a cancelled `Count` error; write_pack remaps it to the
+    // uniform Interrupted above (review F3).
+    Traverse(gix_error::Error),
+    Count(gix_error::Error),
+    IterEntries(gix_error::Error),
+    PackWrite(gix_error::Error),
+    Find(gix_error::Error),
+    Decode(gix_error::Error),
+    MergeRepairDiff(Box<dyn std::error::Error + Send + Sync + 'static>),
     MissingObject {
         /// The object that could not be found.
         id: ObjectId,
     },
-    #[error(
-        "Refusing to push the tree object {id} as a ref tip — only commits, annotated tags, and \
-         blobs may be a ref's value; a bare tree has no receive-pack meaning"
-    )]
     UnsupportedTipType {
         /// The tree object that was offered as a tip.
         id: ObjectId,
     },
 }
 
-impl gix_protocol::transport::IsSpuriousError for Error {
-    fn is_spurious(&self) -> bool {
-        // Every failure here is a local object-database or I/O fault; none is a retryable transport
-        // hiccup (the wire lives in `gpx08`, whose `push::Error` forwards spuriousness there).
-        false
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::Interrupted => f.write_str("Interrupted while building the pack"),
+            Error::Traverse(err)
+            | Error::Count(err)
+            | Error::IterEntries(err)
+            | Error::PackWrite(err)
+            | Error::Find(err)
+            | Error::Decode(err) => std::fmt::Display::fmt(err, f),
+            Error::MergeRepairDiff(_) => {
+                f.write_str("Failed to diff a merge parent's tree during the merge-undercount repair")
+            }
+            Error::MissingObject { id } => {
+                write!(
+                    f,
+                    "The object {id} to be pushed is missing from the local object database"
+                )
+            }
+            Error::UnsupportedTipType { id } => write!(
+                f,
+                "Refusing to push the tree object {id} as a ref tip — only commits, annotated tags, and \
+                 blobs may be a ref's value; a bare tree has no receive-pack meaning"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Interrupted => Some(const { &gix_error::ClassificationMarker::CANCELLED }),
+            Error::Traverse(err)
+            | Error::Count(err)
+            | Error::IterEntries(err)
+            | Error::PackWrite(err)
+            | Error::Find(err)
+            | Error::Decode(err) => Some(err),
+            Error::MergeRepairDiff(err) => Some(&**err),
+            Error::MissingObject { .. } => Some(const { &gix_error::ClassificationMarker::NOT_FOUND }),
+            Error::UnsupportedTipType { .. } => Some(const { &gix_error::ClassificationMarker::UNSUPPORTED }),
+        }
     }
 }
 
@@ -199,16 +224,17 @@ where
     // 2. Revwalk the visible commits (tips minus boundaries), recording the visible set and the
     //    union of parents so the boundary scrub can find the hidden frontier.
     let mut counting = progress.add_child_with_id("counting objects".into(), ProgressId::CountObjects.into());
-    counting.init(None, gix_features::progress::count("objects"));
+    counting.init(None, gix_utils::progress::count("objects"));
 
     let mut visible = gix_hashtable::HashSet::default();
     let mut visible_ids: Vec<ObjectId> = Vec::new();
     let mut parent_union: Vec<ObjectId> = Vec::new();
     {
-        let walk =
-            gix_traverse::commit::Simple::new(commit_tips.iter().copied(), objects.clone()).hide(boundaries.clone())?;
+        let walk = gix_traverse::commit::Simple::new(commit_tips.iter().copied(), objects.clone())
+            .hide(boundaries.clone())
+            .map_err(Error::Traverse)?;
         for info in walk {
-            let info = info?;
+            let info = info.map_err(Error::Traverse)?;
             if visible.insert(info.id) {
                 visible_ids.push(info.id);
             }
@@ -218,9 +244,7 @@ where
 
     // 3. Count objects with tree-diff expansion (single-threaded → deterministic order).
     let (mut counts, count_stats) = {
-        let mut input = visible_ids
-            .iter()
-            .map(|id| Ok::<ObjectId, Box<dyn std::error::Error + Send + Sync + 'static>>(*id));
+        let mut input = visible_ids.iter().map(|id| Ok::<ObjectId, gix_error::Error>(*id));
         count::objects_unthreaded(
             &objects,
             &mut input,
@@ -228,9 +252,12 @@ where
             should_interrupt,
             count::objects::ObjectExpansion::TreeAdditionsComparedToAncestor,
         )
-        .map_err(|e| match e {
-            count::objects::Error::Interrupted => Error::Interrupted,
-            other => Error::Count(other),
+        .map_err(|e| {
+            if e.is_cancelled() {
+                Error::Interrupted
+            } else {
+                Error::Count(e)
+            }
         })?
     };
 
@@ -262,8 +289,9 @@ where
             if should_interrupt.load(Ordering::Relaxed) {
                 return Err(Error::Interrupted);
             }
-            let commit =
-                gix_object::Find::try_find(&objects, id, &mut buf)?.ok_or_else(|| Error::MissingObject { id: *id })?;
+            let commit = gix_object::Find::try_find(&objects, id, &mut buf)
+                .map_err(Error::Find)?
+                .ok_or_else(|| Error::MissingObject { id: *id })?;
             let mut iter = gix_object::CommitRefIter::from_bytes(commit.data, object_hash);
             let tree_id = iter.tree_id().expect("every commit names a tree");
             let parents: Vec<ObjectId> = iter.parent_ids().collect();
@@ -272,14 +300,17 @@ where
             }
             let mut union = MergeAdditions::default();
             for parent in &parents {
-                let parent_commit = gix_object::Find::try_find(&objects, parent, &mut buf_parent)?
+                let parent_commit = gix_object::Find::try_find(&objects, parent, &mut buf_parent)
+                    .map_err(Error::Find)?
                     .ok_or_else(|| Error::MissingObject { id: *parent })?;
                 let parent_tree_id = gix_object::CommitRefIter::from_bytes(parent_commit.data, object_hash)
                     .tree_id()
                     .expect("every commit names a tree");
-                let parent_tree = gix_object::Find::try_find(&objects, &parent_tree_id, &mut buf_parent)?
+                let parent_tree = gix_object::Find::try_find(&objects, &parent_tree_id, &mut buf_parent)
+                    .map_err(Error::Find)?
                     .ok_or_else(|| Error::MissingObject { id: parent_tree_id })?;
-                let current_tree = gix_object::Find::try_find(&objects, &tree_id, &mut buf_tree)?
+                let current_tree = gix_object::Find::try_find(&objects, &tree_id, &mut buf_tree)
+                    .map_err(Error::Find)?
                     .ok_or_else(|| Error::MissingObject { id: tree_id })?;
                 gix_diff::tree(
                     gix_object::TreeRefIter::from_bytes(parent_tree.data, object_hash),
@@ -299,7 +330,7 @@ where
         if !missing.is_empty() {
             let mut pack_buf = Vec::new();
             for oid in missing {
-                let location = gix_pack::Find::location_by_oid(&objects, &oid, &mut pack_buf);
+                let location = gix_pack::Find::location_by_oid(&objects, &oid, &mut pack_buf).map_err(Error::Find)?;
                 counts.push(OutputCount::from_data(oid, location));
             }
         }
@@ -318,43 +349,46 @@ where
 
     // 6. Generate entries and stream the pack bytes.
     let object_count = counts.len() as u32;
-    let entries_progress = progress.add_child_with_id("creating entries".into(), gix_features::progress::UNKNOWN);
-    let in_order = gix_features::parallel::InOrderIter::from(entry::iter_from_counts(
-        counts,
-        objects.clone(),
-        Box::new(entries_progress),
-        entry::iter_from_counts::Options {
-            version: gix_pack::data::Version::V2,
-            mode: entry::iter_from_counts::Mode::PackCopyAndBaseObjects,
-            allow_thin_pack: false,
-            // Single-threaded generation so the streamed byte order is deterministic.
-            thread_limit: Some(1),
-            chunk_size: 1000,
-            // Deflate level for objects not copied from an existing pack; DEFAULT matches git's
-            // pack.compression default and the field's own default (upstream added it in the
-            // gix-zlib split, so the initializer is no longer inferable from `..Default::default()`).
-            compression: gix_zlib::Compression::DEFAULT,
-        },
-    ));
+    let entries_progress = progress.add_child_with_id("creating entries".into(), gix_utils::progress::UNKNOWN);
+    let in_order = gix_parallel::InOrderIter::from(
+        entry::iter_from_counts(
+            counts,
+            objects.clone(),
+            Box::new(entries_progress),
+            entry::iter_from_counts::Options {
+                version: gix_pack::data::Version::V2,
+                mode: entry::iter_from_counts::Mode::PackCopyAndBaseObjects,
+                allow_thin_pack: false,
+                // Single-threaded generation so the streamed byte order is deterministic.
+                thread_limit: Some(1),
+                chunk_size: 1000,
+                // Deflate level for objects not copied from an existing pack; DEFAULT matches git's
+                // pack.compression default and the field's own default (upstream added it in the
+                // gix-zlib split, so the initializer is no longer inferable from `..Default::default()`).
+                compression: gix_zlib::Compression::DEFAULT,
+            },
+        )
+        .map_err(Error::IterEntries)?,
+    );
 
     let mut writing = progress.add_child_with_id("writing pack".into(), ProgressId::WritePack.into());
-    writing.init(None, gix_features::progress::bytes());
+    writing.init(None, gix_utils::progress::bytes());
 
     let mut from_entries = FromEntriesIter::new(in_order, out, object_count, gix_pack::data::Version::V2, object_hash);
     for written in from_entries.by_ref() {
         if should_interrupt.load(Ordering::Relaxed) {
             return Err(Error::Interrupted);
         }
-        let written = written.map_err(map_bytes_error)?;
+        let written = written.map_err(Error::PackWrite)?;
         writing.inc_by(written as usize);
     }
     let pack_hash = from_entries.digest();
 
-    use gix_features::parallel::reduce::Finalize;
+    use gix_parallel::Finalize;
     // Reaches through FromEntriesIter's public `input`/`inner` fields (vendored gix-pack v0.63.0
     // layout) to recover the entries-written stat; a base bump that reshapes FromEntriesIter will
     // surface here as a compile error, which is the desired breakage mode (review note).
-    let entries = from_entries.input.inner.finalize()?;
+    let entries = from_entries.input.inner.finalize().map_err(Error::IterEntries)?;
 
     Ok(Outcome {
         object_count,
@@ -427,9 +461,11 @@ where
                 gix_object::Kind::Commit => Step::Commit,
                 gix_object::Kind::Blob => Step::Blob,
                 gix_object::Kind::Tree => Step::Tree,
-                gix_object::Kind::Tag => {
-                    Step::Tag(gix_object::TagRefIter::from_bytes(data.data, cur.kind()).target_id()?)
-                }
+                gix_object::Kind::Tag => Step::Tag(
+                    gix_object::TagRefIter::from_bytes(data.data, cur.kind())
+                        .target_id()
+                        .map_err(Error::Decode)?,
+                ),
             }
         };
         match step {
@@ -500,23 +536,14 @@ where
         // The parent commit leaked as a count; its root tree leaked alongside it. Both are reachable
         // from a boundary (the server has them), so drop both. If we cannot read the parent we also
         // cannot have counted its tree, so there is nothing more to scrub.
-        if let Ok(Some(data)) = objects.try_find(parent, buf) {
-            if data.kind == gix_object::Kind::Commit {
-                if let Ok(tree) = gix_object::CommitRefIter::from_bytes(data.data, parent.kind()).tree_id() {
-                    scrub.insert(tree);
-                }
-            }
+        if let Ok(Some(data)) = objects.try_find(parent, buf)
+            && data.kind == gix_object::Kind::Commit
+            && let Ok(tree) = gix_object::CommitRefIter::from_bytes(data.data, parent.kind()).tree_id()
+        {
+            scrub.insert(tree);
         }
     }
     scrub
-}
-
-/// Map the `FromEntriesIter` error (I/O vs. entry-generation) onto our [`Error`].
-fn map_bytes_error(err: gix_pack::data::output::bytes::Error<entry::iter_from_counts::Error>) -> Error {
-    match err {
-        gix_pack::data::output::bytes::Error::Io(io) => Error::PackWrite(io),
-        gix_pack::data::output::bytes::Error::Input(inner) => Error::IterEntries(inner),
-    }
 }
 
 #[cfg(test)]
@@ -551,7 +578,7 @@ mod tests {
         }
 
         fn odb(&self) -> Odb {
-            let mut handle = gix_odb::at(self.repo.git_dir().join("objects"))
+            let mut handle = gix_odb::at(self.repo.git_dir().join("objects"), self.repo.object_hash())
                 .expect("open odb")
                 .into_arc()
                 .expect("arc handle");
@@ -616,7 +643,7 @@ mod tests {
                     },
                 }),
                 message: "tag message".into(),
-                pgp_signature: None,
+                signature: None,
             };
             self.repo.write_object(&tag).expect("write tag").detach()
         }
@@ -625,7 +652,7 @@ mod tests {
     /// Build a pack for `tips`/`boundaries` and return `(object_count, pack trailer, pack bytes)`.
     fn build(odb: &Odb, tips: Vec<ObjectId>, boundaries: Vec<ObjectId>) -> Result<(Outcome, Vec<u8>), Error> {
         let mut out = Vec::new();
-        let mut progress = gix_features::progress::Discard;
+        let mut progress = gix_utils::progress::Discard;
         let outcome = write_pack(
             odb.clone(),
             tips,
@@ -643,18 +670,18 @@ mod tests {
     fn indexed_object_ids(pack: &[u8], odb: &Odb) -> HashSet<ObjectId> {
         let dir = gix_testtools::tempfile::tempdir().expect("tempdir");
         let mut cursor = std::io::Cursor::new(pack);
-        let mut progress = gix_features::progress::Discard;
+        let mut progress = gix_utils::progress::Discard;
         let outcome = gix_pack::Bundle::write_to_directory(
             &mut cursor,
             Some(dir.path()),
             &mut progress,
             &AtomicBool::new(false),
             Some(odb.clone()),
+            Kind::Sha1,
             gix_pack::bundle::write::Options {
                 thread_limit: Some(1),
                 iteration_mode: gix_pack::data::input::Mode::Verify,
                 index_version: gix_pack::index::Version::default(),
-                object_hash: Kind::Sha1,
                 // Upstream added these in the gix-zlib split; use the struct's own defaults.
                 alloc_limit_bytes: None,
                 compression: gix_zlib::Compression::BEST_SPEED,
@@ -953,40 +980,40 @@ mod tests {
 
     #[derive(Clone)]
     struct IdRecorder {
-        ids: std::sync::Arc<std::sync::Mutex<Vec<gix_features::progress::Id>>>,
+        ids: std::sync::Arc<std::sync::Mutex<Vec<gix_utils::progress::Id>>>,
     }
 
-    impl gix_features::progress::Count for IdRecorder {
-        fn set(&self, _step: gix_features::progress::Step) {}
-        fn step(&self) -> gix_features::progress::Step {
+    impl gix_utils::progress::Count for IdRecorder {
+        fn set(&self, _step: gix_utils::progress::Step) {}
+        fn step(&self) -> gix_utils::progress::Step {
             0
         }
-        fn inc_by(&self, _step: gix_features::progress::Step) {}
-        fn counter(&self) -> gix_features::progress::StepShared {
-            gix_features::progress::Discard.counter()
+        fn inc_by(&self, _step: gix_utils::progress::Step) {}
+        fn counter(&self) -> gix_utils::progress::StepShared {
+            gix_utils::progress::Discard.counter()
         }
     }
 
-    impl gix_features::progress::Progress for IdRecorder {
-        fn init(&mut self, _max: Option<gix_features::progress::Step>, _unit: Option<gix_features::progress::Unit>) {}
+    impl gix_utils::progress::Progress for IdRecorder {
+        fn init(&mut self, _max: Option<gix_utils::progress::Step>, _unit: Option<gix_utils::progress::Unit>) {}
         fn set_name(&mut self, _name: String) {}
         fn name(&self) -> Option<String> {
             None
         }
-        fn id(&self) -> gix_features::progress::Id {
-            gix_features::progress::UNKNOWN
+        fn id(&self) -> gix_utils::progress::Id {
+            gix_utils::progress::UNKNOWN
         }
-        fn message(&self, _level: gix_features::progress::MessageLevel, _message: String) {}
+        fn message(&self, _level: gix_utils::progress::MessageLevel, _message: String) {}
     }
 
-    impl gix_features::progress::NestedProgress for IdRecorder {
-        type SubProgress = gix_features::progress::Discard;
+    impl gix_utils::progress::NestedProgress for IdRecorder {
+        type SubProgress = gix_utils::progress::Discard;
         fn add_child(&mut self, _name: impl Into<String>) -> Self::SubProgress {
-            gix_features::progress::Discard
+            gix_utils::progress::Discard
         }
-        fn add_child_with_id(&mut self, _name: impl Into<String>, id: gix_features::progress::Id) -> Self::SubProgress {
+        fn add_child_with_id(&mut self, _name: impl Into<String>, id: gix_utils::progress::Id) -> Self::SubProgress {
             self.ids.lock().unwrap().push(id);
-            gix_features::progress::Discard
+            gix_utils::progress::Discard
         }
     }
 
@@ -1013,8 +1040,8 @@ mod tests {
         .expect("pack builds");
 
         let ids = recorder.ids.lock().unwrap();
-        let count: gix_features::progress::Id = ProgressId::CountObjects.into();
-        let write: gix_features::progress::Id = ProgressId::WritePack.into();
+        let count: gix_utils::progress::Id = ProgressId::CountObjects.into();
+        let write: gix_utils::progress::Id = ProgressId::WritePack.into();
         assert!(ids.contains(&count), "CountObjects id emitted");
         assert!(ids.contains(&write), "WritePack id emitted");
     }
@@ -1027,7 +1054,7 @@ mod tests {
         let commit = fx.commit(tree, vec![], "c");
 
         let mut out = Vec::new();
-        let mut progress = gix_features::progress::Discard;
+        let mut progress = gix_utils::progress::Discard;
         let err = write_pack(
             odb,
             vec![commit],
@@ -1076,7 +1103,7 @@ mod tests {
             inner: Vec::new(),
             flag: &flag,
         };
-        let mut progress = gix_features::progress::Discard;
+        let mut progress = gix_utils::progress::Discard;
         let err = write_pack(odb, vec![tip], vec![], Kind::Sha1, &mut out, &mut progress, &flag).unwrap_err();
         assert!(
             matches!(err, Error::Interrupted),
