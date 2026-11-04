@@ -122,7 +122,7 @@ pub fn main() -> Result<()> {
                 let mut config_mut = repo.config_snapshot_mut();
                 // Enable precious file parsing unless the user made a choice.
                 if config_mut
-                    .boolean(gix::config::tree::Gitoxide::PARSE_PRECIOUS)
+                    .boolean(gix::config::tree::Gitoxide::PARSE_PRECIOUS)?
                     .is_none()
                 {
                     config_mut.set_raw_value(gix::config::tree::Gitoxide::PARSE_PRECIOUS, "true")?;
@@ -147,7 +147,7 @@ pub fn main() -> Result<()> {
     let auto_verbose = !progress && !args.no_verbose;
 
     let should_interrupt = Arc::new(AtomicBool::new(false));
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     unsafe {
         // SAFETY: The closure doesn't use mutexes or memory allocation, so it should be safe to call from a signal handler.
         gix::interrupt::init_handler(1, {
@@ -788,24 +788,63 @@ pub fn main() -> Result<()> {
                 }
             }
         }
-        Subcommands::Config(config::Platform { filter }) => prepare_and_run(
-            "config-list",
-            trace,
-            verbose,
-            progress,
-            progress_keep_open,
-            None,
-            move |_progress, out, _err| {
-                core::repository::config::list(
-                    repository(Mode::LenientWithGitInstallConfig)?,
-                    filter,
-                    config,
-                    format,
-                    out,
-                )
-            },
-        )
-        .map(|_| ()),
+        Subcommands::Config(config::Platform { filter, cmd }) => match cmd {
+            Some(config::Subcommands::Show) | None => prepare_and_run(
+                "config-show",
+                trace,
+                verbose,
+                progress,
+                progress_keep_open,
+                None,
+                move |_progress, out, _err| {
+                    core::repository::config::show(
+                        repository(Mode::LenientWithGitInstallConfig)?,
+                        filter,
+                        config,
+                        format,
+                        out,
+                    )
+                },
+            )
+            .map(|_| ()),
+            Some(config::Subcommands::List) => prepare_and_run(
+                "config-list-files",
+                trace,
+                verbose,
+                progress,
+                progress_keep_open,
+                None,
+                move |_progress, out, _err| {
+                    core::repository::config::list_files(
+                        repository(Mode::LenientWithGitInstallConfig)?,
+                        config,
+                        format,
+                        out,
+                    )
+                },
+            )
+            .map(|_| ()),
+            Some(config::Subcommands::Fmt {
+                in_place,
+                in_file,
+                out_file,
+            }) => prepare_and_run(
+                "config-fmt",
+                trace,
+                verbose,
+                progress,
+                progress_keep_open,
+                None,
+                move |_progress, out, _err| {
+                    let repo = in_file
+                        .is_none()
+                        .then(|| repository(Mode::LenientWithGitInstallConfig))
+                        .transpose()?;
+                    core::repository::config::fmt(repo, in_file, out_file, in_place, out)
+                },
+            )
+            .map(|_| ()),
+        },
         Subcommands::Free(subcommands) => match subcommands {
             free::Subcommands::Discover => prepare_and_run(
                 "discover",

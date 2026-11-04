@@ -75,7 +75,7 @@ pub mod decode {
 
     /// The error returned by [`from_bytes()`][Context::from_bytes()].
     #[derive(Debug, thiserror::Error)]
-    #[allow(missing_docs)]
+    #[expect(missing_docs)]
     pub enum Error {
         #[error("Illformed UTF-8 in value of key {key:?}: {value:?}")]
         IllformedUtf8InValue { key: String, value: BString },
@@ -139,7 +139,9 @@ pub mod decode {
                     "url" => *url = Some(value),
                     "path" => *path = Some(value),
                     "quit" => {
-                        *quit = gix_config_value::Boolean::try_from(value.as_ref()).ok().map(Into::into);
+                        *quit = gix_config_value::Boolean::try_from(value.as_bstr())
+                            .ok()
+                            .map(Into::into);
                     }
                     _ => {}
                 }

@@ -65,8 +65,8 @@ impl crate::Repository {
     /// assert_eq!(remote.refspecs(gix::remote::Direction::Fetch).len(), 1);
     /// # Ok(()) }
     /// ```
-    pub fn find_remote<'a>(&self, name_or_url: impl Into<&'a BStr>) -> Result<Remote<'_>, find::existing::Error> {
-        let name_or_url = name_or_url.into();
+    pub fn find_remote(&self, name_or_url: impl gix_utils::AsBStr) -> Result<Remote<'_>, find::existing::Error> {
+        let name_or_url = name_or_url.as_bstr();
         Ok(self
             .try_find_remote(name_or_url)
             .ok_or_else(|| find::existing::Error::NotFound {
@@ -95,8 +95,7 @@ impl crate::Repository {
         &self,
         direction: remote::Direction,
     ) -> Option<Result<Remote<'_>, find::existing::Error>> {
-        self.remote_default_name(direction)
-            .map(|name| self.find_remote(name.as_ref()))
+        self.remote_default_name(direction).map(|name| self.find_remote(name))
     }
 
     /// Find the configured remote with the given `name_or_url` or return `None` if it doesn't exist,
@@ -104,8 +103,9 @@ impl crate::Repository {
     ///
     /// There are various error kinds related to partial information or incorrectly formatted URLs or ref-specs.
     /// Also note that the created `Remote` may have neither fetch nor push ref-specs set at all.
-    /// A configured remote without an effective fetch URL uses its requested name as the fetch URL, matching Git. This
-    /// includes remotes whose URL list was cleared by an empty value and remotes configured only with a push URL.
+    /// Unlike Git, a configured remote with a symbolic name and no effective fetch URL remains without a fetch URL. If the
+    /// requested remote name is itself a URL, it is used as the fetch URL instead. This applies equally to remotes whose URL
+    /// list was cleared by an empty value and remotes configured only with a push URL.
     ///
     /// URL rewrite rules are applied while constructing the remote. A malformed `pushInsteadOf` result is ignored when a fetch
     /// URL is used as the push fallback, keeping the original URL usable. Malformed `insteadOf` results for fetch URLs or explicit
@@ -179,7 +179,7 @@ impl crate::Repository {
         rewrite_urls: bool,
     ) -> Option<Result<Remote<'_>, find::Error>> {
         fn config_spec<T: config::tree::keys::Validate>(
-            specs: Vec<std::borrow::Cow<'_, BStr>>,
+            specs: Vec<crate::bstr::BString>,
             name_or_url: &BStr,
             key: &'static config::tree::keys::Any<T>,
             op: gix_refspec::parse::Operation,
@@ -302,19 +302,22 @@ impl crate::Repository {
                     None => Vec::new(),
                 };
                 if urls.is_empty() {
-                    // Git makes an explicitly requested remote usable by treating its name as the missing fetch URL.
-                    let fallback = match config::tree::Remote::URL.try_into_url(std::borrow::Cow::Borrowed(name_or_url))
-                    {
-                        Ok(url) => url,
-                        Err(source) => {
+                    let name_is_url = matches!(
+                        remote::Name::try_from(std::borrow::Cow::Borrowed(name_or_url)),
+                        Ok(remote::Name::Url(_))
+                    ) || gix_path::is_absolute(gix_path::from_bstr(name_or_url));
+                    match config::tree::Remote::URL.try_into_url(std::borrow::Cow::Borrowed(name_or_url)) {
+                        Ok(url) if name_is_url || url.scheme != gix_url::Scheme::File => urls.push(url),
+                        Ok(_) => {}
+                        Err(source) if name_is_url => {
                             return Some(Err(find::Error::Url {
                                 kind: "fetch",
                                 remote_name: name_or_url.into(),
                                 source,
                             }));
                         }
-                    };
-                    urls.push(fallback);
+                        Err(_) => {}
+                    }
                 }
 
                 Some(

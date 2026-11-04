@@ -19,11 +19,18 @@ pub fn url(
             .ok_or_else(|| anyhow::anyhow!("Could not determine a remote for pushing"))?,
     };
     if all {
-        for url in remote.urls(direction) {
+        let mut urls = remote.urls(direction).peekable();
+        if urls.peek().is_none() {
+            anyhow::bail!("The remote has no {} URL", direction.as_str());
+        }
+        for url in urls {
             out.write_all(&url.to_bstring())?;
             out.write_all(b"\n")?;
         }
-    } else if let Some(url) = remote.url(direction) {
+    } else {
+        let url = remote
+            .url(direction)
+            .ok_or_else(|| anyhow::anyhow!("The remote has no {} URL", direction.as_str()))?;
         out.write_all(&url.to_bstring())?;
         out.write_all(b"\n")?;
     }
@@ -66,7 +73,7 @@ mod refs_impl {
         pub(crate) use super::{print, print_ref};
     }
 
-    #[gix::protocol::maybe_async::maybe_async]
+    #[gix::protocol::bisync::bisync]
     pub async fn refs_fn(
         repo: gix::Repository,
         kind: refs::Kind,

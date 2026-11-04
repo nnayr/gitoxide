@@ -7,7 +7,7 @@ mod error {
 
     /// The error returned by [`Repository::remote_at(…)`][crate::Repository::remote_at()].
     #[derive(Debug, thiserror::Error)]
-    #[allow(missing_docs)]
+    #[expect(missing_docs)]
     pub enum Error {
         #[error(transparent)]
         Url(#[from] gix_url::parse::Error),
@@ -28,7 +28,7 @@ type UrlRewriteAliases = (UrlAliases, UrlAliases, UrlAliases);
 
 /// Initialization
 impl<'repo> Remote<'repo> {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn from_preparsed_config(
         name_or_url: Option<BString>,
         urls: Vec<gix_url::Url>,
@@ -39,10 +39,6 @@ impl<'repo> Remote<'repo> {
         fetch_tags: remote::fetch::Tags,
         repo: &'repo Repository,
     ) -> Result<Self, Error> {
-        debug_assert!(
-            !urls.is_empty() || !push_urls.is_empty(),
-            "BUG: fetch or push url must be set at least"
-        );
         let (url_aliases, url_push_aliases, push_url_aliases) = if should_rewrite_urls {
             rewrite_urls(&repo.config, &urls, &push_urls)
         } else {

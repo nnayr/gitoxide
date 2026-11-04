@@ -1,6 +1,4 @@
 //! lower-level access to filters which are applied to create working tree checkouts or to 'clean' working tree contents for storage in git.
-use std::borrow::Cow;
-
 pub use gix_filter as plumbing;
 use gix_object::Find;
 
@@ -22,7 +20,7 @@ pub mod pipeline {
 
         /// The error returned by [Pipeline::options()](crate::filter::Pipeline::options()).
         #[derive(Debug, thiserror::Error)]
-        #[allow(missing_docs)]
+        #[expect(missing_docs)]
         pub enum Error {
             #[error(transparent)]
             CheckRoundTripEncodings(#[from] config::encoding::Error),
@@ -42,7 +40,7 @@ pub mod pipeline {
     pub mod convert_to_git {
         /// The error returned by [Pipeline::convert_to_git()](crate::filter::Pipeline::convert_to_git()).
         #[derive(Debug, thiserror::Error)]
-        #[allow(missing_docs)]
+        #[expect(missing_docs)]
         pub enum Error {
             #[error("Failed to prime attributes to the path at which the data resides")]
             WorktreeCacheAtPath(#[from] std::io::Error),
@@ -55,7 +53,7 @@ pub mod pipeline {
     pub mod convert_to_worktree {
         /// The error returned by [Pipeline::convert_to_worktree()](crate::filter::Pipeline::convert_to_worktree()).
         #[derive(Debug, thiserror::Error)]
-        #[allow(missing_docs)]
+        #[expect(missing_docs)]
         pub enum Error {
             #[error("Failed to prime attributes to the path at which the data resides")]
             WorktreeCacheAtPath(#[from] std::io::Error),
@@ -70,7 +68,7 @@ pub mod pipeline {
 
         /// The error returned by [Pipeline::worktree_file_to_object()](crate::filter::Pipeline::worktree_file_to_object()).
         #[derive(Debug, thiserror::Error)]
-        #[allow(missing_docs)]
+        #[expect(missing_docs)]
         pub enum Error {
             #[error("Cannot add worktree files in bare repositories")]
             MissingWorktree,
@@ -300,12 +298,12 @@ fn extract_drivers(repo: &Repository) -> Result<Vec<gix_filter::Driver>, pipelin
             s.header().subsection_name().map(|name| {
                 Ok(gix_filter::Driver {
                     name: name.to_owned(),
-                    clean: s.value("clean").map(Cow::into_owned),
-                    smudge: s.value("smudge").map(Cow::into_owned),
-                    process: s.value("process").map(Cow::into_owned),
+                    clean: s.value("clean"),
+                    smudge: s.value("smudge"),
+                    process: s.value("process"),
                     required: s
                         .value("required")
-                        .map(|value| gix_config::Boolean::try_from(value.as_ref()))
+                        .map(|value| gix_config::Boolean::try_from(BStr::new(&value)))
                         .transpose()
                         .map_err(|err| pipeline::options::Error::Driver {
                             name: name.to_owned(),
