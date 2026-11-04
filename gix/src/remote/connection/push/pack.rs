@@ -84,9 +84,10 @@ impl std::fmt::Display for Error {
             | Error::IterEntries(err)
             | Error::PackWrite(err)
             | Error::Find(err)
-            | Error::Decode(err) => std::fmt::Display::fmt(err, f),
-            Error::MergeRepairDiff(_) => {
-                f.write_str("Failed to diff a merge parent's tree during the merge-undercount repair")
+            | Error::Decode(err) => write!(f, "{err:#}"),
+            Error::MergeRepairDiff(err) => {
+                f.write_str("Failed to diff a merge parent's tree during the merge-undercount repair")?;
+                super::error::write_causes(f, &**err)
             }
             Error::MissingObject { id } => {
                 write!(
@@ -107,13 +108,16 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Interrupted => Some(const { &gix_error::ClassificationMarker::CANCELLED }),
-            Error::Traverse(err)
-            | Error::Count(err)
-            | Error::IterEntries(err)
-            | Error::PackWrite(err)
-            | Error::Find(err)
-            | Error::Decode(err) => Some(err),
-            Error::MergeRepairDiff(err) => Some(&**err),
+            // Local object-database or I/O faults: never transient, and a pack-write failure may be a
+            // transport hiccup the server has already half-seen. Their causes stay out of classification
+            // (so they are never retryable) but in `Display`.
+            Error::Traverse(_)
+            | Error::Count(_)
+            | Error::IterEntries(_)
+            | Error::PackWrite(_)
+            | Error::Find(_)
+            | Error::Decode(_)
+            | Error::MergeRepairDiff(_) => None,
             Error::MissingObject { .. } => Some(const { &gix_error::ClassificationMarker::NOT_FOUND }),
             Error::UnsupportedTipType { .. } => Some(const { &gix_error::ClassificationMarker::UNSUPPORTED }),
         }

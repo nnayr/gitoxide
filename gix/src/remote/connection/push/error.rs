@@ -16,8 +16,13 @@
 /// ([`OpenObjectStore`](Error::OpenObjectStore)) plus the pre-wire capability gate
 /// ([`MissingServerFeature`](Error::MissingServerFeature)).
 ///
-/// Whether a failure is worth retrying is answered by [`gix_error::classify()`] over the source chain,
-/// which reaches the transport and plumbing sources; everything else is non-retryable.
+/// Whether a failure is worth retrying is answered by [`gix_error::classify()`] over the source chain.
+/// It reaches the transport and plumbing sources of failures that happen *before* the pack is sent (and
+/// of the handshake), so those stay retryable. Everything that can happen once the server may have applied
+/// the push, or that is a local fault, is **not** retryable: [`Pack`](Error::Pack),
+/// [`OpenObjectStore`](Error::OpenObjectStore), [`UpdateRefs`](Error::UpdateRefs) and the plumbing's
+/// post-send variants hide their cause from classification (see
+/// [`gix_protocol::push::Error`]), while their `Display` still names it.
 #[derive(Debug)]
 #[expect(missing_docs)]
 pub enum Error {
@@ -34,8 +39,9 @@ pub enum Error {
     ///
     /// `send()` (gpx08) drives the pack driver (`pack`) inside the
     /// `gix_protocol::push` closure and re-raises the closure's typed error through a side channel
-    /// (the plumbing itself erases it into `WritePack(Box<dyn Error>)`). Non-retryable — every
-    /// `pack::Error` is a local object-database/I/O fault, never a retryable transport hiccup.
+    /// (the plumbing itself erases it into `WritePack(Box<dyn Error>)`). Never classified as retryable:
+    /// every `pack::Error` is a local object-database/I/O fault, and a failure while streaming the pack is
+    /// reported through the plumbing's `WritePack` instead.
     Pack(super::pack::Error),
     /// A dedicated pack-capable object store could not be opened to build the pack (see
     /// `pack::write_pack` for why `repo.objects` cannot be used directly).
@@ -49,7 +55,8 @@ pub enum Error {
     },
     /// The local tracking-ref bookkeeping after a successful send failed (gpx09/P9). The server has
     /// already applied the push (`ng`s are data on [`Status::Pushed`](super::send_pack::Status), not
-    /// this error); only the *local* `refs/remotes/<remote>/*` transaction faulted. Non-retryable.
+    /// this error); only the *local* `refs/remotes/<remote>/*` transaction faulted. Never classified as retryable, even
+    /// on lock contention: the push was already applied, so re-pushing is not the remedy.
     UpdateRefs(super::refs::update::Error),
 }
 
@@ -68,14 +75,18 @@ impl std::fmt::Display for Error {
             ),
             Error::Client(err) => std::fmt::Display::fmt(err, f),
             Error::Pack(err) => std::fmt::Display::fmt(err, f),
-            Error::OpenObjectStore(_) => {
-                f.write_str("Failed to open a pack-capable object store for building the pack to push")
+            Error::OpenObjectStore(err) => {
+                f.write_str("Failed to open a pack-capable object store for building the pack to push")?;
+                write_causes(f, err)
             }
             Error::MissingServerFeature { feature } => write!(
                 f,
                 "The server did not advertise the {feature:?} capability required by this push"
             ),
-            Error::UpdateRefs(_) => f.write_str("Failed to update the local tracking references after the push"),
+            Error::UpdateRefs(err) => {
+                f.write_str("Failed to update the local tracking references after the push")?;
+                write_causes(f, err)
+            }
         }
     }
 }
@@ -88,8 +99,10 @@ impl std::error::Error for Error {
             Error::Client(err) => std::error::Error::source(err),
             Error::Pack(err) => std::error::Error::source(err),
             Error::PackThreads(err) | Error::ThinConfig(err) | Error::PushDefaultConfig(err) => Some(err),
-            Error::OpenObjectStore(err) => Some(err),
-            Error::UpdateRefs(err) => Some(err),
+            // The causes of these stay out of classification (but in `Display`): a local fault is not
+            // transient, and after the server accepted the push a re-push is not the remedy.
+            Error::OpenObjectStore(_) => None,
+            Error::UpdateRefs(_) => Some(const { &gix_error::ClassificationMarker::CONFLICT }),
             Error::IncompatibleObjectHash { .. } => Some(const { &gix_error::ClassificationMarker::UNSUPPORTED }),
             Error::MissingServerFeature { .. } => Some(const { &gix_error::ClassificationMarker::UNSUPPORTED }),
         }
@@ -118,4 +131,21 @@ impl From<super::refs::update::Error> for Error {
     fn from(err: super::refs::update::Error) -> Self {
         Error::UpdateRefs(err)
     }
+}
+
+/// Append `err` and its causes to `f` as `: <err>: <cause>…`, for variants that must not expose their cause
+/// through [`source()`](std::error::Error::source) but whose message should still name it.
+pub(super) fn write_causes(
+    f: &mut std::fmt::Formatter<'_>,
+    err: &(dyn std::error::Error + 'static),
+) -> std::fmt::Result {
+    write!(f, ": {err}")?;
+    let mut source = err.source();
+    while let Some(cause) = source {
+        if !cause.is::<gix_error::ClassificationMarker>() {
+            write!(f, ": {cause}")?;
+        }
+        source = cause.source();
+    }
+    Ok(())
 }

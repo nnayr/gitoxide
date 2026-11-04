@@ -7,8 +7,13 @@ use gix_error::ClassificationMarker;
 ///
 /// Mirrors the fetch/handshake errors' classification approach: `MissingServerFeature` is the same
 /// `{ feature, description }` struct variant fetch used to have, and retry decisions are driven by
-/// the [`gix_error::Class`] found in the [source chain](std::error::Error::source), so transport
-/// failures that are retryable stay retryable once wrapped here (everything else is not).
+/// the [`gix_error::Class`] found in the [source chain](std::error::Error::source).
+///
+/// Only [`Client`](Error::Client) failures, which happen before the pack is sent, expose their cause for
+/// that purpose, so a transport failure stays retryable. [`Response`](Error::Response), [`Io`](Error::Io)
+/// and [`WritePack`](Error::WritePack) can occur once the server may already have applied the update, where
+/// re-pushing is not idempotent: they classify as [`Conflict`](gix_error::Class::Conflict) and hide their cause
+/// from classification, while their `Display` still names it.
 #[derive(Debug)]
 #[expect(missing_docs)]
 pub enum Error {
@@ -40,9 +45,15 @@ impl std::fmt::Display for Error {
                  refusing before any bytes are sent"
             ),
             Error::Response(err) => std::fmt::Display::fmt(err, f),
-            Error::Client(_) => f.write_str("The transport failed while pushing"),
-            Error::WritePack(_) => f.write_str("Failed to write the packfile to the transport"),
-            Error::Io(_) => f.write_str("An I/O error occurred while sending the update request"),
+            Error::Client(err) => std::fmt::Display::fmt(err, f),
+            Error::WritePack(err) => {
+                f.write_str("Failed to write the packfile to the transport")?;
+                write_causes(f, &**err)
+            }
+            Error::Io(err) => {
+                f.write_str("An I/O error occurred while sending the update request")?;
+                write_causes(f, err)
+            }
         }
     }
 }
@@ -56,9 +67,9 @@ impl std::error::Error for Error {
             }
             // Transparent: the response error is the message, only its own cause is the source.
             Error::Response(err) => std::error::Error::source(err),
-            Error::Client(err) => Some(err),
-            Error::WritePack(err) => Some(&**err),
-            Error::Io(err) => Some(err),
+            // Transparent: only the transport error's own cause is the source.
+            Error::Client(err) => std::error::Error::source(err),
+            Error::WritePack(_) | Error::Io(_) => Some(const { &ClassificationMarker::CONFLICT }),
         }
     }
 }
@@ -79,4 +90,23 @@ impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Self {
         Error::Io(err)
     }
+}
+
+/// Append `err` and its causes to `f` as `: <err>: <cause>…`, the way an alternate-formatted error chain reads.
+///
+/// Used where a variant must not expose its cause through [`source()`](std::error::Error::source)
+/// (so classification cannot see it) but its message should still name it.
+pub(crate) fn write_causes(
+    f: &mut std::fmt::Formatter<'_>,
+    err: &(dyn std::error::Error + 'static),
+) -> std::fmt::Result {
+    write!(f, ": {err}")?;
+    let mut source = err.source();
+    while let Some(cause) = source {
+        if !cause.is::<ClassificationMarker>() {
+            write!(f, ": {cause}")?;
+        }
+        source = cause.source();
+    }
+    Ok(())
 }

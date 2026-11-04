@@ -201,9 +201,24 @@ impl From<ProgressId> for gix_utils::progress::Id {
 #[cfg(test)]
 mod tests {
     use crate::remote::push;
+    use gix_error::ErrorExt;
 
     fn is_spurious(err: &(dyn std::error::Error + 'static)) -> bool {
         gix_error::classify(err).can_retry_lenient()
+    }
+
+    fn io(kind: std::io::ErrorKind) -> std::io::Error {
+        std::io::Error::from(kind)
+    }
+
+    /// Errors that arise once the pack was sent never count as retryable, as `IsSpuriousError` did
+    /// before: the server may already have applied the ref updates, so a re-push is not idempotent.
+    fn assert_not_retryable(err: &(dyn std::error::Error + 'static), what: &str) {
+        assert!(!gix_error::classify(err).can_retry(), "{what}: strict retry policy");
+        assert!(
+            !gix_error::classify(err).can_retry_lenient(),
+            "{what}: lenient retry policy"
+        );
     }
 
     #[test]
@@ -218,8 +233,97 @@ mod tests {
 
     #[test]
     fn client_errors_forward_spuriousness() {
-        let err = push::Error::Client(std::io::Error::from(std::io::ErrorKind::ConnectionReset).into());
-        assert!(is_spurious(&err));
+        // `send()` wraps plumbing failures as `Push(..)`, so pin that nested shape; the direct
+        // terminal `Client` variant is kept as a separately supported shape.
+        let nested = push::Error::Push(gix_protocol::push::Error::Client(
+            io(std::io::ErrorKind::ConnectionReset).into(),
+        ));
+        assert!(is_spurious(&nested), "a reset before the pack was sent is spurious");
+        assert!(
+            gix_error::classify(&push::Error::Push(gix_protocol::push::Error::Client(
+                io(std::io::ErrorKind::TimedOut).into()
+            )))
+            .can_retry(),
+            "a timeout before the pack was sent is retryable under the strict policy too"
+        );
+        let direct = push::Error::Client(io(std::io::ErrorKind::ConnectionReset).into());
+        assert!(is_spurious(&direct));
+    }
+
+    #[test]
+    fn handshake_failures_stay_spurious() {
+        let err =
+            push::prepare::Error::Handshake(gix_error::Error::from_error(io(std::io::ErrorKind::ConnectionReset)));
+        assert!(
+            is_spurious(&err),
+            "the handshake is the one prepare step that forwards spuriousness"
+        );
+    }
+
+    #[test]
+    fn failures_after_the_pack_was_sent_are_not_retryable() {
+        use std::io::ErrorKind::{ConnectionReset, TimedOut};
+        for kind in [ConnectionReset, TimedOut] {
+            assert_not_retryable(
+                &push::Error::Push(gix_protocol::push::Error::Response(
+                    gix_protocol::push::response::Error::Io(io(kind)),
+                )),
+                "Push(Response(Io))",
+            );
+            assert_not_retryable(&push::Error::Push(gix_protocol::push::Error::Io(io(kind))), "Push(Io)");
+            assert_not_retryable(
+                &push::Error::Push(gix_protocol::push::Error::WritePack(Box::new(io(kind)))),
+                "Push(WritePack)",
+            );
+            assert_not_retryable(&push::Error::OpenObjectStore(io(kind)), "OpenObjectStore");
+        }
+    }
+
+    #[test]
+    fn tracking_ref_bookkeeping_failures_are_not_retryable_even_on_lock_contention() {
+        use super::refs::update::Error;
+        for err in [
+            Error::EditReferences(gix_error::retryable("the reference lock is held elsewhere").raise()),
+            Error::FindReference(gix_error::Error::from_error(io(std::io::ErrorKind::TimedOut))),
+        ] {
+            assert_not_retryable(&push::Error::UpdateRefs(err), "UpdateRefs");
+        }
+    }
+
+    #[test]
+    fn pack_failures_are_not_retryable() {
+        use super::pack::Error;
+        let transport_reset = || gix_error::Error::from_error(io(std::io::ErrorKind::ConnectionReset));
+        let retryable = || gix_error::retryable("looks transient").raise();
+        for err in [
+            Error::PackWrite(transport_reset()),
+            Error::Find(retryable()),
+            Error::Count(retryable()),
+            Error::IterEntries(retryable()),
+            Error::Traverse(retryable()),
+            Error::Decode(retryable()),
+            Error::MergeRepairDiff(Box::new(io(std::io::ErrorKind::TimedOut))),
+        ] {
+            assert_not_retryable(&push::Error::Pack(err), "Pack");
+        }
+    }
+
+    #[test]
+    fn post_send_failures_keep_their_cause_in_the_message() {
+        let err = push::Error::Push(gix_protocol::push::Error::Response(
+            gix_protocol::push::response::Error::Io(io(std::io::ErrorKind::ConnectionReset)),
+        ));
+        assert!(
+            format!("{err:#}").contains("connection reset"),
+            "the I/O cause stays visible for diagnostics, got: {err:#}"
+        );
+        let err = push::Error::UpdateRefs(super::refs::update::Error::EditReferences(
+            gix_error::message("lock held").raise(),
+        ));
+        assert!(
+            format!("{err:#}").contains("lock held"),
+            "the bookkeeping cause stays visible for diagnostics, got: {err:#}"
+        );
     }
 
     #[test]

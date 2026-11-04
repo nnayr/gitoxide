@@ -59,7 +59,10 @@ impl std::fmt::Display for Error {
                 f,
                 "the per-ref status for {name:?} is missing, or a status was reported for a ref that was never sent"
             ),
-            Error::Io(_) => f.write_str("an I/O error occurred while reading the report-status"),
+            Error::Io(err) => {
+                f.write_str("an I/O error occurred while reading the report-status")?;
+                super::error::write_causes(f, err)
+            }
         }
     }
 }
@@ -70,7 +73,9 @@ impl std::error::Error for Error {
             Error::MissingUnpackStatus | Error::Malformed { .. } | Error::MissingRefStatus { .. } => {
                 Some(const { &gix_error::ClassificationMarker::CORRUPTION })
             }
-            Error::Io(err) => Some(err),
+            // The server may already have applied the update by the time the report is lost, so a
+            // retry-capable cause must stay out of classification; `Display` still names it.
+            Error::Io(_) => Some(const { &gix_error::ClassificationMarker::CONFLICT }),
         }
     }
 }
