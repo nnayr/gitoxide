@@ -84,11 +84,9 @@ impl Default for Remote {
             } in req_recv
             {
                 // fu4 (rolfdb fork): (re)build the client when the TLS-trust options change.
-                let tls_key: TlsTrustKey =
-                    (config.ssl_ca_info.clone(), config.ssl_verify, config.ssl_version);
+                let tls_key: TlsTrustKey = (config.ssl_ca_info.clone(), config.ssl_verify, config.ssl_version);
                 if !client_and_tls.as_ref().is_some_and(|(_, key)| key == &tls_key) {
-                    client_and_tls =
-                        Some((build_client(&redirect_action, &redirect_tail, &tls_key)?, tls_key));
+                    client_and_tls = Some((build_client(&redirect_action, &redirect_tail, &tls_key)?, tls_key));
                 }
                 let client = &client_and_tls.as_ref().expect("client built above").0;
                 let redirected_base_url = redirected_base_url_shared.lock().clone();
@@ -367,7 +365,11 @@ pub(crate) struct Response {
 // fu4 (rolfdb fork): TLS-trust helpers giving the reqwest backend TLS-trust parity with the curl
 // backend for the trust options carried on each request's `http::Options` (connect_timeout and
 // http_version stay unwired, out of fu4 scope). https://github.com/GitoxideLabs/gitoxide/issues/1109
-type TlsTrustKey = (Option<std::path::PathBuf>, bool, Option<http::options::SslVersionRangeInclusive>);
+type TlsTrustKey = (
+    Option<std::path::PathBuf>,
+    bool,
+    Option<http::options::SslVersionRangeInclusive>,
+);
 
 fn build_client(
     redirect_action: &Arc<Mutex<RedirectAction>>,

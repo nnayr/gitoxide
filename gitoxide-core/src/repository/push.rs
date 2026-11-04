@@ -330,7 +330,7 @@ pub(crate) mod function {
                         Mode::TrackingRefUpdated | Mode::TrackingRefSkipped(_) => false,
                         // RATIFY-14: `Ok` here means suppressed/rolled-back — not durably applied.
                         Mode::Ok | Mode::RejectedByServer { .. } | Mode::RejectedLocal(_) | Mode::CorrelationGap => {
-                            return None
+                            return None;
                         }
                     };
                     Some(Edit {
@@ -416,8 +416,8 @@ pub(crate) mod function {
     /// [`Mode`](gix::remote::push::refs::Mode) so a new variant breaks the build, not the output. The
     /// verb (for the modes that carry one) comes from the mapping's plan [`Verdict`].
     pub(crate) fn disposition(mode: &gix::remote::push::refs::Mode, verdict: &gix::remote::push::Verdict) -> String {
-        use gix::remote::push::refs::{Mode, SkipReason};
         use gix::remote::push::Verdict;
+        use gix::remote::push::refs::{Mode, SkipReason};
         let verb = verb_of(verdict);
         match mode {
             Mode::UpToDate => "up to date".into(),
@@ -966,8 +966,8 @@ pub(crate) mod function {
             update: &gix::remote::push::refs::Update,
             update_refs: &gix::remote::push::refs::update::Outcome,
         ) -> (String, Option<String>) {
-            use gix::remote::push::refs::{Mode, SkipReason};
             use gix::remote::push::Verdict;
+            use gix::remote::push::refs::{Mode, SkipReason};
             match &update.mode {
                 Mode::UpToDate => ("up-to-date".into(), None),
                 Mode::DryRun => ("dry-run".into(), Some(verb_of(&mapping.verdict).to_string())),
