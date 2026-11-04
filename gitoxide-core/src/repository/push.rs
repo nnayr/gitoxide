@@ -33,8 +33,11 @@ pub struct Options {
 pub const PROGRESS_RANGE: std::ops::RangeInclusive<u8> = 1..=3;
 
 pub(crate) mod function {
-    use anyhow::bail;
-    use gix::bstr::{BString, ByteSlice};
+    use gix::{
+        Result,
+        bstr::{BString, ByteSlice},
+        error::{ErrorExt, ResultExt, bail, message},
+    };
 
     use super::Options;
     use crate::OutputFormat;
@@ -58,7 +61,7 @@ pub(crate) mod function {
             handshake_info,
             set_upstream,
         }: Options,
-    ) -> anyhow::Result<()>
+    ) -> Result<()>
     where
         P: gix::NestedProgress,
         P::SubProgress: 'static,
@@ -177,20 +180,20 @@ pub(crate) mod function {
         match format {
             OutputFormat::Human => {
                 if handshake_info {
-                    writeln!(out, "Handshake Information")?;
-                    writeln!(out, "\t{:?}", outcome.handshake)?;
+                    writeln!(out, "Handshake Information").or_error()?;
+                    writeln!(out, "\t{:?}", outcome.handshake).or_error()?;
                 }
                 for line in &messages {
-                    writeln!(err, "remote: {line}")?;
+                    writeln!(err, "remote: {line}").or_error()?;
                 }
-                write_human_table(&mut out, push_url.as_bstr(), &outcome)?;
+                write_human_table(&mut out, push_url.as_bstr(), &outcome).or_error()?;
             }
             #[cfg(feature = "serde")]
             OutputFormat::Json => {
                 if handshake_info {
                     // stdout is reserved for the document, so the handshake block goes to stderr.
-                    writeln!(err, "Handshake Information")?;
-                    writeln!(err, "\t{:?}", outcome.handshake)?;
+                    writeln!(err, "Handshake Information").or_error()?;
+                    writeln!(err, "\t{:?}", outcome.handshake).or_error()?;
                 }
                 let su = set_upstream.then(|| {
                     (
@@ -202,7 +205,7 @@ pub(crate) mod function {
                 write_json_document(&mut out, atomic_label, push_url.as_bstr(), &outcome, messages, su)?;
             }
         }
-        write_notes(&mut err, &outcome)?;
+        write_notes(&mut err, &outcome).or_error()?;
         // gpx17: the per-branch upstream notes follow the pack-stat line (RATIFY-11: stderr). A write
         // failure suppresses the success lines and — after everything is rendered — forces exit 1
         // (RATIFY-10, house `UpdateRefs` parity; a deliberate deviation from git's exit 0).
@@ -211,7 +214,8 @@ pub(crate) mod function {
             upstream_remote.as_bstr(),
             &upstream_edits,
             upstream_write_error.as_deref(),
-        )?;
+        )
+        .or_error()?;
         Report::from_outcome(&outcome).into_result()?;
         if upstream_write_error.is_some() {
             bail!("the push was accepted by the server, but writing upstream configuration failed");
@@ -227,12 +231,12 @@ pub(crate) mod function {
     pub(crate) fn by_name_or_url_for_push<'repo>(
         repo: &'repo gix::Repository,
         name_or_url: Option<&str>,
-    ) -> anyhow::Result<gix::Remote<'repo>> {
+    ) -> Result<gix::Remote<'repo>> {
         use gix::remote::Direction::Push;
         Ok(match name_or_url {
-            Some(name) => match repo.try_find_remote(name).and_then(Result::ok) {
+            Some(name) => match repo.try_find_remote(name).and_then(std::result::Result::ok) {
                 Some(remote) => remote,
-                None => repo.remote_at(gix::url::parse(name.into())?)?,
+                None => repo.remote_at(gix::url::parse(name)?)?,
             },
             None => repo
                 .head()?
@@ -241,9 +245,11 @@ pub(crate) mod function {
                 .map(Ok)
                 .or_else(|| repo.find_default_remote(Push))
                 .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "no remote found to push to — set 'remote.pushDefault', configure a remote, or pass --remote"
+                    message(
+                        "no remote found to push to — set 'remote.pushDefault', configure a remote, or pass --remote",
                     )
+                    .not_found()
+                    .raise()
                 })??,
         })
     }
@@ -270,6 +276,7 @@ pub(crate) mod function {
     /// CLI-only — the porcelain never touches `branch.*` (hard constraint).
     pub(crate) mod upstream {
         use gix::bstr::{BStr, BString, ByteSlice};
+        use gix::error::ResultExt;
 
         /// One qualifying branch mapping: the config edit to make (or that WOULD be made under
         /// `--dry-run`), plus the names the stderr/JSON reporting needs.
@@ -357,17 +364,22 @@ pub(crate) mod function {
             config_path: &std::path::Path,
             remote_value: &BStr,
             edits: &[&Edit],
-        ) -> anyhow::Result<()> {
+        ) -> gix::Result<()> {
             let mut file =
                 gix::config::File::from_path_no_includes(config_path.to_owned(), gix::config::Source::Local)?;
             for edit in edits {
                 file.set_raw_value_by("branch", Some(edit.short.as_bstr()), "remote", remote_value)?;
                 file.set_raw_value_by("branch", Some(edit.short.as_bstr()), "merge", edit.merge.as_bstr())?;
             }
-            let mut lock =
-                gix::lock::File::acquire_to_update_resource(config_path, gix::lock::acquire::Fail::Immediately, None)?;
-            file.write_to_filter(&mut lock, |s| s.meta().source == gix::config::Source::Local)?;
-            lock.commit()?;
+            let mut lock = gix::lock::File::acquire_to_update_resource(
+                config_path,
+                gix::lock::acquire::Fail::Immediately,
+                None,
+                0,
+            )?;
+            file.write_to_filter(&mut lock, |s| s.meta().source == gix::config::Source::Local)
+                .or_error()?;
+            lock.commit().or_error()?;
             Ok(())
         }
 
@@ -492,7 +504,7 @@ pub(crate) mod function {
             }
         }
 
-        pub(crate) fn into_result(self) -> anyhow::Result<()> {
+        pub(crate) fn into_result(self) -> Result<()> {
             if self.unpack_failed {
                 bail!("push failed: the server could not unpack the sent pack");
             }
@@ -587,9 +599,9 @@ pub(crate) mod function {
         err: impl std::io::Write,
         url: &gix::bstr::BStr,
         outcome: &gix::remote::push::Outcome,
-    ) -> anyhow::Result<Report> {
-        write_human_table(out, url, outcome)?;
-        write_notes(err, outcome)?;
+    ) -> Result<Report> {
+        write_human_table(out, url, outcome).or_error()?;
+        write_notes(err, outcome).or_error()?;
         Ok(Report::from_outcome(outcome))
     }
 
@@ -651,35 +663,37 @@ pub(crate) mod function {
         err: gix::remote::push::prepare::Error,
         remote_name: Option<&str>,
         url: &gix::bstr::BStr,
-    ) -> anyhow::Error {
+    ) -> gix::Error {
         use gix::remote::push::prepare::Error;
         match err {
             // FC3: name the `remote.<name>.push` config key only when the remote actually has a name;
             // an anonymous URL-remote has no such key to configure.
             Error::MissingRefSpecs => match remote_name {
-                Some(remote) => anyhow::anyhow!(
+                Some(remote) => message!(
                     "nothing to push: no ref-specs given and none configured for remote {remote:?}\n\
                      hint: pass a ref-spec (e.g. 'gix push refs/heads/main'), or configure remote.{remote}.push\n\
                      hint: expansion of 'push.default' is not yet supported by gix"
-                ),
-                None => anyhow::anyhow!(
+                )
+                .validation()
+                .raise(),
+                None => message!(
                     "nothing to push: no ref-specs given and none configured for the remote\n\
                      hint: pass a ref-spec (e.g. 'gix push refs/heads/main')\n\
                      hint: expansion of 'push.default' is not yet supported by gix"
-                ),
+                )
+                .validation()
+                .raise(),
             },
             Error::Plan(gix::remote::push::plan::Error::StaleLease { .. }) => {
-                anyhow::Error::new(err).context("hint: run 'gix fetch <remote>' and re-inspect before forcing")
+                err.and_raise(message("hint: run 'gix fetch <remote>' and re-inspect before forcing"))
             }
             // §4.1: the connection-setup variants say which url we could not reach.
             Error::GatherTransportConfig { .. } | Error::ConfigureTransport(_) | Error::ConfigureCredentials(_) => {
-                anyhow::Error::new(err).context(format!("failed to set up the connection to {url}"))
+                err.and_raise(message!("failed to set up the connection to {url}"))
             }
-            Error::Handshake(_) => {
-                anyhow::Error::new(err).context(format!("could not talk to {url} (receive-pack handshake failed)"))
-            }
+            Error::Handshake(_) => err.and_raise(message!("could not talk to {url} (receive-pack handshake failed)")),
             Error::MissingRefAdvertisement { .. } | Error::Plan(_) | Error::CollectRefs(_) | Error::AtomicConfig(_) => {
-                anyhow::Error::new(err)
+                gix::Error::from_error(err)
             }
         }
     }
@@ -687,11 +701,7 @@ pub(crate) mod function {
     /// Map a `send` failure to a CLI-facing error (§4.2): `MissingServerFeature` gets the actionable
     /// per-feature hint naming the flag to drop; `UpdateRefs` says the push *was* applied server-side;
     /// the connection/protocol/pack variants gain a §4.2 context; the rest surface verbatim.
-    fn map_push_error(
-        err: gix::remote::push::Error,
-        _remote_name: Option<&str>,
-        url: &gix::bstr::BStr,
-    ) -> anyhow::Error {
+    fn map_push_error(err: gix::remote::push::Error, _remote_name: Option<&str>, url: &gix::bstr::BStr) -> gix::Error {
         use gix::remote::push::Error;
         match &err {
             Error::MissingServerFeature { feature } => {
@@ -701,20 +711,20 @@ pub(crate) mod function {
                         "the server does not advertise push-options — retry without -o/--push-option (also check push.pushOption config)"
                     }
                     "side-band-64k" => "the server does not advertise side-band-64k — retry with --no-sideband",
-                    other => return anyhow::Error::new(err).context(format!("missing server feature: {other}")),
+                    other => return err.and_raise(message!("missing server feature: {other}")),
                 };
-                anyhow::Error::new(err).context(hint)
+                err.and_raise(message(hint))
             }
-            Error::UpdateRefs(_) => anyhow::Error::new(err).context(
+            Error::UpdateRefs(_) => err.and_raise(message(
                 "the push was accepted by the server, but updating local tracking refs failed — \
                  run 'gix fetch <remote>' to resynchronize",
-            ),
-            Error::Client(_) => anyhow::Error::new(err).context(format!("connection to {url} failed during the push")),
-            Error::Push(_) => anyhow::Error::new(err).context("the server ended the push unexpectedly"),
-            Error::Pack(_) | Error::OpenObjectStore(_) => {
-                anyhow::Error::new(err).context("failed to build the pack to send (local object database problem)")
-            }
-            _ => anyhow::Error::new(err),
+            )),
+            Error::Client(_) => err.and_raise(message!("connection to {url} failed during the push")),
+            Error::Push(_) => err.and_raise(message("the server ended the push unexpectedly")),
+            Error::Pack(_) | Error::OpenObjectStore(_) => err.and_raise(message(
+                "failed to build the pack to send (local object database problem)",
+            )),
+            _ => gix::Error::from_error(err),
         }
     }
 
@@ -729,11 +739,11 @@ pub(crate) mod function {
         outcome: &gix::remote::push::Outcome,
         messages: Vec<String>,
         set_upstream: Option<(&[upstream::Edit], &gix::bstr::BStr, Option<&str>)>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         let set_upstream = set_upstream.map(|(edits, remote, error)| json::set_upstream_of(edits, remote, error));
         let doc = json::to_document(url, atomic_label, outcome, messages, set_upstream);
-        serde_json::to_writer_pretty(&mut out, &doc)?;
-        writeln!(out)?;
+        serde_json::to_writer_pretty(&mut out, &doc).or_error()?;
+        writeln!(out).or_error()?;
         Ok(())
     }
 
@@ -1575,7 +1585,7 @@ refs/heads/done:refs/heads/done
         fn connection_setup_error_names_the_url() {
             // ConfigureTransport shares the §4.1 connection-context arm with GatherTransportConfig and
             // ConfigureCredentials (which have no public constructor).
-            let boxed: Box<dyn std::error::Error + Send + Sync> = Box::new(std::io::Error::other("boom"));
+            let boxed = gix::Error::from_error(std::io::Error::other("boom"));
             let e = map_prepare_error(
                 gix::remote::push::prepare::Error::ConfigureTransport(boxed),
                 Some("origin"),
@@ -1638,9 +1648,11 @@ refs/heads/done:refs/heads/done
 
         #[test]
         fn handshake_error_names_the_url() {
-            // EmptyCredentials is the one handshake variant with a public unit constructor.
+            // The handshake step reports an erased `gix::Error`; any failure exercises the arm.
             let e = map_prepare_error(
-                gix::remote::push::prepare::Error::Handshake(gix::protocol::handshake::Error::EmptyCredentials),
+                gix::remote::push::prepare::Error::Handshake(gix::Error::from_error(std::io::Error::other(
+                    "empty credentials",
+                ))),
                 Some("origin"),
                 err_url(),
             );
