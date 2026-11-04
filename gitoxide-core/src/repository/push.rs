@@ -171,7 +171,7 @@ pub(crate) mod function {
                 let config_path = repo.common_dir().join("config");
                 upstream::write_config(&config_path, upstream_remote.as_bstr(), &to_write)
                     .err()
-                    .map(|e| format!("to {} failed: {e}", config_path.display()))
+                    .map(|e| format!("to {} failed: {}", config_path.display(), error_chain(&e)))
             }
         };
 
@@ -221,6 +221,20 @@ pub(crate) mod function {
             bail!("the push was accepted by the server, but writing upstream configuration failed");
         }
         Ok(())
+    }
+
+    /// Render `err` and all of its causes as `outer: cause: root`, the way `{err:#}` read before errors moved to
+    /// `gix::Error`. Built from the error iterator rather than alternate formatting, which prints a Debug
+    /// tree when `gix-error` is built in tree mode.
+    pub(crate) fn error_chain(err: &gix::Error) -> String {
+        let mut chain: Vec<String> = Vec::new();
+        for cause in err.iter_errors() {
+            let text = cause.to_string();
+            if chain.last() != Some(&text) {
+                chain.push(text);
+            }
+        }
+        chain.join(": ")
     }
 
     /// Resolve the remote to push to — the push twin of
@@ -1088,6 +1102,7 @@ pub(crate) mod function {
 
     #[cfg(test)]
     mod tests {
+        use super::error_chain;
         use gix::bstr::{BStr, BString, ByteSlice};
         use gix::hash::ObjectId;
         use gix::remote::push::plan::{PlannedUpdates, SpecIndex};
@@ -1537,7 +1552,7 @@ refs/heads/done:refs/heads/done
                 Some("origin"),
                 err_url(),
             );
-            let msg = format!("{e}");
+            let msg = error_chain(&e);
             assert!(
                 msg.contains("nothing to push: no ref-specs given and none configured for remote \"origin\""),
                 "{msg}"
@@ -1554,7 +1569,7 @@ refs/heads/done:refs/heads/done
             // FC3: an anonymous URL-remote (no name) must not tell the user to configure
             // `remote.origin.push` — there is no named remote to configure.
             let e = map_prepare_error(gix::remote::push::prepare::Error::MissingRefSpecs, None, err_url());
-            let msg = format!("{e}");
+            let msg = error_chain(&e);
             assert!(!msg.contains("remote.origin.push"), "{msg}");
             assert!(!msg.contains("remote \"origin\""), "{msg}");
             assert!(msg.contains("nothing to push"), "{msg}");
@@ -1576,8 +1591,14 @@ refs/heads/done:refs/heads/done
                 err_url(),
             );
             assert!(
-                format!("{e}").contains("run 'gix fetch <remote>' and re-inspect before forcing"),
-                "{e}"
+                error_chain(&e).contains("run 'gix fetch <remote>' and re-inspect before forcing"),
+                "{}",
+                error_chain(&e)
+            );
+            assert!(
+                error_chain(&e).contains("stale lease for refs/heads/main"),
+                "the plan error stays in the chain: {}",
+                error_chain(&e)
             );
         }
 
@@ -1592,8 +1613,14 @@ refs/heads/done:refs/heads/done
                 err_url(),
             );
             assert!(
-                format!("{e}").contains("failed to set up the connection to file:///x"),
-                "{e}"
+                error_chain(&e).contains("failed to set up the connection to file:///x"),
+                "{}",
+                error_chain(&e)
+            );
+            assert!(
+                error_chain(&e).ends_with(": boom"),
+                "the cause stays in the rendered chain: {}",
+                error_chain(&e)
             );
         }
 
@@ -1609,7 +1636,11 @@ refs/heads/done:refs/heads/done
                     Some("origin"),
                     err_url(),
                 );
-                assert!(format!("{e}").contains(needle), "feature {feature}: {e}");
+                assert!(
+                    error_chain(&e).contains(needle),
+                    "feature {feature}: {}",
+                    error_chain(&e)
+                );
             }
         }
 
@@ -1625,8 +1656,15 @@ refs/heads/done:refs/heads/done
                 err_url(),
             );
             assert!(
-                format!("{e}").contains("the push was accepted by the server, but updating local tracking refs failed"),
-                "{e}"
+                error_chain(&e)
+                    .contains("the push was accepted by the server, but updating local tracking refs failed"),
+                "{}",
+                error_chain(&e)
+            );
+            assert!(
+                error_chain(&e).contains("Failed to update the local tracking references after the push"),
+                "the library error stays in the chain: {}",
+                error_chain(&e)
             );
         }
 
@@ -1640,8 +1678,14 @@ refs/heads/done:refs/heads/done
                 err_url(),
             );
             assert!(
-                format!("{e}").contains("failed to build the pack to send (local object database problem)"),
-                "{e}"
+                error_chain(&e).contains("failed to build the pack to send (local object database problem)"),
+                "{}",
+                error_chain(&e)
+            );
+            assert!(
+                error_chain(&e).ends_with(": no odb"),
+                "the cause stays in the rendered chain: {}",
+                error_chain(&e)
             );
         }
 
@@ -1656,8 +1700,14 @@ refs/heads/done:refs/heads/done
                 err_url(),
             );
             assert!(
-                format!("{e}").contains("could not talk to file:///x (receive-pack handshake failed)"),
-                "{e}"
+                error_chain(&e).contains("could not talk to file:///x (receive-pack handshake failed)"),
+                "{}",
+                error_chain(&e)
+            );
+            assert!(
+                error_chain(&e).ends_with(": empty credentials"),
+                "the cause stays in the rendered chain: {}",
+                error_chain(&e)
             );
         }
 
@@ -1670,8 +1720,14 @@ refs/heads/done:refs/heads/done
                 err_url(),
             );
             assert!(
-                format!("{e}").contains("connection to file:///x failed during the push"),
-                "{e}"
+                error_chain(&e).contains("connection to file:///x failed during the push"),
+                "{}",
+                error_chain(&e)
+            );
+            assert!(
+                error_chain(&e).contains("connection reset"),
+                "the transport cause stays in the chain: {}",
+                error_chain(&e)
             );
         }
 
@@ -1683,7 +1739,10 @@ refs/heads/done:refs/heads/done
                 Some("origin"),
                 err_url(),
             );
-            assert!(format!("{e}").contains("the server ended the push unexpectedly"), "{e}");
+            assert!(
+                error_chain(&e).contains("the server ended the push unexpectedly"),
+                "{e}"
+            );
         }
 
         // ── (e) remote defaulting chain (pushDefault > single remote > origin > error) ───────────
@@ -1829,7 +1888,7 @@ refs/heads/done:refs/heads/done
                 None,
                 err_url(),
             );
-            assert!(format!("{e}").contains("object hashes"), "{e}");
+            assert!(error_chain(&e).contains("object hashes"), "{e}");
         }
 
         // ── gpx14: the -f json DTO (§2.2) ────────────────────────────────────────────────────────
@@ -2436,8 +2495,13 @@ refs/heads/done:refs/heads/done
                 .join("no-such-dir")
                 .join("config");
             let e = edit("main", "main", false);
-            super::upstream::write_config(&missing, BStr::new("origin"), &[&e])
+            let err = super::upstream::write_config(&missing, BStr::new("origin"), &[&e])
                 .expect_err("a write to an unwritable path must fail, not silently succeed");
+            let chain = error_chain(&err);
+            assert!(
+                chain.contains("os error") || chain.contains("No such file"),
+                "the OS cause stays in the chain printed for the failure note: {chain}"
+            );
         }
 
         // (f) JSON goldens.
