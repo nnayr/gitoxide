@@ -216,7 +216,7 @@ where
 }
 
 /// Builders — infallible, by gitoxide convention (a capability/lease failure surfaces at `send()`,
-/// design amendment S6). The plan is immutable, so none of these can invalidate [`ref_updates`].
+/// design amendment S6). The plan is immutable, so none of these can invalidate [`ref_updates()`](Prepare::ref_updates).
 impl<T> Prepare<'_, '_, T>
 where
     T: Transport,
@@ -258,7 +258,7 @@ where
     }
 
     /// Set the reflog message used when the tracking refs are updated after the push. Reuses fetch's
-    /// [`RefLogMessage`](crate::remote::RefLogMessage) verbatim (never a twin). Consumed by gpx09's
+    /// [`RefLogMessage`](crate::remote::fetch::RefLogMessage) verbatim (never a twin). Consumed by gpx09's
     /// bookkeeping; stored here so a caller can set it before `send()`.
     pub fn with_reflog_message(mut self, reflog_message: RefLogMessage) -> Self {
         self.inner.reflog_message = Some(reflog_message);

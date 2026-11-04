@@ -1,10 +1,10 @@
-//! Push support for [`Remote`][crate::Remote]s, mirroring [`fetch`][super::fetch] for the
+//! Push support for [`Remote`][crate::Remote]s, mirroring [`fetch`][crate::remote::fetch] for the
 //! send (`git push`) direction: where fetch **receives** a pack, push **sends** one via
 //! `gix_protocol::push`.
 //!
 //! Porcelain fork landed by the `gpx01`..`gpx10` family (skeleton bead `rolfdb-gpx-p0`). This facade
-//! mirrors [`remote::fetch`](super::fetch) — an ungated module whose items are individually gated;
-//! porcelain types come from [`connection::push`](super::connection::push), plumbing vocabulary from
+//! mirrors [`remote::fetch`](crate::remote::fetch) — an ungated module whose items are individually gated;
+//! porcelain types come from `connection::push`, plumbing vocabulary from
 //! `gix_protocol::push`. `gpx02` wires the type foundations (errors, options, progress, and the
 //! re-exports below); the `prepare_push().send()` flow and its `Prepare`/`Outcome`/`Status`/`plan`
 //! types land with `gpx05`..`gpx09`.

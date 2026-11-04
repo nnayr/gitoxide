@@ -7,7 +7,7 @@
 //! pre-verdict for every ref (mirroring C-git's `set_ref_status_for_push`).
 //!
 //! # Pure core + oracle seam
-//! Everything lives in [`plan_inner`], a **pure** function with **zero I/O**: all repository access
+//! Everything lives in `plan_inner`, a **pure** function with **zero I/O**: all repository access
 //! is injected as four `&mut dyn FnMut` oracles (`has_object`, `ancestry`, `resolve_rev`,
 //! `tracking_ref_value`). That is what lets the whole edge-case catalog (E1–E36, below) run as
 //! deterministic, fixture-free unit tests over `HashMap` oracles — the plan-side analogue of the Q7
@@ -32,10 +32,13 @@
 //! # Lease / force (Q2)
 //! Three disentangled layers: (a) the wire **always** CAS-es `expected_old` = the advertised oid;
 //! (b) a `+`-spec skips **only** the local fast-forward check (never the CAS); (c)
-//! [`LeasePolicy::ForceWithLease`] with [`Lease::TrackingRef`]/[`Lease::Exact`] is applied at plan
-//! time — a held lease upgrades an otherwise-rejected update to [`Verdict::Forced`], a violation is a
-//! prepare-time [`Error::StaleLease`]. `expected_old` is therefore lease-independent (always the
-//! advertised oid), which is why the plan stays immutable under gpx07's late lease builders.
+//! [`LeasePolicy::ForceWithLease`](crate::remote::push::LeasePolicy::ForceWithLease) with
+//! [`Lease::TrackingRef`](crate::remote::push::Lease::TrackingRef)/[`Lease::Exact`](crate::remote::push::Lease::Exact)
+//! is applied at plan time — a held lease upgrades an otherwise-rejected update to
+//! [`Verdict::Forced`](crate::remote::push::Verdict::Forced), a violation is a prepare-time
+//! [`Error::StaleLease`](crate::remote::push::plan::Error::StaleLease). `expected_old` is therefore
+//! lease-independent (always the advertised oid), which is why the plan stays immutable under gpx07's
+//! late lease builders.
 
 #![allow(clippy::result_large_err)]
 // SKELETON: the pure core (`plan_inner`), its input snapshots (`LocalRef`/`HeadState`/`Ancestry`) and
@@ -315,7 +318,7 @@ pub enum Error {
     #[error(transparent)]
     InvalidRefName(#[from] gix_validate::reference::name::Error),
     /// A failure while snapshotting the local repository state (references, `HEAD`, object lookups)
-    /// that the [`plan()`] repo adapter feeds into the pure [`plan_inner`] core. Boxed so a single
+    /// that the `plan()` repo adapter feeds into the pure `plan_inner` core. Boxed so a single
     /// prepare-time variant absorbs the several distinct gix error types the snapshot can raise; like
     /// the rest of [`Error`] it is a whole-push abort and non-spurious.
     #[error("failed to snapshot the local repository for the push plan")]

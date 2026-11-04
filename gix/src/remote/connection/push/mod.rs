@@ -52,7 +52,7 @@ pub mod prepare {
     /// leases surface at prepare time) is appended by gpx05.
     ///
     /// gpx07 handshake-path audit (gpx02 owed note): every fallible call in
-    /// [`receive_pack_handshake_by_ref`](super::handshake) is already wrapped —
+    /// `receive_pack_handshake_by_ref` is already wrapped —
     /// `Transport::configure` returns `Box<dyn Error>` (⇒ [`ConfigureTransport`](Error::ConfigureTransport)),
     /// `gix_protocol::handshake` returns [`handshake::Error`](gix_protocol::handshake::Error)
     /// (⇒ [`Handshake`](Error::Handshake)), credential/transport-config each have their own variant,
@@ -148,7 +148,7 @@ impl PrepareOptions {
 }
 
 /// The progress ids emitted by the push pack-build phase (gpx06), mirroring the pattern of
-/// [`clone::checkout::ProgressId`](crate::clone::checkout::ProgressId).
+/// [`clone::checkout::main_worktree::ProgressId`](crate::clone::checkout::main_worktree::ProgressId).
 #[derive(Debug, Copy, Clone)]
 pub enum ProgressId {
     /// The number of objects counted while traversing tips (down to the advertised boundaries) to

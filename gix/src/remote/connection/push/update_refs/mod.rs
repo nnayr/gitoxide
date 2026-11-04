@@ -2,7 +2,7 @@
 //! [`fetch::refs`](crate::remote::fetch::refs), wired with `#[path]` and re-exported as
 //! [`remote::push::refs`](crate::remote::push::refs) exactly like fetch.
 //!
-//! After a successful [`send`](super::send_pack::Prepare::send), [`update`] correlates the server's
+//! After a successful [`send`](crate::remote::push::Prepare::send), `update` correlates the server's
 //! per-ref report back to the plan and — for every accepted branch update — moves (or, on a delete,
 //! removes) the corresponding `refs/remotes/<remote>/<branch>` tracking ref through one `gix_ref`
 //! transaction, writing an `"update by push"` reflog line via the reused fetch
@@ -14,11 +14,11 @@
 //! creation, no unborn/tag special-casing, and no `WritePackedRefs` beyond the default `DeletionsOnly`.
 //!
 //! # Correlation is PLAN-driven with a left-join (design amendment S1)
-//! [`update`] iterates **every** plan [`Mapping`](super::plan::Mapping) — including the locally
-//! rejected ones that were never sent — and left-joins the server [`RefUpdateStatus`] by the M5
-//! verbatim-name rule. A mapping with a local pre-verdict keeps its verdict as its [`Mode`]; a sent
+//! `update` iterates **every** plan [`Mapping`](crate::remote::push::Mapping) — including the locally
+//! rejected ones that were never sent — and left-joins the server [`RefUpdateStatus`](gix_protocol::push::RefUpdateStatus) by the M5
+//! verbatim-name rule. A mapping with a local pre-verdict keeps its verdict as its [`Mode`](crate::remote::push::refs::Mode); a sent
 //! mapping resolves from its `ok`/`ng` line; a sent mapping with *no* status is a defensive
-//! [`Mode::CorrelationGap`] rather than a panic.
+//! [`Mode::CorrelationGap`](crate::remote::push::refs::Mode::CorrelationGap) rather than a panic.
 
 #![allow(clippy::result_large_err)]
 

@@ -1,6 +1,6 @@
 //! The report-status parser (plan §3.5).
 //!
-//! The meaty logic is [`parse_report`], a pure function over already-split pkt-line payloads — so it
+//! The meaty logic is `parse_report`, a pure function over already-split pkt-line payloads — so it
 //! is unit-testable on byte slices, independent of any transport. The blocking I/O twin reads the
 //! pkt-lines off the wire and delegates to it.
 //!
@@ -158,7 +158,7 @@ pub(crate) fn parse_report(
 /// no longer splits for us (unlike the plain path, where each `readline_str` is one pkt-line). This
 /// re-frames that stream: `<4-hex-len><payload>` repeated, a `0000` flush-pkt ends the report, and a
 /// non-data length (`0001`/`0002`) is skipped. Payloads keep their trailing LF (the shared
-/// [`parse_report`] trims it, exactly as on the plain path).
+/// `parse_report` trims it, exactly as on the plain path).
 #[allow(dead_code)] // consumed by the sideband reader twins (blocking_io + async_io)
 pub(crate) fn split_report_pkt_lines(buf: &[u8]) -> Result<Vec<BString>, Error> {
     let mut lines = Vec::new();

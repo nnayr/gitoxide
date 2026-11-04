@@ -23,7 +23,7 @@ use crate::transport::client::{self, blocking_io::Transport};
 ///
 /// Blocking, non-atomic, single-ref, plain `report-status` v1. The negotiated object-format must
 /// equal the local ODB hash kind or the push is refused with [`Error::HashKindMismatch`] **before
-/// any bytes are sent** (F3). The [`async`](super::async_io::push) twin mirrors this flow exactly.
+/// any bytes are sent** (F3). The `async_io::push` twin mirrors this flow exactly.
 pub fn push<P, T, E>(
     updates: &[RefUpdate],
     write_pack: impl FnOnce(&mut dyn std::io::Write, &mut dyn DynNestedProgress, &AtomicBool) -> Result<(), E>,

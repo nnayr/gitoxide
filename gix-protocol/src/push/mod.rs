@@ -2,7 +2,7 @@
 //!
 //! **M1 (`gp01-u02`) — `push()` v1 blocking, non-atomic, single-ref core.**
 //!
-//! This module mirrors [`fetch`](crate::fetch) exactly (same [`Context`], `Options`/`Outcome`
+//! This module mirrors [`fetch()`](crate::fetch()) exactly (same [`Context`](crate::fetch::Context), `Options`/`Outcome`
 //! shapes, the caller-supplied pack closure, the "never ends the interaction" discipline). The
 //! `gix-protocol` crate never gains a `gix-pack` dependency: the packfile is built by the
 //! **caller's** `write_pack` closure, exactly as `fetch` consumes the server's pack through a
@@ -26,13 +26,13 @@
 //!
 //! # M3 wire features (default OFF)
 //!
-//! Two optional plumbing legs, negotiated only when the caller opts in via [`Options`] **and** the
+//! Two optional plumbing legs, negotiated only when the caller opts in via [`Options`](crate::push::Options) **and** the
 //! server advertised the capability (§1.3, §3.5):
 //!
-//! * **push-options** ([`Options::push_options`]) — option pkt-lines sent as their own flush-framed
+//! * **push-options** ([`Options::push_options`](crate::push::Options::push_options)) — option pkt-lines sent as their own flush-framed
 //!   block between the command-list flush and the pack (delete-only pushes send the block with no
 //!   pack).
-//! * **side-band-64k** ([`Options::sideband`]) — the report stream is demultiplexed (band 1 = the
+//! * **side-band-64k** ([`Options::sideband`](crate::push::Options::sideband)) — the report stream is demultiplexed (band 1 = the
 //!   report, band 2 = progress, band 3 = a remote error), mirroring `fetch`'s side-band handling.
 //!
 //! Left at their defaults (empty / `false`) neither touches the wire, so an M1/M2 push is

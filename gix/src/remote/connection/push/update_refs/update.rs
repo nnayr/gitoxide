@@ -1,12 +1,12 @@
 //! The result vocabulary of the push tracking-ref bookkeeping (`gpx09` / design `P9`): the per-ref
 //! [`Mode`], the [`Update`] that pairs a mode with its (optional) tracking-ref [`RefEdit`], and the
-//! [`Outcome`] the whole [`update`](super::update) pass returns.
+//! [`Outcome`](crate::remote::push::refs::update::Outcome) the whole `update` pass returns.
 //!
 //! The push twin of [`fetch::refs::update`](crate::remote::fetch::refs::update), deliberately **not**
 //! reusing fetch's `Mode`/`Update` so the push surface never names a `fetch` result type — the same
-//! stance as the twin [`plan::Verdict`](super::super::plan::Verdict) and the twin push errors. It is a
+//! stance as the twin [`plan::Verdict`](crate::remote::push::Verdict) and the twin push errors. It is a
 //! *shrunken* analogue: the only local refs push edits are the remote-tracking refs
-//! (`refs/remotes/<remote>/*`), so [`Outcome::edits`] holds tracking-ref edits only (05-outcome §Verdict).
+//! (`refs/remotes/<remote>/*`), so [`Outcome::edits`](crate::remote::push::refs::update::Outcome::edits) holds tracking-ref edits only (05-outcome §Verdict).
 
 use crate::bstr::BString;
 
@@ -75,8 +75,7 @@ pub enum SkipReason {
 }
 
 /// Information about the disposition of a single reference after a push, corresponding to the
-/// [`Mapping`](super::super::plan::Mapping) at the same index in [`PlannedUpdates::mappings`]
-/// (super::super::plan::PlannedUpdates::mappings).
+/// [`Mapping`](super::super::plan::Mapping) at the same index in [`PlannedUpdates::mappings`](super::super::plan::PlannedUpdates::mappings).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Update {
     /// How the reference fared.
