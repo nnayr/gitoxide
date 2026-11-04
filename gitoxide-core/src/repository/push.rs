@@ -171,7 +171,7 @@ pub(crate) mod function {
                 let config_path = repo.common_dir().join("config");
                 upstream::write_config(&config_path, upstream_remote.as_bstr(), &to_write)
                     .err()
-                    .map(|e| format!("to {} failed: {e:#}", config_path.display()))
+                    .map(|e| format!("to {} failed: {e}", config_path.display()))
             }
         };
 
@@ -1537,7 +1537,7 @@ refs/heads/done:refs/heads/done
                 Some("origin"),
                 err_url(),
             );
-            let msg = format!("{e:#}");
+            let msg = format!("{e}");
             assert!(
                 msg.contains("nothing to push: no ref-specs given and none configured for remote \"origin\""),
                 "{msg}"
@@ -1554,7 +1554,7 @@ refs/heads/done:refs/heads/done
             // FC3: an anonymous URL-remote (no name) must not tell the user to configure
             // `remote.origin.push` — there is no named remote to configure.
             let e = map_prepare_error(gix::remote::push::prepare::Error::MissingRefSpecs, None, err_url());
-            let msg = format!("{e:#}");
+            let msg = format!("{e}");
             assert!(!msg.contains("remote.origin.push"), "{msg}");
             assert!(!msg.contains("remote \"origin\""), "{msg}");
             assert!(msg.contains("nothing to push"), "{msg}");
@@ -1576,8 +1576,8 @@ refs/heads/done:refs/heads/done
                 err_url(),
             );
             assert!(
-                format!("{e:#}").contains("run 'gix fetch <remote>' and re-inspect before forcing"),
-                "{e:#}"
+                format!("{e}").contains("run 'gix fetch <remote>' and re-inspect before forcing"),
+                "{e}"
             );
         }
 
@@ -1592,8 +1592,8 @@ refs/heads/done:refs/heads/done
                 err_url(),
             );
             assert!(
-                format!("{e:#}").contains("failed to set up the connection to file:///x"),
-                "{e:#}"
+                format!("{e}").contains("failed to set up the connection to file:///x"),
+                "{e}"
             );
         }
 
@@ -1609,7 +1609,7 @@ refs/heads/done:refs/heads/done
                     Some("origin"),
                     err_url(),
                 );
-                assert!(format!("{e:#}").contains(needle), "feature {feature}: {e:#}");
+                assert!(format!("{e}").contains(needle), "feature {feature}: {e}");
             }
         }
 
@@ -1625,9 +1625,8 @@ refs/heads/done:refs/heads/done
                 err_url(),
             );
             assert!(
-                format!("{e:#}")
-                    .contains("the push was accepted by the server, but updating local tracking refs failed"),
-                "{e:#}"
+                format!("{e}").contains("the push was accepted by the server, but updating local tracking refs failed"),
+                "{e}"
             );
         }
 
@@ -1641,8 +1640,8 @@ refs/heads/done:refs/heads/done
                 err_url(),
             );
             assert!(
-                format!("{e:#}").contains("failed to build the pack to send (local object database problem)"),
-                "{e:#}"
+                format!("{e}").contains("failed to build the pack to send (local object database problem)"),
+                "{e}"
             );
         }
 
@@ -1657,8 +1656,8 @@ refs/heads/done:refs/heads/done
                 err_url(),
             );
             assert!(
-                format!("{e:#}").contains("could not talk to file:///x (receive-pack handshake failed)"),
-                "{e:#}"
+                format!("{e}").contains("could not talk to file:///x (receive-pack handshake failed)"),
+                "{e}"
             );
         }
 
@@ -1671,8 +1670,8 @@ refs/heads/done:refs/heads/done
                 err_url(),
             );
             assert!(
-                format!("{e:#}").contains("connection to file:///x failed during the push"),
-                "{e:#}"
+                format!("{e}").contains("connection to file:///x failed during the push"),
+                "{e}"
             );
         }
 
@@ -1684,10 +1683,7 @@ refs/heads/done:refs/heads/done
                 Some("origin"),
                 err_url(),
             );
-            assert!(
-                format!("{e:#}").contains("the server ended the push unexpectedly"),
-                "{e:#}"
-            );
+            assert!(format!("{e}").contains("the server ended the push unexpectedly"), "{e}");
         }
 
         // ── (e) remote defaulting chain (pushDefault > single remote > origin > error) ───────────
@@ -1833,7 +1829,7 @@ refs/heads/done:refs/heads/done
                 None,
                 err_url(),
             );
-            assert!(format!("{e:#}").contains("object hashes"), "{e:#}");
+            assert!(format!("{e}").contains("object hashes"), "{e}");
         }
 
         // ── gpx14: the -f json DTO (§2.2) ────────────────────────────────────────────────────────
