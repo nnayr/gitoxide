@@ -354,7 +354,7 @@ where
     // 6. Generate entries and stream the pack bytes.
     let object_count = counts.len() as u32;
     let entries_progress = progress.add_child_with_id("creating entries".into(), gix_utils::progress::UNKNOWN);
-    let in_order = gix_parallel::InOrderIter::from(
+    let in_order = TagEntryGenerationErrors(gix_parallel::InOrderIter::from(
         entry::iter_from_counts(
             counts,
             objects.clone(),
@@ -373,7 +373,7 @@ where
             },
         )
         .map_err(Error::IterEntries)?,
-    );
+    ));
 
     let mut writing = progress.add_child_with_id("writing pack".into(), ProgressId::WritePack.into());
     writing.init(None, gix_utils::progress::bytes());
@@ -383,7 +383,13 @@ where
         if should_interrupt.load(Ordering::Relaxed) {
             return Err(Error::Interrupted);
         }
-        let written = written.map_err(Error::PackWrite)?;
+        let written = written.map_err(|err| {
+            if err.iter_errors().any(|cause| cause.is::<EntryGenerationFailed>()) {
+                Error::IterEntries(err)
+            } else {
+                Error::PackWrite(err)
+            }
+        })?;
         writing.inc_by(written as usize);
     }
     let pack_hash = from_entries.digest();
@@ -392,7 +398,7 @@ where
     // Reaches through FromEntriesIter's public `input`/`inner` fields (vendored gix-pack v0.63.0
     // layout) to recover the entries-written stat; a base bump that reshapes FromEntriesIter will
     // surface here as a compile error, which is the desired breakage mode (review note).
-    let entries = from_entries.input.inner.finalize().map_err(Error::IterEntries)?;
+    let entries = from_entries.input.0.inner.finalize().map_err(Error::IterEntries)?;
 
     Ok(Outcome {
         object_count,
@@ -402,6 +408,35 @@ where
         counts: count_stats,
         entries,
     })
+}
+
+/// Marks an error as having occurred while generating pack entries, as opposed to writing the pack.
+#[derive(Debug)]
+struct EntryGenerationFailed;
+
+impl std::fmt::Display for EntryGenerationFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Failed to generate the pack entries")
+    }
+}
+
+impl std::error::Error for EntryGenerationFailed {}
+
+/// Adapts the entry iterator so errors it yields carry [`EntryGenerationFailed`]. `FromEntriesIter` reports
+/// failures of its input iterator and of its output writer alike, and this marker tells them apart.
+struct TagEntryGenerationErrors<I>(I);
+
+impl<T, I> Iterator for TagEntryGenerationErrors<I>
+where
+    I: Iterator<Item = gix_error::Result<T>>,
+{
+    type Item = gix_error::Result<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0
+            .next()
+            .map(|item| item.map_err(|err| gix_error::ErrorExt::and_raise(err, EntryGenerationFailed)))
+    }
 }
 
 /// The synchronous pack-writing closure `gix_protocol::push()` demands (F6): a
@@ -1112,6 +1147,129 @@ mod tests {
         assert!(
             matches!(err, Error::Interrupted),
             "mid-write interrupt is surfaced, got {err:?}"
+        );
+    }
+
+    /// An object store that cannot read one particular blob through the pack-side lookup. Counting objects
+    /// never decodes blobs, so only entry generation, which has to compress the blob, trips over it.
+    #[derive(Clone)]
+    struct GenerationFails {
+        odb: Odb,
+        unreadable: ObjectId,
+    }
+
+    impl gix_object::Find for GenerationFails {
+        fn try_find<'a>(
+            &self,
+            id: &gix_hash::oid,
+            buffer: &'a mut Vec<u8>,
+        ) -> gix_error::Result<Option<gix_object::Data<'a>>> {
+            gix_object::Find::try_find(&self.odb, id, buffer)
+        }
+    }
+    impl gix_object::FindHeader for GenerationFails {
+        fn try_header(&self, id: &gix_hash::oid) -> gix_error::Result<Option<gix_object::Header>> {
+            gix_object::FindHeader::try_header(&self.odb, id)
+        }
+    }
+    impl gix_pack::Find for GenerationFails {
+        fn contains(&self, id: &gix_hash::oid) -> bool {
+            gix_pack::Find::contains(&self.odb, id)
+        }
+        fn try_find_cached<'a>(
+            &self,
+            id: &gix_hash::oid,
+            buffer: &'a mut Vec<u8>,
+            pack_cache: &mut dyn gix_pack::cache::DecodeEntry,
+        ) -> gix_error::Result<Option<(gix_object::Data<'a>, Option<gix_pack::data::entry::Location>)>> {
+            if id != self.unreadable {
+                return gix_pack::Find::try_find_cached(&self.odb, id, buffer, pack_cache);
+            }
+            Err(gix_error::ErrorExt::raise(gix_error::message(
+                "injected object lookup failure while generating entries",
+            )))
+        }
+        fn location_by_oid(
+            &self,
+            id: &gix_hash::oid,
+            buf: &mut Vec<u8>,
+        ) -> gix_error::Result<Option<gix_pack::data::entry::Location>> {
+            gix_pack::Find::location_by_oid(&self.odb, id, buf)
+        }
+        fn pack_offsets_and_oid(
+            &self,
+            pack_id: u32,
+        ) -> gix_error::Result<Option<Vec<(gix_pack::data::Offset, ObjectId)>>> {
+            gix_pack::Find::pack_offsets_and_oid(&self.odb, pack_id)
+        }
+        fn entry_by_location(&self, location: &gix_pack::data::entry::Location) -> Option<gix_pack::find::Entry> {
+            gix_pack::Find::entry_by_location(&self.odb, location)
+        }
+    }
+
+    /// A writer that always fails, standing in for a broken transport.
+    struct BrokenWriter;
+    impl std::io::Write for BrokenWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn entry_generation_failures_are_not_reported_as_write_failures() {
+        let fx = Fixture::new();
+        let odb = fx.odb();
+        let blob = fx.blob(b"hello");
+        let tree = fx.tree(vec![("hello.txt", gix_object::tree::EntryKind::Blob, blob)]);
+        let commit = fx.commit(tree, vec![], "root");
+
+        let mut out = Vec::new();
+        let mut progress = gix_utils::progress::Discard;
+        let err = write_pack(
+            GenerationFails { odb, unreadable: blob },
+            vec![commit],
+            vec![],
+            Kind::Sha1,
+            &mut out,
+            &mut progress,
+            &AtomicBool::new(false),
+        )
+        .expect_err("entry generation cannot read the objects");
+        assert!(
+            matches!(err, Error::IterEntries(_)),
+            "a failure producing entries is `IterEntries`, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("injected object lookup failure"),
+            "the cause stays visible: {err}"
+        );
+    }
+
+    #[test]
+    fn output_write_failures_are_reported_as_pack_write_failures() {
+        let fx = Fixture::new();
+        let odb = fx.odb();
+        let blob = fx.blob(b"hello");
+        let tree = fx.tree(vec![("hello.txt", gix_object::tree::EntryKind::Blob, blob)]);
+        let commit = fx.commit(tree, vec![], "root");
+
+        let mut progress = gix_utils::progress::Discard;
+        let err = write_pack(
+            odb,
+            vec![commit],
+            vec![],
+            Kind::Sha1,
+            &mut BrokenWriter,
+            &mut progress,
+            &AtomicBool::new(false),
+        )
+        .expect_err("the writer is broken");
+        assert!(
+            matches!(err, Error::PackWrite(_)),
+            "a failure writing bytes is `PackWrite`, got {err:?}"
         );
     }
 }
