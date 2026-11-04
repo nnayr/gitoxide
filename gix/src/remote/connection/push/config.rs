@@ -163,7 +163,7 @@ mod tests {
         gix::init(dir.path()).expect("init empty repo");
         let mut opts = gix::open::Options::isolated();
         if !overrides.is_empty() {
-            opts = opts.config_overrides(overrides.iter().map(|s| s.to_string()));
+            opts = opts.config_overrides(overrides.iter().map(ToString::to_string));
         }
         let repo = gix::open_opts(dir.path(), opts).expect("reopen with overrides");
         (repo, dir)

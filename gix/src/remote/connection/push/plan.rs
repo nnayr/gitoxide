@@ -1178,7 +1178,7 @@ mod adapter {
 
         let mut has_object = |id: &oid| repo.objects.exists(id);
         let mut ancestry = |old: &oid, new: &oid| ancestry_of(repo, old, new);
-        let mut resolve_rev = |spec: &BStr| repo.rev_parse_single(spec).ok().map(|id| id.detach());
+        let mut resolve_rev = |spec: &BStr| repo.rev_parse_single(spec).ok().map(crate::Id::detach);
         let mut tracking_ref_value = |dst: &FullName| tracking_ref_value(repo, &fetch_specs, dst.as_ref(), object_hash);
 
         plan_inner(
@@ -1214,7 +1214,7 @@ mod adapter {
             let peeled = reference
                 .into_fully_peeled_id()
                 .ok()
-                .map(|id| id.detach())
+                .map(crate::Id::detach)
                 .filter(|peeled| *peeled != target);
             out.push(LocalRef { name, target, peeled });
         }
@@ -1273,8 +1273,7 @@ mod adapter {
 
     fn object_is_commit(repo: &crate::Repository, id: &oid) -> bool {
         repo.find_object(id)
-            .map(|obj| obj.kind == gix_object::Kind::Commit)
-            .unwrap_or(false)
+            .is_ok_and(|obj| obj.kind == gix_object::Kind::Commit)
     }
 
     /// The `tracking_ref_value` oracle for `--force-with-lease=<tracking-ref>` (Q5 reverse-map): map
@@ -2121,7 +2120,7 @@ mod tests {
     #[test]
     fn e25_dst_unqualified_object_source() {
         let a = oid(1);
-        let s: &'static str = Box::leak(format!("{}:x", a).into_boxed_str());
+        let s: &'static str = Box::leak(format!("{a}:x").into_boxed_str());
         let err = Fix {
             specs: vec![s],
             odb: HashSet::from([a]),
@@ -2522,7 +2521,7 @@ mod adapter_integration {
     /// remote sits at C1, local advanced to C2 (child of C1) ⇒ `FastForward` update.
     #[test]
     fn fast_forward_when_remote_is_an_ancestor() {
-        let (tmp, repo, c1) = repo_with_main();
+        let (tmp, _repo, c1) = repo_with_main();
         let root = tmp.path();
         std::fs::write(root.join("f.txt"), b"hi2").expect("write file");
         git(&["add", "f.txt"], root);
@@ -2552,7 +2551,7 @@ mod adapter_integration {
     /// (sibling of local main, both children of the root) ⇒ `RejectedNonFastForward`, reject-as-data.
     #[test]
     fn non_fast_forward_when_histories_diverge() {
-        let (tmp, repo, c1) = repo_with_main();
+        let (tmp, _repo, c1) = repo_with_main();
         let root = tmp.path();
         // Advance main to C2, then create a divergent sibling D (child of C1) on a side branch —
         // the remote advertises D while we push C2: D is not an ancestor of C2.

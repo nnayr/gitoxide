@@ -6,8 +6,7 @@
 //!
 //! `#[ignore]`-gated AND environment-driven (manual/nightly by design, plan §6.4 — never CI):
 //!   * `ROLFDB_HOSTED_URL`   — the https clone URL of a scratch repo this test MAY MUTATE
-//!                             (pushes and deletes `refs/rolfdb/interop-test`; never touches
-//!                             `refs/heads/*`).
+//!     (pushes and deletes `refs/rolfdb/interop-test`; never touches `refs/heads/*`).
 //!   * `ROLFDB_HOSTED_USER`  — username for Basic auth (for GitHub tokens any non-empty value).
 //!   * `ROLFDB_HOSTED_TOKEN` — the token/password.
 //!
@@ -18,6 +17,7 @@
 //! The remaining fu2 items (hosted `ng`-prose matrix, hidden-ref F11, replica-lag → `Err(Backend)`
 //! never NFF-retried) stay on the bead; this file is where they land.
 
+#![allow(unexpected_cfgs)] // `push_https_test` is set via RUSTFLAGS by `scripts/gix-push-sync.sh hosted`
 #![cfg(all(unix, feature = "push", feature = "blocking-client", push_https_test))]
 
 mod support;

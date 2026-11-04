@@ -1728,7 +1728,7 @@ refs/heads/done:refs/heads/done
             let (_g, repo) = TmpRepo::new("");
             let remote = by_name_or_url_for_push(&repo, Some("https://example.com/explicit")).expect("url resolves");
             assert_eq!(
-                remote.url(gix::remote::Direction::Push).map(|u| u.to_bstring()),
+                remote.url(gix::remote::Direction::Push).map(gix::Url::to_bstring),
                 Some(BString::from("https://example.com/explicit"))
             );
         }
