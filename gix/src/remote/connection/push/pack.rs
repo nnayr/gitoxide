@@ -84,7 +84,7 @@ impl std::fmt::Display for Error {
             | Error::IterEntries(err)
             | Error::PackWrite(err)
             | Error::Find(err)
-            | Error::Decode(err) => write!(f, "{err:#}"),
+            | Error::Decode(err) => write_error_chain(f, err),
             Error::MergeRepairDiff(err) => {
                 f.write_str("Failed to diff a merge parent's tree during the merge-undercount repair")?;
                 super::error::write_causes(f, &**err)
@@ -102,6 +102,24 @@ impl std::fmt::Display for Error {
             ),
         }
     }
+}
+
+/// Write `err` and all of its causes on one line as `outer: cause: root`. Alternate formatting is not used:
+/// it prints a multi-line, Debug-labelled tree when `gix-error` is built in tree mode.
+fn write_error_chain(f: &mut std::fmt::Formatter<'_>, err: &gix_error::Error) -> std::fmt::Result {
+    let mut previous = String::new();
+    for (index, cause) in err.iter_errors().enumerate() {
+        let text = cause.to_string();
+        if index > 0 && text == previous {
+            continue;
+        }
+        if index > 0 {
+            f.write_str(": ")?;
+        }
+        f.write_str(&text)?;
+        previous = text;
+    }
+    Ok(())
 }
 
 impl std::error::Error for Error {
@@ -1274,5 +1292,27 @@ mod tests {
             matches!(err, Error::PackWrite(_)),
             "a failure writing bytes is `PackWrite`, got {err:?}"
         );
+    }
+
+    #[test]
+    fn erased_pack_errors_render_their_causes_on_one_line() {
+        use gix_error::ErrorExt;
+        let cause = gix_error::message("root cause")
+            .raise()
+            .and_raise(gix_error::message("outer context"));
+        for err in [
+            Error::Find(cause),
+            Error::PackWrite(gix_error::message("root cause").raise()),
+        ] {
+            let text = err.to_string();
+            assert!(!text.contains('\n'), "a single line in every error mode: {text:?}");
+            assert!(text.contains("root cause"), "the cause is named: {text:?}");
+        }
+        let nested = Error::Find(
+            gix_error::message("root cause")
+                .raise()
+                .and_raise(gix_error::message("outer context")),
+        );
+        assert_eq!(nested.to_string(), "outer context: root cause");
     }
 }
