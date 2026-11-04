@@ -66,6 +66,7 @@ pub(crate) mod function {
         // The requested atomic policy, reported in the JSON `atomic` field (§2.2). We report the
         // flag-level intent — the config seed (`push.atomic`) is read inside `prepare_push` and the CLI
         // must not re-read it (§"Config seeding"), so a bare push labels its policy `when-advertised`.
+        #[cfg(feature = "serde")]
         let atomic_label = if no_atomic {
             "disabled"
         } else if atomic {
@@ -184,6 +185,7 @@ pub(crate) mod function {
                 }
                 write_human_table(&mut out, push_url.as_bstr(), &outcome)?;
             }
+            #[cfg(feature = "serde")]
             OutputFormat::Json => {
                 if handshake_info {
                     // stdout is reserved for the document, so the handshake block goes to stderr.
@@ -716,9 +718,9 @@ pub(crate) mod function {
         }
     }
 
-    /// Write the `-f json` document to `out` (gpx14, §2.2). Non-serde builds `bail!` like fetch does
-    /// today — JSON is only available when gitoxide-core's `serde` feature is on (the binary's
-    /// `pretty-cli` enables it).
+    /// Write the `-f json` document to `out` (gpx14, §2.2). JSON is only available when
+    /// gitoxide-core's `serde` feature is on (the binary's `pretty-cli` enables it); without it
+    /// `OutputFormat::Json` does not exist, exactly as for fetch.
     #[cfg(feature = "serde")]
     fn write_json_document(
         mut out: impl std::io::Write,
@@ -733,18 +735,6 @@ pub(crate) mod function {
         serde_json::to_writer_pretty(&mut out, &doc)?;
         writeln!(out)?;
         Ok(())
-    }
-
-    #[cfg(not(feature = "serde"))]
-    fn write_json_document(
-        _out: impl std::io::Write,
-        _atomic_label: &str,
-        _url: &gix::bstr::BStr,
-        _outcome: &gix::remote::push::Outcome,
-        _messages: Vec<String>,
-        _set_upstream: Option<(&[upstream::Edit], &gix::bstr::BStr, Option<&str>)>,
-    ) -> anyhow::Result<()> {
-        bail!("JSON output for pushing requires the 'serde' feature (enabled by the binary's 'pretty-cli')");
     }
 
     /// The `-f json` serde DTO (§2.2) — a CLI-local projection of the push [`Outcome`], so the fork's
