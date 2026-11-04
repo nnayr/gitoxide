@@ -203,7 +203,7 @@ mod tests {
     use crate::remote::push;
 
     fn is_spurious(err: &(dyn std::error::Error + 'static)) -> bool {
-        gix_error::classify(err).can_retry()
+        gix_error::classify(err).can_retry_lenient()
     }
 
     #[test]
