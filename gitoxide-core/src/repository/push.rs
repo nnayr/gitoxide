@@ -263,8 +263,7 @@ pub(crate) mod function {
                     message(
                         "no remote found to push to — set 'remote.pushDefault', configure a remote, or pass --remote",
                     )
-                    .not_found()
-                    .raise()
+                    .not_found_error()
                 })??,
         })
     }
@@ -689,15 +688,13 @@ pub(crate) mod function {
                      hint: pass a ref-spec (e.g. 'gix push refs/heads/main'), or configure remote.{remote}.push\n\
                      hint: expansion of 'push.default' is not yet supported by gix"
                 )
-                .validation()
-                .raise(),
+                .validation_error(),
                 None => message!(
                     "nothing to push: no ref-specs given and none configured for the remote\n\
                      hint: pass a ref-spec (e.g. 'gix push refs/heads/main')\n\
                      hint: expansion of 'push.default' is not yet supported by gix"
                 )
-                .validation()
-                .raise(),
+                .validation_error(),
             },
             Error::Plan(gix::remote::push::plan::Error::StaleLease { .. }) => {
                 err.and_raise(message("hint: run 'gix fetch <remote>' and re-inspect before forcing"))
