@@ -19,9 +19,9 @@ mod blocking_io;
 #[cfg(feature = "blocking-client")]
 pub(crate) use blocking_io::parse;
 
-#[cfg(feature = "async-client")]
+#[cfg(all(feature = "async-client", not(feature = "blocking-client")))]
 mod async_io;
-#[cfg(feature = "async-client")]
+#[cfg(all(feature = "async-client", not(feature = "blocking-client")))]
 pub(crate) use async_io::parse;
 
 /// The progress id for the `remote` child progress a side-band-64k report demux routes band 2 (and

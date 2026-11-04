@@ -8,8 +8,8 @@
 //! [`select_capabilities`](crate::push::command::select_capabilities)) and mirror each other's flow
 //! byte-for-byte (F4 single-flush on the pack path vs the delete-only path, R2 drop-before-read).
 //!
-//! The two client features are mutually exclusive, so exactly one `push` is ever in scope; `push/mod`
-//! re-exports whichever one the active feature selects.
+//! Exactly one `push` is ever in scope: `push/mod` re-exports the async twin only if `async-client` is
+//! the sole client feature, and the blocking one otherwise (as for all APIs shared by both I/O modes).
 
 use crate::push::{Error, Options, RefUpdate, command, command::SelectedCaps};
 
@@ -18,9 +18,9 @@ mod blocking_io;
 #[cfg(feature = "blocking-client")]
 pub use blocking_io::push;
 
-#[cfg(feature = "async-client")]
+#[cfg(all(feature = "async-client", not(feature = "blocking-client")))]
 mod async_io;
-#[cfg(feature = "async-client")]
+#[cfg(all(feature = "async-client", not(feature = "blocking-client")))]
 pub use async_io::push;
 
 /// The pure pre-flight shared by both orchestrator twins (plan §3.3): reject an empty request, then

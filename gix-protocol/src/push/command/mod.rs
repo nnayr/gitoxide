@@ -16,10 +16,9 @@ mod blocking_io;
 #[cfg(feature = "blocking-client")]
 pub(crate) use blocking_io::{write_command_list, write_push_options};
 
-#[cfg(feature = "async-client")]
+#[cfg(all(feature = "async-client", not(feature = "blocking-client")))]
 mod async_io;
-#[cfg(feature = "async-client")]
-#[allow(unused_imports)]
+#[cfg(all(feature = "async-client", not(feature = "blocking-client")))]
 pub(crate) use async_io::{write_command_list, write_push_options};
 
 /// The client's selection from the advertised capabilities, plus the negotiated object hash and the

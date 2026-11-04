@@ -57,10 +57,11 @@ pub mod validate;
 pub use validate::{Advertised, plan_from_advertisement};
 
 // The orchestrator has explicit blocking/async twins (see `function/`); each I/O build re-exports
-// its own `push`. The two client features are mutually exclusive, so only one is ever in scope.
+// its own `push`. Like the other APIs shared by both I/O modes, enabling both client features selects
+// the blocking implementation, so only one `push` is ever in scope.
 #[cfg(any(feature = "blocking-client", feature = "async-client"))]
 mod function;
 #[cfg(feature = "blocking-client")]
 pub use function::push;
-#[cfg(feature = "async-client")]
+#[cfg(all(feature = "async-client", not(feature = "blocking-client")))]
 pub use function::push;
