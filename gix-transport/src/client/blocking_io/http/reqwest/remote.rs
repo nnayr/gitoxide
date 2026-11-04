@@ -70,6 +70,12 @@ impl Default for Remote {
             } in req_recv
             {
                 // (Re)build the client on first use, and whenever the fu4 TLS-trust options change.
+                // NOTE: unlike upstream, which builds the client once per worker (and again only after a worker
+                // restart), a changed TLS-trust key also rebuilds it, so the user-supplied
+                // `Options::configure_client` callback runs again for that rebuild. The key only changes if
+                // `configure()` is called again with different TLS options on the same transport, which the
+                // normal fetch and push flows do not do. The callback must be idempotent: a one-shot setting
+                // it installs by consuming captured state would be missing from the rebuilt client.
                 let tls_key: TlsTrustKey = (config.ssl_ca_info.clone(), config.ssl_verify, config.ssl_version);
                 if !client_and_tls.as_ref().is_some_and(|(_, key)| key == &tls_key) {
                     client_and_tls = Some((
@@ -379,6 +385,9 @@ type TlsTrustKey = (
     Option<http::options::SslVersionRangeInclusive>,
 );
 
+// Builds one client for the given TLS-trust key. Runs the application's `Options::configure_client` callback
+// each time it is called, i.e. also on a rebuild after the TLS-trust key changed (fork behavior, see the
+// call site); the upstream documentation of that option only mentions a worker restart.
 fn build_client(
     redirect_action: &Arc<Mutex<RedirectAction>>,
     redirect_tail: &Arc<Mutex<String>>,
