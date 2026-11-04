@@ -14,10 +14,8 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
-mod error;
-pub use error::Error;
 mod types;
-pub use types::{BlameEntry, BlamePathEntry, BlameRanges, Options, Outcome, Statistics};
+pub use types::{BlameEntry, BlamePathEntry, BlameRanges, Options, Outcome, Start, Statistics};
 
 mod file;
 pub use file::function::file;

@@ -1,6 +1,7 @@
-use std::hash;
+use gix_error::{Result, message};
+use std::{hash, ops::Range};
 
-use crate::{Kind, ObjectId};
+use crate::{Kind, ObjectId, Prefix};
 
 #[cfg(feature = "sha1")]
 use crate::{EMPTY_BLOB_SHA1, EMPTY_TREE_SHA1, SIZE_OF_SHA1_DIGEST};
@@ -55,6 +56,17 @@ impl std::fmt::Display for HexDisplay<'_> {
     }
 }
 
+impl HexDisplay<'_> {
+    pub(crate) fn eq_str(&self, other: &str) -> bool {
+        let mut hex = Kind::hex_buf();
+        let hex = self.inner.hex_to_buf(hex.as_mut());
+        hex[..self.hex_len.min(hex.len())] == *other
+    }
+}
+
+// Keep this directional as truncated displays aren't uniquely identified by their text.
+impl_partial_eq_str_one_way!(HexDisplay<'_>);
+
 impl std::fmt::Debug for oid {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -71,19 +83,11 @@ impl std::fmt::Debug for oid {
     }
 }
 
-/// The error returned when trying to convert a byte slice to an [`oid`] or [`ObjectId`]
-#[expect(missing_docs)]
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("Cannot instantiate git hash from a digest of length {0}")]
-    InvalidByteSliceLength(usize),
-}
-
 /// Conversion
 impl oid {
     /// Try to create a shared object id from a slice of bytes representing a hash `digest`
     #[inline]
-    pub fn try_from_bytes(digest: &[u8]) -> Result<&Self, Error> {
+    pub fn try_from_bytes(digest: &[u8]) -> Result<&Self> {
         match digest.len() {
             #[cfg(feature = "sha1")]
             SIZE_OF_SHA1_DIGEST => Ok(
@@ -99,7 +103,7 @@ impl oid {
                     &*(std::ptr::from_ref::<[u8]>(digest) as *const oid)
                 },
             ),
-            len => Err(Error::InvalidByteSliceLength(len)),
+            len => Err(message!("Cannot instantiate git hash from a digest of length {len}").validation_error()),
         }
     }
 
@@ -139,6 +143,7 @@ impl oid {
     }
 
     /// Return a type which can display itself in hexadecimal form with the `len` amount of characters.
+    #[gix_macros::unstable(since = "2021-12-21")]
     #[inline]
     pub fn to_hex_with_len(&self, len: usize) -> HexDisplay<'_> {
         HexDisplay {
@@ -148,11 +153,32 @@ impl oid {
     }
 
     /// Return a type which displays this `oid` as hex in full.
+    #[gix_macros::unstable(since = "2020-07-16")]
     #[inline]
     pub fn to_hex(&self) -> HexDisplay<'_> {
         HexDisplay {
             inner: self,
             hex_len: self.bytes.len() * 2,
+        }
+    }
+
+    /// Return the bytes in `range` as a standalone, byte-aligned [`Prefix`].
+    ///
+    /// The range addresses raw hash bytes, not hexadecimal digits. Thus, each selected byte contributes two hexadecimal
+    /// digits to the returned prefix. The selected bytes become the beginning of the prefix, independently of where they
+    /// occurred in this object ID.
+    ///
+    /// # Panics
+    ///
+    /// If `range` is out of bounds or has its start after its end.
+    #[inline]
+    pub fn to_prefix(&self, range: Range<usize>) -> Prefix {
+        let selected = &self.bytes[range];
+        let mut bytes = ObjectId::null(self.kind());
+        bytes.as_mut_slice()[..selected.len()].copy_from_slice(selected);
+        Prefix {
+            bytes,
+            hex_len: selected.len() * 2,
         }
     }
 
@@ -175,6 +201,10 @@ impl oid {
         let mut hex = Kind::hex_buf();
         let hex_len = self.hex_to_buf(&mut hex).len();
         out.write_all(&hex[..hex_len])
+    }
+
+    pub(crate) fn eq_str(&self, other: &str) -> bool {
+        self.to_hex().eq_str(other)
     }
 
     /// Returns `true` if this hash consists of all null bytes.
@@ -264,9 +294,9 @@ impl AsRef<oid> for &oid {
 }
 
 impl<'a> TryFrom<&'a [u8]> for &'a oid {
-    type Error = Error;
+    type Error = gix_error::Error;
 
-    fn try_from(value: &'a [u8]) -> Result<Self, Self::Error> {
+    fn try_from(value: &'a [u8]) -> Result<Self> {
         oid::try_from_bytes(value)
     }
 }
@@ -311,12 +341,26 @@ impl PartialEq<ObjectId> for &oid {
     }
 }
 
+impl PartialEq<String> for &oid {
+    fn eq(&self, other: &String) -> bool {
+        self.eq_str(other)
+    }
+}
+
+impl PartialEq<&oid> for String {
+    fn eq(&self, other: &&oid) -> bool {
+        other.eq_str(self)
+    }
+}
+
+impl_partial_eq_str!(oid);
+
 /// Manually created from a version that uses a slice, and we forcefully try to convert it into a borrowed array of the desired size
 /// Could be improved by fitting this into serde.
 /// Unfortunately the `serde::Deserialize` derive wouldn't work for borrowed arrays.
 #[cfg(feature = "serde")]
 impl<'de: 'a, 'a> serde::Deserialize<'de> for &'a oid {
-    fn deserialize<D>(deserializer: D) -> Result<Self, <D as serde::Deserializer<'de>>::Error>
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, <D as serde::Deserializer<'de>>::Error>
     where
         D: serde::Deserializer<'de>,
     {

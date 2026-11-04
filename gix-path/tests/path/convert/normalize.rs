@@ -15,7 +15,7 @@ fn no_change_if_there_are_no_trailing_relative_components() {
 }
 
 #[test]
-fn special_cases_around_cwd() -> crate::Result {
+fn special_cases_around_cwd() -> gix_testtools::TestResult {
     let cwd = std::env::current_dir()?;
     assert_eq!(
         normalize(p("./../../.git/modules/src/llvm-project").into(), &cwd).unwrap(),
@@ -25,6 +25,16 @@ fn special_cases_around_cwd() -> crate::Result {
             .unwrap()
             .join(".git/modules/src/llvm-project"),
         "'.' is handled specifically to not fail to swap in the CWD"
+    );
+    assert_eq!(
+        normalize(p("././../target").into(), &cwd).unwrap(),
+        cwd.parent().expect("current directory has a parent").join("target"),
+        "current-directory components don't consume parent-directory components"
+    );
+    assert_eq!(
+        normalize(p("././../target").into(), p("")),
+        None,
+        "current-directory components don't hide traversal above an empty root"
     );
     assert_eq!(
         normalize((&cwd).into(), &cwd).unwrap(),
@@ -141,7 +151,7 @@ fn trailing_relative_components_are_resolved() {
         assert_eq!(
             normalize(path.into(), cwd).unwrap_or_else(|| panic!("{path:?}")),
             Cow::Borrowed(p(expected)),
-            "'{input}' got an unexpected result"
+            "\"{input}\" got an unexpected result"
         );
     }
 }

@@ -2,13 +2,13 @@ lints.workspace = true
 
 [package]
 name = "gix-submodule"
-version = "0.32.0"
+version = "0.36.1"
 repository = "https://github.com/GitoxideLabs/gitoxide"
 license = "MIT OR Apache-2.0"
 description = "A crate of the gitoxide project dealing git submodules"
 authors = ["Sebastian Thiel <sebastian.thiel@icloud.com>"]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 include = ["/src/**/*", "/LICENSE-*"]
 
 [lib]
@@ -21,18 +21,19 @@ sha1 = ["gix-refspec/sha1"]
 sha256 = ["gix-refspec/sha256"]
 
 [dependencies]
-gix-pathspec = { version = "^0.18.1", path = "../gix-pathspec" }
-gix-refspec = { version = "^0.43.0", path = "../gix-refspec" }
-gix-config = { version = "^0.58.0", path = "../gix-config" }
-gix-path = { version = "^0.12.2", path = "../gix-path" }
-gix-url = { version = "^0.36.2", path = "../gix-url" }
+gix-pathspec = { version = "^0.22.1", path = "../gix-pathspec" }
+gix-error = { version = "^0.5.2", path = "../gix-error", features = ["bstr"] }
+gix-refspec = { version = "^0.47.1", path = "../gix-refspec" }
+gix-config = { version = "^0.62.2", path = "../gix-config" }
+gix-path = { version = "^0.14.1", path = "../gix-path" }
+gix-url = { version = "^0.40.1", path = "../gix-url" }
 
 bstr = { version = "1.12.0", default-features = false }
-thiserror = "2.0.18"
 
 [dev-dependencies]
+insta = "1.46.3"
 gix-testtools = { path = "../tests/tools" }
-gix-features = { path = "../gix-features", features = ["walkdir"] }
+gix-fs = { path = "../gix-fs", features = ["walkdir", "unstable"] }
 
 [package.metadata.docs.rs]
 features = ["sha1"]

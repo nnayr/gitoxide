@@ -1,11 +1,14 @@
 use std::cell::RefCell;
 
+use crate::Result;
+
 impl crate::Repository {
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn from_refs_and_objects(
         refs: crate::RefStore,
         mut objects: crate::OdbHandle,
         work_tree: Option<std::path::PathBuf>,
+        index_path: std::path::PathBuf,
         common_dir: Option<std::path::PathBuf>,
         config: crate::config::Cache,
         linked_worktree_options: crate::open::Options,
@@ -17,6 +20,7 @@ impl crate::Repository {
         crate::Repository {
             bufs: Some(RefCell::new(Vec::with_capacity(4))),
             work_tree,
+            index_path,
             common_dir,
             objects,
             refs,
@@ -37,7 +41,7 @@ impl crate::Repository {
 
     /// Reopen this repository in place using the stored open options.
     /// Use this to forcefully refresh Git configuration, drop caches, and release system resources
-    /// for opened object database resources.
+    /// for opened object database resources (if this is the last instance to a repository).
     ///
     /// This discards in-memory-only configuration edits and any other transient repository state that is recreated
     /// during opening.
@@ -47,24 +51,43 @@ impl crate::Repository {
     /// When the [`git_dir`](Self::git_dir()) is relative and the current working dir changed,
     /// then a reload will be performed on the joined path of both to make it succeed, which makes
     /// the reloaded repository git-dir absolute.
-    pub fn reload(&mut self) -> Result<&mut Self, crate::open::Error> {
+    pub fn reload(&mut self) -> Result<&mut Self> {
+        self.reload_with(|options| options)
+    }
+
+    /// Reopen this repository in place after applying `configure` to a copy of its stored open options.
+    ///
+    /// Trust is retained unless `configure` changes it with [`with_trust()`][crate::open::Options::with_trust()].
+    /// The modified options are stored for subsequent reloads. On failure, this handle remains unchanged.
+    /// Like [`reload()`][Self::reload()], this discards transient state and refreshes configuration and caches.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # let mut repo = gix::open(".")?;
+    /// repo.reload_with(|options| options.cli_overrides(["core.abbrev=8"]))?;
+    /// # Ok::<_, gix::Error>(())
+    /// ```
+    pub fn reload_with(
+        &mut self,
+        configure: impl FnOnce(crate::open::Options) -> crate::open::Options,
+    ) -> Result<&mut Self> {
         let mut git_dir = self.git_dir().to_owned();
-        let options = self.options.clone().open_path_as_is(true);
-        if git_dir.is_relative() {
-            if let Some((prev_cwd, cwd)) = options.current_dir.as_ref().zip(std::env::current_dir().ok()) {
-                if *prev_cwd != cwd {
-                    git_dir = prev_cwd.join(git_dir);
-                }
-            }
+        let options = configure(self.options.clone_with_trust()).open_path_as_is(true);
+        if git_dir.is_relative()
+            && let Some((prev_cwd, cwd)) = self.options.current_dir.as_ref().zip(std::env::current_dir().ok())
+            && *prev_cwd != cwd
+        {
+            git_dir = prev_cwd.join(git_dir);
         }
         *self = crate::ThreadSafeRepository::open_opts(git_dir, options)?.to_thread_local();
         Ok(self)
     }
 }
 
-#[cfg_attr(not(feature = "max-performance-safe"), allow(unused_variables, unused_mut))]
+#[cfg_attr(not(feature = "max-performance"), allow(unused_variables, unused_mut))]
 pub(crate) fn setup_objects(objects: &mut crate::OdbHandle, config: &crate::config::Cache) {
-    #[cfg(feature = "max-performance-safe")]
+    #[cfg(feature = "max-performance")]
     {
         match config.pack_cache_bytes {
             None => match config.static_pack_cache_limit_bytes {

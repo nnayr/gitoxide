@@ -1,13 +1,16 @@
+use gix_testtools::TestResult;
+
 mod set_namespace {
     use gix::refs::transaction::PreviousValue;
     use gix_testtools::tempfile;
+    use gix_testtools::{Result, TestResult};
 
-    fn easy_repo_rw() -> crate::Result<(gix::Repository, tempfile::TempDir)> {
+    fn easy_repo_rw() -> Result<(gix::Repository, tempfile::TempDir)> {
         crate::repo_rw("make_references_repo.sh")
     }
 
     #[test]
-    fn affects_edits_and_iteration() -> crate::Result {
+    fn affects_edits_and_iteration() -> TestResult {
         let (mut repo, _keep) = easy_repo_rw()?;
         assert_eq!(
             repo.references()?.all()?.count(),
@@ -18,7 +21,7 @@ mod set_namespace {
         assert!(repo.set_namespace("foo")?.is_none(), "there is no previous namespace");
 
         assert_eq!(
-            repo.references()?.all()?.filter_map(Result::ok).count(),
+            repo.references()?.all()?.filter_map(std::result::Result::ok).count(),
             0,
             "no references are in the namespace yet"
         );
@@ -35,8 +38,7 @@ mod set_namespace {
         assert_eq!(
             repo.references()?
                 .all()?
-                .filter_map(Result::ok)
-                .map(|r| r.name().as_bstr().to_owned())
+                .filter_map(std::result::Result::ok)
                 .collect::<Vec<_>>(),
             vec!["refs/heads/new-branch", "refs/tags/new-tag"],
             "namespaced references appear like normal ones"
@@ -45,26 +47,25 @@ mod set_namespace {
         assert_eq!(
             repo.references()?
                 .prefixed("refs/tags/")?
-                .filter_map(Result::ok)
-                .map(|r| r.name().as_bstr().to_owned())
+                .filter_map(std::result::Result::ok)
                 .collect::<Vec<_>>(),
             vec!["refs/tags/new-tag"],
             "namespaced references appear like normal ones"
         );
         let fully_qualified_tag_name = "refs/tags/new-tag";
         assert_eq!(
-            repo.find_reference(fully_qualified_tag_name)?.name().as_bstr(),
+            repo.find_reference(fully_qualified_tag_name)?,
             fully_qualified_tag_name,
             "fully qualified (yet namespaced) names work"
         );
         assert_eq!(
-            repo.find_reference("new-tag")?.name().as_bstr(),
+            repo.find_reference("new-tag")?,
             fully_qualified_tag_name,
             "namespaces are transparent"
         );
 
         let previous_ns = repo.clear_namespace().expect("namespace set");
-        assert_eq!(previous_ns.as_bstr(), "refs/namespaces/foo/");
+        assert_eq!(previous_ns, "refs/namespaces/foo/");
         assert!(repo.clear_namespace().is_none(), "it doesn't invent namespaces");
 
         assert_eq!(
@@ -77,7 +78,7 @@ mod set_namespace {
 }
 
 #[test]
-fn try_find_reference_with_existing_ref_as_path_prefix_returns_none() -> crate::Result {
+fn try_find_reference_with_existing_ref_as_path_prefix_returns_none() -> TestResult {
     let (repo, _tmp) = crate::repo_rw("make_references_repo.sh")?;
     std::fs::create_dir_all(repo.git_dir().join("refs/heads"))?;
     std::fs::write(
@@ -94,19 +95,19 @@ fn try_find_reference_with_existing_ref_as_path_prefix_returns_none() -> crate::
 
 mod iter_references {
     use crate::util::hex_to_id;
+    use gix_testtools::{Result, TestResult};
 
-    fn repo() -> crate::Result<gix::Repository> {
+    fn repo() -> Result<gix::Repository> {
         crate::repo("make_references_repo.sh").map(|r| r.to_thread_local())
     }
 
     #[test]
-    fn all() -> crate::Result {
+    fn all() -> TestResult {
         let repo = repo()?;
         assert_eq!(
             repo.references()?
                 .all()?
-                .filter_map(Result::ok)
-                .map(|r| r.name().as_bstr().to_owned())
+                .filter_map(std::result::Result::ok)
                 .collect::<Vec<_>>(),
             vec![
                 "refs/d1",
@@ -131,12 +132,12 @@ mod iter_references {
     }
 
     #[test]
-    fn prefixed() -> crate::Result {
+    fn prefixed() -> TestResult {
         let repo = repo()?;
         assert_eq!(
             repo.references()?
                 .prefixed("refs/heads/")?
-                .filter_map(Result::ok)
+                .filter_map(std::result::Result::ok)
                 .map(|r| (
                     r.name().as_bstr().to_string(),
                     r.target().try_id().map(ToOwned::to_owned)
@@ -162,13 +163,13 @@ mod iter_references {
     }
 
     #[test]
-    fn prefixed_and_peeled() -> crate::Result {
+    fn prefixed_and_peeled() -> TestResult {
         let repo = repo()?;
         assert_eq!(
             repo.references()?
                 .prefixed(b"refs/heads/")?
                 .peeled()?
-                .filter_map(Result::ok)
+                .filter_map(std::result::Result::ok)
                 .map(|r| (
                     r.name().as_bstr().to_string(),
                     r.target().try_id().map(ToOwned::to_owned)
@@ -199,15 +200,15 @@ mod iter_references {
     /// Regression test for https://github.com/GitoxideLabs/gitoxide/issues/2103
     /// This only ensures we can return a reference, not that the code below is correct
     #[test]
-    fn tags() -> crate::Result {
+    fn tags() -> TestResult {
         let repo = repo()?;
         let actual = repo
             .references()?
             .tags()?
-            .filter_map(Result::ok)
+            .filter_map(std::result::Result::ok)
             .max_by_key(|tag| tag.name().shorten().to_owned())
             .ok_or(std::io::Error::other("latest tag not found"))?;
-        assert_eq!(actual.name().as_bstr(), "refs/tags/t1");
+        assert_eq!(actual, "refs/tags/t1");
         Ok(())
     }
 }
@@ -215,11 +216,12 @@ mod iter_references {
 mod head {
 
     use gix_ref::transaction::PreviousValue;
+    use gix_testtools::TestResult;
 
     use crate::util::hex_to_id;
 
     #[test]
-    fn symbolic() -> crate::Result {
+    fn symbolic() -> TestResult {
         let repo = crate::basic_repo()?;
         let head = repo.head()?;
         match &head.kind {
@@ -231,13 +233,13 @@ mod head {
             }
             _ => panic!("unexpected head kind"),
         }
-        assert_eq!(head.referent_name().expect("born").as_bstr(), "refs/heads/main");
+        assert_eq!(head.referent_name().expect("born"), "refs/heads/main");
         assert!(!head.is_detached());
         Ok(())
     }
 
     #[test]
-    fn detached() -> crate::Result {
+    fn detached() -> TestResult {
         let (repo, _keep) = crate::basic_rw_repo()?;
         repo.reference(
             "HEAD",

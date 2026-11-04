@@ -6,36 +6,40 @@ use crate::{
 impl Extensions {
     /// The `extensions.worktreeConfig` key.
     pub const WORKTREE_CONFIG: keys::Boolean = keys::Boolean::new_boolean("worktreeConfig", &config::Tree::EXTENSIONS);
+    /// The `extensions.relativeWorktrees` key, indicating that worktrees may use relative links.
+    pub const RELATIVE_WORKTREES: keys::Boolean =
+        keys::Boolean::new_boolean("relativeWorktrees", &config::Tree::EXTENSIONS);
     /// The `extensions.objectFormat` key.
-    pub const OBJECT_FORMAT: ObjectFormat =
-        ObjectFormat::new_with_validate("objectFormat", &config::Tree::EXTENSIONS, validate::ObjectFormat).with_note(
-            "Support for SHA256 is prepared but not fully implemented yet. For now we abort when encountered",
-        );
+    pub const OBJECT_FORMAT: ObjectFormat = ObjectFormat::new_object_format("objectFormat", &config::Tree::EXTENSIONS);
 }
 
-/// The `core.checkStat` key.
+/// The `extensions.objectFormat` key.
 pub type ObjectFormat = keys::Any<validate::ObjectFormat>;
 
 mod object_format {
-    use crate::{bstr::ByteSlice, config, config::tree::sections::extensions::ObjectFormat};
+    use gix_error::{ResultExt, message};
+
+    use crate::{
+        Result,
+        config::tree::{Key, Section, keys, sections::extensions::ObjectFormat},
+    };
 
     impl ObjectFormat {
-        pub fn try_into_object_format(
-            &'static self,
-            value: impl gix_utils::AsBStr,
-        ) -> Result<gix_hash::Kind, config::key::GenericErrorWithValue> {
-            let value = value.as_bstr();
-            #[cfg(feature = "sha1")]
-            if value.as_bstr().eq_ignore_ascii_case(b"sha1") {
-                return Ok(gix_hash::Kind::Sha1);
-            }
+        /// Create a new instance.
+        pub const fn new_object_format(name: &'static str, section: &'static dyn Section) -> Self {
+            keys::Any::new_with_validate(name, section, super::validate::ObjectFormat)
+        }
 
-            #[cfg(feature = "sha256")]
-            if value.as_bstr().eq_ignore_ascii_case(b"sha256") {
-                return Ok(gix_hash::Kind::Sha256);
-            }
-
-            Err(config::key::GenericErrorWithValue::from_value(self, value.into()))
+        /// Parse an object format, distinguishing unknown names from known hashes disabled in this build.
+        /// Disabled hashes are classified as [`gix_error::Class::Unsupported`], unknown names as validation failures.
+        pub fn try_into_object_format(&'static self, value: impl gix_utils::AsBStr) -> Result<gix_hash::Kind> {
+            super::validate::ObjectFormat::parse(value.as_bstr()).or_raise(|| {
+                let mut context = message("Invalid configuration value").with("key", self.logical_name());
+                if let Some(environment) = self.environment_override() {
+                    context = context.with("environment_override", environment);
+                }
+                context
+            })
         }
     }
 }
@@ -46,20 +50,45 @@ impl Section for Extensions {
     }
 
     fn keys(&self) -> &[&dyn Key] {
-        &[&Self::OBJECT_FORMAT, &Self::WORKTREE_CONFIG]
+        &[&Self::OBJECT_FORMAT, &Self::WORKTREE_CONFIG, &Self::RELATIVE_WORKTREES]
     }
 }
 
 mod validate {
-    use crate::{bstr::BStr, config::tree::keys};
+    use gix_error::message;
+
+    use crate::{Result, bstr::BStr, config::tree::keys};
 
     #[derive(Clone, Copy)]
     pub struct ObjectFormat;
 
     impl keys::Validate for ObjectFormat {
-        fn validate(&self, value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-            super::Extensions::OBJECT_FORMAT.try_into_object_format(value)?;
-            Ok(())
+        fn validate(&self, value: &BStr) -> Result {
+            Self::parse(value).map(|_| ())
+        }
+    }
+
+    impl ObjectFormat {
+        pub(super) fn parse(value: &BStr) -> Result<gix_hash::Kind> {
+            #[cfg(feature = "sha1")]
+            if value.eq_ignore_ascii_case(b"sha1") {
+                return Ok(gix_hash::Kind::Sha1);
+            }
+
+            #[cfg(feature = "sha256")]
+            if value.eq_ignore_ascii_case(b"sha256") {
+                return Ok(gix_hash::Kind::Sha256);
+            }
+
+            if value.eq_ignore_ascii_case(b"sha1") || value.eq_ignore_ascii_case(b"sha256") {
+                return Err(message("Object format is not enabled in this build")
+                    .with_input(value)
+                    .unsupported_error());
+            }
+
+            Err(message("Invalid configuration value")
+                .with_input(value)
+                .validation_error())
         }
     }
 }

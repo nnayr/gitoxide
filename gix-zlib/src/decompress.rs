@@ -1,22 +1,10 @@
 //! Implementations for [`Decompress`](crate::Decompress).
 
+use gix_error::{ErrorExt, ResourceExhaustionKind, message};
+use gix_error::{Result, resource_exhaustion};
 use zlib_rs::InflateError;
 
 use crate::{Decompress, FlushDecompress, Status};
-///
-/// The error produced by [`Decompress::decompress()`].
-#[derive(Debug, thiserror::Error)]
-#[expect(missing_docs)]
-pub enum DecompressError {
-    #[error("stream error")]
-    StreamError,
-    #[error("Not enough memory")]
-    InsufficientMemory,
-    #[error("Invalid input data")]
-    DataError,
-    #[error("Decompressing this input requires a dictionary")]
-    NeedDict,
-}
 
 impl Default for Decompress {
     fn default() -> Self {
@@ -54,34 +42,30 @@ impl Decompress {
     }
 
     /// Decompress `input` and write all decompressed bytes into `output`, with `flush` defining some details about this.
-    pub fn decompress(
-        &mut self,
-        input: &[u8],
-        output: &mut [u8],
-        flush: FlushDecompress,
-    ) -> Result<Status, DecompressError> {
+    pub fn decompress(&mut self, input: &[u8], output: &mut [u8], flush: FlushDecompress) -> Result<Status> {
         let inflate_flush = match flush {
             FlushDecompress::None => zlib_rs::InflateFlush::NoFlush,
             FlushDecompress::Sync => zlib_rs::InflateFlush::SyncFlush,
             FlushDecompress::Finish => zlib_rs::InflateFlush::Finish,
         };
 
-        let status = self.0.decompress(input, output, inflate_flush)?;
+        let status = self
+            .0
+            .decompress(input, output, inflate_flush)
+            .map_err(|err| match err {
+                InflateError::NeedDict { .. } => {
+                    gix_error::validation("Decompressing this input requires a dictionary").raise_erased()
+                }
+                InflateError::StreamError => message("stream error").raise_erased(),
+                InflateError::DataError => gix_error::corruption("Invalid input data").raise_erased(),
+                InflateError::MemError => {
+                    resource_exhaustion(ResourceExhaustionKind::AllocationFailure, "Not enough memory").raise_erased()
+                }
+            })?;
         match status {
             zlib_rs::Status::Ok => Ok(Status::Ok),
             zlib_rs::Status::BufError => Ok(Status::BufError),
             zlib_rs::Status::StreamEnd => Ok(Status::StreamEnd),
-        }
-    }
-}
-
-impl From<InflateError> for DecompressError {
-    fn from(value: InflateError) -> Self {
-        match value {
-            InflateError::NeedDict { .. } => DecompressError::NeedDict,
-            InflateError::StreamError => DecompressError::StreamError,
-            InflateError::DataError => DecompressError::DataError,
-            InflateError::MemError => DecompressError::InsufficientMemory,
         }
     }
 }

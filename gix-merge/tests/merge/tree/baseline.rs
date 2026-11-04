@@ -36,6 +36,8 @@ pub enum ConflictKind {
     ConflictModifyDelete,
     /// Modified in ours but parent directory renamed in theirs.
     DirectoryRenamedWithModificationInside,
+    /// A path was automatically moved through a directory rename.
+    PathUpdatedDueToDirectoryRename,
     /// Added files differ in mode.
     DistinctModes,
     /// The same file was renamed to different destinations.
@@ -169,15 +171,7 @@ impl Iterator for Expectations<'_> {
             unknown => unreachable!("Unknown conflict style: '{unknown}'"),
         };
         let object_hash = gix_testtools::object_hash();
-        let odb = gix_odb::at_opts(
-            subdir_path.join(".git/objects"),
-            Vec::new(),
-            gix_odb::store::init::Options {
-                object_hash,
-                ..Default::default()
-            },
-        )
-        .expect("object dir exists");
+        let odb = gix_odb::at(subdir_path.join(".git/objects"), object_hash).expect("object dir exists");
         let objects = gix_odb::memory::Proxy::new(odb, object_hash);
         let our_commit_id = gix_hash::ObjectId::from_hex(our_commit_id.as_bytes()).unwrap();
         let their_commit_id = gix_hash::ObjectId::from_hex(their_commit_id.as_bytes()).unwrap();
@@ -291,6 +285,7 @@ fn parse_info<'a>(mut lines: impl Iterator<Item = &'a str>) -> Option<ConflictIn
         "CONFLICT (file/directory)" => ConflictKind::ConflictDirectoryBlocksFile,
         "CONFLICT (modify/delete)" => ConflictKind::ConflictModifyDelete,
         "CONFLICT (directory rename suggested)" => ConflictKind::DirectoryRenamedWithModificationInside,
+        "Path updated due to directory rename" => ConflictKind::PathUpdatedDueToDirectoryRename,
         "CONFLICT (distinct modes)" => ConflictKind::DistinctModes,
         "CONFLICT (rename/rename)" => ConflictKind::RenameRename,
         "CONFLICT (rename/delete)" => ConflictKind::RenameAddDelete,

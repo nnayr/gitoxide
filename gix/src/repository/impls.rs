@@ -1,7 +1,27 @@
+use gix_error::Result;
 use std::ops::DerefMut;
 
+use gix_error::{ResultExt, bail};
 use gix_hash::ObjectId;
-use gix_object::Exists;
+
+impl Clone for crate::ThreadSafeRepository {
+    fn clone(&self) -> Self {
+        Self {
+            refs: self.refs.clone(),
+            objects: self.objects.clone(),
+            work_tree: self.work_tree.clone(),
+            index_path: self.index_path.clone(),
+            common_dir: self.common_dir.clone(),
+            config: self.config.clone(),
+            linked_worktree_options: self.linked_worktree_options.clone_with_trust(),
+            #[cfg(feature = "index")]
+            index: self.index.clone(),
+            #[cfg(feature = "attributes")]
+            modules: self.modules.clone(),
+            shallow_commits: self.shallow_commits.clone(),
+        }
+    }
+}
 
 impl Clone for crate::Repository {
     fn clone(&self) -> Self {
@@ -9,9 +29,10 @@ impl Clone for crate::Repository {
             self.refs.clone(),
             self.objects.clone(),
             self.work_tree.clone(),
+            self.index_path.clone(),
             self.common_dir.clone(),
             self.config.clone(),
-            self.options.clone(),
+            self.options.clone_with_trust(),
             #[cfg(feature = "index")]
             self.index.clone(),
             self.shallow_commits.clone(),
@@ -39,9 +60,12 @@ impl std::fmt::Debug for crate::Repository {
 
 impl PartialEq<crate::Repository> for crate::Repository {
     fn eq(&self, other: &crate::Repository) -> bool {
-        self.git_dir().canonicalize().ok() == other.git_dir().canonicalize().ok()
-            && self.work_tree.as_deref().and_then(|wt| wt.canonicalize().ok())
-                == other.work_tree.as_deref().and_then(|wt| wt.canonicalize().ok())
+        let realpath = |repo: &crate::Repository, path| {
+            gix_path::realpath_opts(path, repo.current_dir(), gix_path::realpath::MAX_SYMLINKS).ok()
+        };
+        realpath(self, self.git_dir()) == realpath(other, other.git_dir())
+            && self.work_tree.as_deref().and_then(|path| realpath(self, path))
+                == other.work_tree.as_deref().and_then(|path| realpath(other, path))
     }
 }
 
@@ -51,9 +75,10 @@ impl From<&crate::ThreadSafeRepository> for crate::Repository {
             repo.refs.clone(),
             gix_odb::memory::Proxy::from(gix_odb::Cache::from(repo.objects.to_handle())).with_write_passthrough(),
             repo.work_tree.clone(),
+            repo.index_path.clone(),
             repo.common_dir.clone(),
             repo.config.clone(),
-            repo.linked_worktree_options.clone(),
+            repo.linked_worktree_options.clone_with_trust(),
             #[cfg(feature = "index")]
             repo.index.clone(),
             repo.shallow_commits.clone(),
@@ -69,6 +94,7 @@ impl From<crate::ThreadSafeRepository> for crate::Repository {
             repo.refs,
             gix_odb::memory::Proxy::from(gix_odb::Cache::from(repo.objects.to_handle())).with_write_passthrough(),
             repo.work_tree,
+            repo.index_path,
             repo.common_dir,
             repo.config,
             repo.linked_worktree_options,
@@ -87,6 +113,7 @@ impl From<crate::Repository> for crate::ThreadSafeRepository {
             refs: r.refs,
             objects: r.objects.into_inner().store(),
             work_tree: r.work_tree,
+            index_path: r.index_path,
             common_dir: r.common_dir,
             config: r.config,
             linked_worktree_options: r.options,
@@ -100,15 +127,15 @@ impl From<crate::Repository> for crate::ThreadSafeRepository {
 }
 
 impl gix_object::Write for crate::Repository {
-    fn write(&self, object: &dyn gix_object::WriteTo) -> Result<gix_hash::ObjectId, gix_object::write::Error> {
+    fn write(&self, object: &dyn gix_object::WriteTo) -> Result<gix_hash::ObjectId> {
         let mut buf = self.empty_reusable_buffer();
-        object.write_to(buf.deref_mut())?;
+        object.write_to(buf.deref_mut()).or_error()?;
         self.write_buf(object.kind(), &buf)
     }
 
-    fn write_buf(&self, object: gix_object::Kind, from: &[u8]) -> Result<gix_hash::ObjectId, gix_object::write::Error> {
+    fn write_buf(&self, object: gix_object::Kind, from: &[u8]) -> Result<gix_hash::ObjectId> {
         let oid = gix_object::compute_hash(self.object_hash(), object, from)?;
-        if self.objects.exists(&oid) {
+        if self.objects.exists_without_refresh(&oid) {
             return Ok(oid);
         }
         self.objects.write_buf_with_known_id(object, from, oid)
@@ -119,11 +146,11 @@ impl gix_object::Write for crate::Repository {
         kind: gix_object::Kind,
         size: u64,
         from: &mut dyn std::io::Read,
-    ) -> Result<gix_hash::ObjectId, gix_object::write::Error> {
+    ) -> Result<gix_hash::ObjectId> {
         let mut buf = self.empty_reusable_buffer();
-        let bytes = std::io::copy(from, buf.deref_mut())?;
+        let bytes = std::io::copy(from, buf.deref_mut()).or_error()?;
         if size != bytes {
-            return Err(format!("Found {bytes} bytes in stream, but had {size} bytes declared").into());
+            bail!("Found {bytes} bytes in stream, but had {size} bytes declared");
         }
         self.write_buf(kind, &buf)
     }
@@ -133,8 +160,8 @@ impl gix_object::Write for crate::Repository {
         object: gix_object::Kind,
         from: &[u8],
         id: gix_hash::ObjectId,
-    ) -> Result<gix_hash::ObjectId, gix_object::write::Error> {
-        if self.objects.exists(&id) {
+    ) -> Result<gix_hash::ObjectId> {
+        if self.objects.exists_without_refresh(&id) {
             return Ok(id);
         }
         self.objects.write_buf_with_known_id(object, from, id)
@@ -146,18 +173,18 @@ impl gix_object::Write for crate::Repository {
         size: u64,
         from: &mut dyn std::io::Read,
         id: gix_hash::ObjectId,
-    ) -> Result<gix_hash::ObjectId, gix_object::write::Error> {
+    ) -> Result<gix_hash::ObjectId> {
         let mut buf = self.empty_reusable_buffer();
-        let bytes = std::io::copy(from, buf.deref_mut())?;
+        let bytes = std::io::copy(from, buf.deref_mut()).or_error()?;
         if size != bytes {
-            return Err(format!("Found {bytes} bytes in stream, but had {size} bytes declared").into());
+            bail!("Found {bytes} bytes in stream, but had {size} bytes declared");
         }
         self.write_buf_with_known_id(kind, &buf, id)
     }
 }
 
 impl gix_object::FindHeader for crate::Repository {
-    fn try_header(&self, id: &gix_hash::oid) -> Result<Option<gix_object::Header>, gix_object::find::Error> {
+    fn try_header(&self, id: &gix_hash::oid) -> Result<Option<gix_object::Header>> {
         if id == ObjectId::empty_tree(self.object_hash()) {
             return Ok(Some(gix_object::Header {
                 kind: gix_object::Kind::Tree,
@@ -169,11 +196,7 @@ impl gix_object::FindHeader for crate::Repository {
 }
 
 impl gix_object::Find for crate::Repository {
-    fn try_find<'a>(
-        &self,
-        id: &gix_hash::oid,
-        buffer: &'a mut Vec<u8>,
-    ) -> Result<Option<gix_object::Data<'a>>, gix_object::find::Error> {
+    fn try_find<'a>(&self, id: &gix_hash::oid, buffer: &'a mut Vec<u8>) -> Result<Option<gix_object::Data<'a>>> {
         if id == ObjectId::empty_tree(self.object_hash()) {
             buffer.clear();
             return Ok(Some(gix_object::Data {

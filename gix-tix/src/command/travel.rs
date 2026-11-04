@@ -1,0 +1,1198 @@
+use std::{
+    collections::{HashMap, HashSet},
+    ffi::OsString,
+};
+
+#[cfg(test)]
+use gix::Error;
+use gix::{
+    Result,
+    error::{OptionExt, ResultExt, bail, message},
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
+pub(super) enum To {
+    /// Visit the oldest reachable root in HEAD's visible history.
+    First,
+    /// Visit HEAD's direct visible parent.
+    Parent,
+    /// Visit HEAD's direct visible child.
+    Child,
+    /// Visit the reachable leaf in HEAD's visible history.
+    Tip,
+}
+
+impl To {
+    fn name(self) -> &'static str {
+        match self {
+            To::First => "first",
+            To::Parent => "parent",
+            To::Child => "child",
+            To::Tip => "tip",
+        }
+    }
+}
+
+#[derive(Debug, clap::Args)]
+#[command(group(
+    clap::ArgGroup::new("destination")
+        .required(true)
+        .multiple(false)
+        .args(["revision", "to"])
+))]
+pub(super) struct Args {
+    /// Save local changes at the departure commit and restore them on return.
+    #[arg(long)]
+    pub(super) stash: bool,
+    /// Check out an encountered replay conflict and write its unmerged index.
+    #[arg(long)]
+    pub(super) materialize_conflicts: bool,
+    /// Revision resolving to the commit to visit.
+    #[arg(value_name = "REVSPEC")]
+    pub(super) revision: Option<OsString>,
+    /// Visit a commit relative to HEAD in the default Tix view.
+    #[arg(long, value_enum, value_name = "DESTINATION")]
+    pub(super) to: Option<To>,
+}
+
+pub(super) fn run(repository: gix::Repository, args: Args) -> Result<()> {
+    let head = repository
+        .head()
+        .or_raise(|| message("could not read HEAD before time-travel"))?;
+    let head_id = head
+        .id()
+        .map(gix::Id::detach)
+        .ok_or_raise(|| message("cannot time-travel from an unborn HEAD"))?;
+    let detached = head.is_detached();
+    drop(head);
+    let (selected, resolved_graph) = match (&args.revision, args.to) {
+        (Some(revision), None) => super::resolve_commit(&repository, revision, "time-travel destination")?,
+        (None, Some(to)) => {
+            let hidden = crate::history::available_hidden_revisions(&repository, &[], true)?.0;
+            let hidden_tips = crate::history::snapshot(&repository, &[], &hidden, false)?.hidden_tips;
+            let graph = crate::edit::loaded_explicit_view_graph(&repository, &[], &hidden)?;
+            let selected = relative_destination(&repository, &graph, &hidden_tips, head_id, to)?;
+            (selected, Some(graph))
+        }
+        _ => bail!("exactly one time-travel destination is required"),
+    };
+    if selected == head_id {
+        let commit = repository.find_commit(selected)?.decode()?.into_owned()?;
+        if args.stash || !crate::edit::rebase::is_pending(&commit) && !crate::edit::auto_merge::is_auto_merge(&commit) {
+            eprintln!("already at {}", crate::change_id::display(&repository, selected, 7)?);
+            return Ok(());
+        }
+    }
+
+    let revisions = vec![OsString::from("HEAD"), OsString::from(selected.to_string())];
+    let graph = match resolved_graph {
+        Some(graph) => graph,
+        None => {
+            let hidden = crate::history::available_hidden_revisions(&repository, &[], true)?.0;
+            crate::edit::loaded_explicit_view_graph(&repository, &revisions, &hidden)?
+        }
+    };
+    let forward = graph.is_ancestor(head_id, selected);
+    if detached && !forward {
+        let source_is_pinned = crate::history::all_pins(&repository)?
+            .into_iter()
+            .any(|pin| graph.is_ancestor(head_id, pin.id));
+        if !source_is_pinned {
+            bail!("detached HEAD or one of its descendants must be pinned before travelling into the past or sideways");
+        }
+    }
+
+    let reviews = crate::history::all_reviews(&repository)?
+        .into_iter()
+        .map(|review| review.id)
+        .collect::<Vec<_>>();
+    let repository_path = repository.git_dir().to_owned();
+    let bare = repository.is_bare();
+    drop(repository);
+    match crate::edit::time_travel::perform(
+        &repository_path,
+        bare,
+        selected,
+        &graph,
+        &reviews,
+        &[],
+        crate::edit::time_travel::Options {
+            stash: args.stash,
+            ..Default::default()
+        },
+    )? {
+        crate::edit::time_travel::Perform::Complete {
+            notice,
+            selected,
+            ref_rewrites,
+            ref_changes,
+        } => {
+            let repository = crate::open_repository(&repository_path, bare, false)
+                .or_raise(|| message("could not reopen repository after time-travel"))?;
+            eprintln!(
+                "{}",
+                super::notice_with_change_id(
+                    &repository,
+                    &notice.unwrap_or_else(|| format!("already at {}", selected.to_hex_with_len(7))),
+                    selected,
+                )?
+            );
+            super::print_ref_rewrites(&repository, &ref_rewrites)?;
+            super::record_undo(&repository, "time travel", Ok(ref_changes));
+        }
+        crate::edit::time_travel::Perform::Conflict(conflict) if args.materialize_conflicts => {
+            let (notice, _, ref_rewrites, ref_changes) = conflict.accept()?;
+            let repository = crate::open_repository(&repository_path, bare, false)
+                .or_raise(|| message("could not reopen repository after materializing time-travel"))?;
+            super::print_ref_rewrites(&repository, &ref_rewrites)?;
+            super::record_undo(&repository, "materialize time-travel conflict", Ok(ref_changes));
+            bail!("{notice}");
+        }
+        crate::edit::time_travel::Perform::Conflict(_) => {
+            bail!("time-travel would conflict; retry with --materialize-conflicts to check it out")
+        }
+    }
+    Ok(())
+}
+
+fn relative_destination(
+    repository: &gix::Repository,
+    graph: &crate::history::HistoryGraph,
+    hidden_tips: &[gix::ObjectId],
+    head: gix::ObjectId,
+    to: To,
+) -> Result<gix::ObjectId> {
+    let order = graph
+        .stored_commit_ids()
+        .filter(|id| !hidden_tips.iter().any(|hidden| graph.is_ancestor(*id, *hidden)))
+        .collect::<Vec<_>>();
+    let stored = order.iter().copied().collect::<HashSet<_>>();
+    if !stored.contains(&head) {
+        bail!("HEAD is not present in the default Tix view");
+    }
+
+    let candidates = match to {
+        To::Parent => visible_parents(graph, head, &stored),
+        To::Child => order
+            .iter()
+            .copied()
+            .filter(|id| graph.parents_of(*id).is_some_and(|parents| parents.contains(&head)))
+            .collect(),
+        To::First => first_candidates(graph, head, &stored, &order),
+        To::Tip => terminal_candidates(head, &children_by_parent(graph, &stored, &order), &order),
+    };
+    match candidates.as_slice() {
+        [candidate] => Ok(*candidate),
+        [] => bail!("HEAD has no {} in the default Tix view", to.name()),
+        candidates => {
+            let candidates = candidates
+                .iter()
+                .map(|id| crate::change_id::display_short(repository, *id))
+                .collect::<Result<Vec<_>>>()?
+                .join("\n  ");
+            bail!(
+                "--to {} is ambiguous; candidates:\n  {candidates}\ntravel to one directly with `tix travel REVSPEC`",
+                to.name()
+            )
+        }
+    }
+}
+
+fn visible_parents(
+    graph: &crate::history::HistoryGraph,
+    id: gix::ObjectId,
+    stored: &HashSet<gix::ObjectId>,
+) -> Vec<gix::ObjectId> {
+    graph
+        .parents_of(id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|parent| stored.contains(parent))
+        .collect()
+}
+
+fn first_candidates(
+    graph: &crate::history::HistoryGraph,
+    start: gix::ObjectId,
+    stored: &HashSet<gix::ObjectId>,
+    order: &[gix::ObjectId],
+) -> Vec<gix::ObjectId> {
+    let mut pending = vec![start];
+    let mut seen = HashSet::new();
+    let mut terminals = HashSet::new();
+    while let Some(id) = pending.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let parents = visible_parents(graph, id, stored);
+        if parents.is_empty() {
+            terminals.insert(id);
+        } else {
+            pending.extend(parents);
+        }
+    }
+    order.iter().copied().filter(|id| terminals.contains(id)).collect()
+}
+
+fn children_by_parent(
+    graph: &crate::history::HistoryGraph,
+    stored: &HashSet<gix::ObjectId>,
+    order: &[gix::ObjectId],
+) -> HashMap<gix::ObjectId, Vec<gix::ObjectId>> {
+    let mut children = HashMap::<_, Vec<_>>::new();
+    for &id in order {
+        for parent in visible_parents(graph, id, stored) {
+            children.entry(parent).or_default().push(id);
+        }
+    }
+    children
+}
+
+fn terminal_candidates(
+    start: gix::ObjectId,
+    adjacent: &HashMap<gix::ObjectId, Vec<gix::ObjectId>>,
+    order: &[gix::ObjectId],
+) -> Vec<gix::ObjectId> {
+    let mut pending = vec![start];
+    let mut seen = HashSet::new();
+    let mut terminals = HashSet::new();
+    while let Some(id) = pending.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        match adjacent.get(&id).filter(|next| !next.is_empty()) {
+            Some(next) => pending.extend(next),
+            None => {
+                terminals.insert(id);
+            }
+        }
+    }
+    order.iter().copied().filter(|id| terminals.contains(id)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use gix::bstr::ByteSlice;
+
+    use super::*;
+
+    fn git(path: &Path, args: &[&str]) -> gix_testtools::Result<Vec<u8>> {
+        let output = gix_testtools::git_command(path).args(args).output()?;
+        if !output.status.success() {
+            return Err(format!("git {} failed: {}", args.join(" "), output.stderr.trim().to_str_lossy()).into());
+        }
+        Ok(output.stdout)
+    }
+
+    fn observable_state(path: &Path) -> gix_testtools::Result<(Vec<u8>, Vec<u8>)> {
+        Ok((
+            git(path, &["status", "--porcelain=v2", "--branch"])?,
+            git(path, &["show-ref"])?,
+        ))
+    }
+
+    fn args(revision: &str) -> Args {
+        Args {
+            stash: false,
+            materialize_conflicts: false,
+            revision: Some(revision.into()),
+            to: None,
+        }
+    }
+
+    fn relative_args(to: To) -> Args {
+        Args {
+            stash: false,
+            materialize_conflicts: false,
+            revision: None,
+            to: Some(to),
+        }
+    }
+
+    #[test]
+    fn stashing_travel_restores_the_index_worktree_and_untracked_files_on_return() -> gix_testtools::Result {
+        let fixture = gix_testtools::scripted_fixture_writable("rebase_edit.sh")?;
+        let path = fixture.path();
+        std::fs::write(path.join("ordinary"), "ordinary stash\n")?;
+        git(path, &["stash", "push", "--include-untracked", "-qm", "ordinary"])?;
+        let ordinary_stashes = git(path, &["stash", "list", "--format=%H %gs"])?;
+        std::fs::write(path.join(".git/info/exclude"), "ignored\n")?;
+        std::fs::write(path.join("ignored"), "ignored\n")?;
+        std::fs::write(path.join("tip"), "staged tip\n")?;
+        git(path, &["add", "tip"])?;
+        std::fs::write(path.join("tip"), "unstaged tip\n")?;
+        std::fs::write(path.join("untracked"), "untracked\n")?;
+        let before = git(path, &["status", "--porcelain=v2", "--branch"])?;
+        let staged = git(path, &["diff", "--cached"])?;
+        let unstaged = git(path, &["diff"])?;
+        let repository = crate::test_repository::open(path)?;
+        let source_commit_id = repository.head_id()?.detach();
+        let destination_commit_id = repository.rev_parse_single("HEAD~1")?.detach();
+        let stash_name = crate::edit::stash::reference(source_commit_id)?;
+
+        run(
+            repository,
+            Args {
+                stash: true,
+                ..args("HEAD~1")
+            },
+        )?;
+
+        let repository = crate::test_repository::open(path)?;
+        assert_eq!(
+            repository.head_id()?,
+            destination_commit_id,
+            "travel visits the selected parent"
+        );
+        assert!(
+            repository.try_find_reference(stash_name.as_ref())?.is_some(),
+            "the departure commit owns the saved changes"
+        );
+        assert!(
+            git(path, &["status", "--porcelain=v1", "--untracked-files=all"])?.is_empty(),
+            "the destination has no staged, unstaged, or untracked changes"
+        );
+        assert_eq!(
+            std::fs::read(path.join("ignored"))?,
+            b"ignored\n",
+            "ignored files remain in place"
+        );
+        assert_eq!(
+            git(path, &["stash", "list", "--format=%H %gs"])?,
+            ordinary_stashes,
+            "the ordinary stash stack is unchanged"
+        );
+
+        run(
+            repository,
+            Args {
+                stash: true,
+                ..relative_args(To::Tip)
+            },
+        )?;
+
+        let repository = crate::test_repository::open(path)?;
+        assert_eq!(
+            git(path, &["status", "--porcelain=v2", "--branch"])?,
+            before,
+            "returning restores the original branch and status"
+        );
+        assert_eq!(
+            git(path, &["diff", "--cached"])?,
+            staged,
+            "staged changes retain their index state"
+        );
+        assert_eq!(
+            git(path, &["diff"])?,
+            unstaged,
+            "unstaged changes retain their worktree state"
+        );
+        assert_eq!(
+            std::fs::read(path.join("untracked"))?,
+            b"untracked\n",
+            "untracked contents are restored"
+        );
+        assert!(
+            repository.try_find_reference(stash_name.as_ref())?.is_none(),
+            "successful restoration consumes the stash"
+        );
+        assert!(
+            repository
+                .try_find_reference(crate::edit::stash::reference(destination_commit_id)?.as_ref())?
+                .is_none(),
+            "a clean departure creates no stash"
+        );
+        assert_eq!(
+            git(path, &["stash", "list", "--format=%H %gs"])?,
+            ordinary_stashes,
+            "restoration preserves the ordinary stash stack"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stashing_travel_to_head_or_an_invalid_destination_leaves_changes_in_place() -> gix_testtools::Result {
+        let fixture = gix_testtools::scripted_fixture_writable("rebase_edit.sh")?;
+        let path = fixture.path();
+        std::fs::write(path.join("tip"), "local tip\n")?;
+        git(path, &["add", "tip"])?;
+        std::fs::write(path.join("untracked"), "untracked\n")?;
+        let before = gix_testtools::repository::snapshot(path)?;
+
+        run(
+            crate::test_repository::open(path)?,
+            Args {
+                stash: true,
+                ..args("HEAD")
+            },
+        )?;
+        assert_eq!(
+            gix_testtools::repository::snapshot(path)?,
+            before,
+            "travelling to HEAD does not save or restore changes"
+        );
+
+        run(
+            crate::test_repository::open(path)?,
+            Args {
+                stash: true,
+                ..args("HEAD~99")
+            },
+        )
+        .expect_err("an invalid revision cannot be visited");
+        assert_eq!(
+            gix_testtools::repository::snapshot(path)?,
+            before,
+            "revision validation happens before stashing"
+        );
+
+        run(
+            crate::test_repository::open(path)?,
+            Args {
+                stash: true,
+                ..relative_args(To::Child)
+            },
+        )
+        .expect_err("the tip has no visible child");
+        assert_eq!(
+            gix_testtools::repository::snapshot(path)?,
+            before,
+            "a missing relative destination does not stash changes"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn change_ids_ignore_non_visible_tracking_history() -> gix_testtools::Result {
+        let fixture = gix_testtools::scripted_fixture_writable("history.sh")?;
+        let path = fixture.path();
+        let repository = crate::test_repository::open(path)?;
+        let main = repository.rev_parse_single("main")?.detach();
+        let original_topic = repository.rev_parse_single("topic")?.detach();
+        let change_id = crate::change_id::for_commit(&repository, main)?;
+        let mut topic = repository.find_commit(original_topic)?.decode()?.into_owned()?;
+        topic
+            .extra_headers
+            .push((crate::change_id::HEADER.into(), change_id.to_string().into()));
+        let topic = repository.write_object(&topic)?.detach();
+        drop(repository);
+
+        git(path, &["update-ref", "refs/heads/topic", &topic.to_string()])?;
+        git(path, &["config", "remote.origin.url", "https://example.com/repo"])?;
+        git(
+            path,
+            &["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"],
+        )?;
+        git(path, &["config", "branch.topic.remote", "origin"])?;
+        git(path, &["config", "branch.topic.merge", "refs/heads/main"])?;
+        git(path, &["update-ref", "refs/remotes/origin/main", &main.to_string()])?;
+        git(path, &["switch", "-q", "topic"])?;
+
+        let repository = crate::test_repository::open(path)?;
+        let graph = crate::edit::loaded_view_graph(&repository)?;
+        assert!(
+            graph.index(main).is_some(),
+            "the tracking commit is loaded for topology"
+        );
+        assert!(
+            !graph.stored_commit_ids().any(|id| id == main),
+            "the tracking commit is absent from the visible view"
+        );
+        assert!(
+            graph.stored_commit_ids().any(|id| id == topic),
+            "the checked-out topic is visible"
+        );
+        run(repository, args(&change_id.to_reverse_hex().to_string()))?;
+        assert_eq!(
+            crate::test_repository::open(path)?.head_id()?,
+            topic,
+            "the visible change ID resolves to the already checked-out topic"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_destinations_respect_inferred_hidden_history() -> gix_testtools::Result {
+        for pending_destination in [false, true] {
+            for revision_kind in ["branch", "hash", "change-id"] {
+                let fixture = gix_testtools::scripted_fixture_writable("rebase_edit.sh")?;
+                let path = fixture.path();
+                let repository = crate::test_repository::open(path)?;
+                // The integrated main branch retains an old pending marker below a final commit.
+                // Source and destination are siblings above main and have identical trees, so only
+                // a pending destination itself needs replay; local index/worktree changes can stay.
+                let mut pending = repository
+                    .find_commit(repository.rev_parse_single("HEAD~1")?)?
+                    .decode()?
+                    .into_owned()?;
+                pending
+                    .extra_headers
+                    .push(("tix-rebase-parent".into(), pending.parents[0].to_string().into()));
+                let pending_commit_id = repository.write_object(&pending)?.detach();
+                let mut boundary = repository.head_commit()?.decode()?.into_owned()?;
+                boundary.parents = [pending_commit_id].into_iter().collect();
+                let boundary_commit_id = repository.write_object(&boundary)?.detach();
+                let mut source = boundary.clone();
+                source.parents = [boundary_commit_id].into_iter().collect();
+                source.message = "source branch".into();
+                let source_commit_id = repository.write_object(&source)?.detach();
+                let mut destination = source;
+                destination.message = "worktree-create".into();
+                if pending_destination {
+                    destination
+                        .extra_headers
+                        .push(("tix-rebase-parent".into(), boundary_commit_id.to_string().into()));
+                }
+                let destination_commit_id = repository.write_object(&destination)?.detach();
+                for (name, commit_id) in [
+                    ("refs/heads/main", boundary_commit_id),
+                    ("refs/heads/merged", pending_commit_id),
+                    ("refs/heads/source", source_commit_id),
+                    ("refs/heads/worktree-create", destination_commit_id),
+                    ("refs/remotes/origin/main", boundary_commit_id),
+                ] {
+                    repository.reference(
+                        name,
+                        commit_id,
+                        gix::refs::transaction::PreviousValue::Any,
+                        "prepare travel",
+                    )?;
+                }
+                if revision_kind == "change-id" {
+                    repository.reference(
+                        "refs/worktree/tix/pins/destination",
+                        destination_commit_id,
+                        gix::refs::transaction::PreviousValue::MustNotExist,
+                        "make the change ID visible in the default view",
+                    )?;
+                }
+                let revision = match revision_kind {
+                    "branch" => "worktree-create".into(),
+                    "hash" => destination_commit_id.to_string(),
+                    _ => crate::change_id::for_commit(&repository, destination_commit_id)?
+                        .to_reverse_hex()
+                        .to_string(),
+                };
+                drop(repository);
+                git(path, &["config", "remote.origin.url", "."])?;
+                git(
+                    path,
+                    &["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"],
+                )?;
+                git(
+                    path,
+                    &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"],
+                )?;
+                git(path, &["checkout", "-q", "source"])?;
+                std::fs::write(path.join("tip"), "staged local change\n")?;
+                git(path, &["add", "tip"])?;
+                std::fs::write(path.join("tip"), "unstaged local change\n")?;
+                std::fs::write(path.join("untracked"), "untracked local change\n")?;
+                let before = gix_testtools::repository::snapshot(path)?;
+
+                run(crate::test_repository::open(path)?, args(&revision))?;
+
+                let repository = crate::test_repository::open(path)?;
+                let selected_commit_id = repository.head_id()?.detach();
+                let selected = repository.find_commit(selected_commit_id)?.decode()?.into_owned()?;
+                if pending_destination {
+                    assert_ne!(
+                        selected_commit_id, destination_commit_id,
+                        "the visible pending destination is replayed"
+                    );
+                    assert!(
+                        !crate::edit::rebase::is_pending(&selected),
+                        "the visible destination is finalized"
+                    );
+                } else {
+                    assert_eq!(
+                        selected_commit_id, destination_commit_id,
+                        "{revision_kind} travel must preserve a final destination above hidden pending ancestry"
+                    );
+                }
+                assert_eq!(
+                    selected.parents.as_slice(),
+                    [boundary_commit_id],
+                    "replay stops above the hidden base"
+                );
+                for (name, commit_id) in [
+                    ("refs/heads/main", boundary_commit_id),
+                    ("refs/heads/merged", pending_commit_id),
+                    ("refs/heads/source", source_commit_id),
+                    ("refs/remotes/origin/main", boundary_commit_id),
+                    ("refs/heads/worktree-create", selected_commit_id),
+                ] {
+                    assert_eq!(
+                        repository.find_reference(name)?.id(),
+                        commit_id,
+                        "{name} keeps the expected identity"
+                    );
+                }
+                let after = gix_testtools::repository::snapshot(path)?;
+                assert_eq!(after.index, before.index, "same-tree travel preserves staging");
+                assert_eq!(
+                    after.worktree, before.worktree,
+                    "same-tree travel preserves local files"
+                );
+                drop(repository);
+
+                // Reattach so past travel preserves the departure through the ordinary source pin.
+                git(path, &["checkout", "-q", "worktree-create"])?;
+                let hidden_revision = if revision_kind == "branch" {
+                    "main".into()
+                } else {
+                    boundary_commit_id.to_string()
+                };
+                run(crate::test_repository::open(path)?, args(&hidden_revision))?;
+                let repository = crate::test_repository::open(path)?;
+                assert_eq!(
+                    repository.head_id()?,
+                    boundary_commit_id,
+                    "an explicit hidden target remains visitable without replay"
+                );
+                assert_eq!(
+                    repository.find_reference("refs/heads/merged")?.id(),
+                    pending_commit_id,
+                    "visiting the hidden boundary preserves its pending ancestry"
+                );
+                let hidden = gix_testtools::repository::snapshot(path)?;
+                assert_eq!(
+                    hidden.index, before.index,
+                    "visiting the hidden boundary preserves staging"
+                );
+                assert_eq!(
+                    hidden.worktree, before.worktree,
+                    "visiting the hidden boundary preserves local files"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn current_and_backward_travel_replay_only_the_selected_destination() -> gix_testtools::Result {
+        for (revision, pending_destination) in [("HEAD~1", false), ("HEAD~1", true), ("HEAD", false), ("HEAD", true)] {
+            let fixture = gix_testtools::scripted_fixture_writable("rebase_edit.sh")?;
+            let path = fixture.path();
+            let repository = crate::test_repository::open(path)?;
+            let base_commit_id = repository.rev_parse_single("HEAD~2")?.detach();
+            let mut parent = repository
+                .find_commit(repository.rev_parse_single("HEAD~1")?)?
+                .decode()?
+                .into_owned()?;
+            parent
+                .extra_headers
+                .push(("tix-rebase-parent".into(), base_commit_id.to_string().into()));
+            let parent_commit_id = repository.write_object(&parent)?.detach();
+            let mut destination = repository.head_commit()?.decode()?.into_owned()?;
+            destination.parents = [parent_commit_id].into_iter().collect();
+            if pending_destination {
+                destination
+                    .extra_headers
+                    .push(("tix-rebase-parent".into(), parent_commit_id.to_string().into()));
+            }
+            let destination_commit_id = repository.write_object(&destination)?.detach();
+            // Same-tree descendants distinguish parent-link updates from tree replay.
+            let mut departure = destination.clone();
+            departure.extra_headers.clear();
+            departure.parents = [destination_commit_id].into_iter().collect();
+            departure.message = "departure".into();
+            let departure_commit_id = repository.write_object(&departure)?.detach();
+            let mut later = departure;
+            later.parents = [departure_commit_id].into_iter().collect();
+            later.message = "later descendant".into();
+            let later_commit_id = repository.write_object(&later)?.detach();
+            let same_head = revision == "HEAD";
+            for (name, commit_id) in [
+                ("refs/heads/base", base_commit_id),
+                ("refs/heads/pending-parent", parent_commit_id),
+                ("refs/heads/destination", destination_commit_id),
+                ("refs/heads/departure", departure_commit_id),
+                ("refs/heads/later", later_commit_id),
+                (
+                    "refs/heads/main",
+                    if same_head {
+                        destination_commit_id
+                    } else {
+                        departure_commit_id
+                    },
+                ),
+            ] {
+                repository.reference(
+                    name,
+                    commit_id,
+                    gix::refs::transaction::PreviousValue::Any,
+                    "prepare endpoint travel",
+                )?;
+            }
+            assert!(
+                crate::history::available_hidden_revisions(&repository, &[], true)?
+                    .0
+                    .is_empty(),
+                "pending ancestry stays visible without any hidden history boundary"
+            );
+            let before = gix_testtools::repository::snapshot(path)?;
+
+            run(repository, args(revision))?;
+
+            let repository = crate::test_repository::open(path)?;
+            let selected_commit_id = repository.head_id()?.detach();
+            let selected = repository.find_commit(selected_commit_id)?.decode()?.into_owned()?;
+            if pending_destination {
+                assert_ne!(
+                    selected_commit_id, destination_commit_id,
+                    "{revision} finalizes the selected pending destination"
+                );
+                assert!(
+                    !crate::edit::rebase::is_pending(&selected),
+                    "{revision} clears the selected destination's pending marker"
+                );
+            } else {
+                assert_eq!(
+                    selected_commit_id, destination_commit_id,
+                    "{revision} preserves the exact final destination"
+                );
+            }
+            assert_eq!(
+                selected.parents.as_slice(),
+                [parent_commit_id],
+                "{revision} keeps the destination's pending parent unchanged"
+            );
+            let mapped_departure_commit_id = repository.find_reference("refs/heads/departure")?.id().detach();
+            if !same_head && pending_destination {
+                assert_ne!(
+                    mapped_departure_commit_id, departure_commit_id,
+                    "backward travel reparents the departure above its rewritten destination"
+                );
+                let departure = repository
+                    .find_commit(mapped_departure_commit_id)?
+                    .decode()?
+                    .into_owned()?;
+                assert_eq!(departure.parents.as_slice(), [selected_commit_id]);
+                assert_eq!(departure.tree, destination.tree, "the departure retains its exact tree");
+                assert!(
+                    !crate::edit::rebase::is_pending(&departure),
+                    "unchanged parent trees keep the departure final"
+                );
+            } else {
+                assert_eq!(
+                    mapped_departure_commit_id, departure_commit_id,
+                    "an unchanged or out-of-view departure retains its exact commit"
+                );
+            }
+            for (name, commit_id) in [
+                ("refs/heads/base", base_commit_id),
+                ("refs/heads/pending-parent", parent_commit_id),
+                // This unpinned branch remains outside the loaded view.
+                ("refs/heads/later", later_commit_id),
+                ("refs/heads/destination", selected_commit_id),
+                (
+                    "refs/heads/main",
+                    if same_head {
+                        selected_commit_id
+                    } else {
+                        mapped_departure_commit_id
+                    },
+                ),
+            ] {
+                assert_eq!(
+                    repository.find_reference(name)?.id(),
+                    commit_id,
+                    "{revision} preserves {name} outside the selected destination"
+                );
+            }
+            if same_head {
+                assert_eq!(
+                    repository.head_name()?,
+                    Some("refs/heads/main".try_into()?),
+                    "travelling to the current HEAD preserves its branch attachment"
+                );
+                assert!(
+                    crate::history::all_pins(&repository)?.is_empty(),
+                    "travelling to the current HEAD creates no departure pin"
+                );
+            }
+            if same_head && !pending_destination {
+                assert_eq!(
+                    gix_testtools::repository::snapshot(path)?,
+                    before,
+                    "travelling to the current final HEAD remains a complete no-op"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn attached_past_travel_saves_and_returns_to_the_branch() -> gix_testtools::Result {
+        let fixture = gix_testtools::scripted_fixture_writable("rebase_edit.sh")?;
+        let repository = crate::test_repository::open(fixture.path())?;
+        let middle = repository.rev_parse_single("HEAD~1")?.detach();
+        let change_id = crate::change_id::for_commit(&repository, middle)?
+            .to_reverse_hex_with_len(7)
+            .to_string();
+        run(repository, args(&change_id))?;
+
+        let repository = crate::test_repository::open(fixture.path())?;
+        assert_eq!(repository.head_id()?, middle);
+        assert!(repository.head()?.is_detached());
+        let pins = crate::history::all_pins(&repository)?;
+        assert_eq!(pins.len(), 1, "leaving the attached tip creates one source pin");
+        assert_eq!(
+            pins[0].target.try_name().expect("the source pin is symbolic"),
+            "refs/heads/main",
+            "the source pin follows the departed branch"
+        );
+
+        run(repository, args("main"))?;
+        let repository = crate::test_repository::open(fixture.path())?;
+        assert_eq!(
+            repository.head()?.referent_name().expect("HEAD is attached"),
+            "refs/heads/main",
+            "travelling to the pinned destination reattaches HEAD"
+        );
+        assert!(crate::history::all_pins(&repository)?.is_empty());
+        run(repository, args("HEAD"))?;
+        let repository = crate::test_repository::open(fixture.path())?;
+        assert!(
+            !repository.head()?.is_detached(),
+            "travelling to the current attached HEAD is a no-op"
+        );
+        assert!(crate::history::all_pins(&repository)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn detached_travel_needs_a_source_pin_except_toward_descendants() -> gix_testtools::Result {
+        let fixture = gix_testtools::scripted_fixture_writable("rebase_edit.sh")?;
+        let path = fixture.path();
+        git(path, &["branch", "side", "HEAD~2"])?;
+        git(path, &["checkout", "-q", "side"])?;
+        git(path, &["commit", "-q", "--allow-empty", "-m", "side"])?;
+        git(path, &["checkout", "-q", "--detach", "main~1"])?;
+        let repository = crate::test_repository::open(path)?;
+        run(repository, args("main"))?;
+        let repository = crate::test_repository::open(path)?;
+        assert!(repository.head()?.is_detached());
+        assert!(crate::history::all_pins(&repository)?.is_empty());
+
+        let before_rejected = repository.head_id()?.detach();
+        let err = run(repository, args("HEAD~1")).expect_err("past travel from detached HEAD needs a pin");
+        assert!(format!("{err:#}").contains("must be pinned"));
+        let repository = crate::test_repository::open(path)?;
+        assert_eq!(
+            repository.head_id()?,
+            before_rejected,
+            "the rejected command does not move HEAD"
+        );
+        let err = run(repository, args("side")).expect_err("sideways travel from detached HEAD needs a pin");
+        assert!(format!("{err:#}").contains("must be pinned"));
+        let repository = crate::test_repository::open(path)?;
+        let tip = repository.head_id()?.detach();
+        repository.reference(
+            "refs/worktree/tix/pins/keep",
+            tip,
+            gix::refs::transaction::PreviousValue::MustNotExist,
+            "test pin",
+        )?;
+        run(repository, args("side"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn relative_targets_follow_the_current_default_view_component() -> gix_testtools::Result {
+        let fixture = gix_testtools::scripted_fixture_writable("rebase_edit.sh")?;
+        let path = fixture.path();
+        let repository = crate::test_repository::open(path)?;
+        let tip = repository.head_id()?.detach();
+        let middle = repository.rev_parse_single("HEAD~1")?.detach();
+        let root = repository.rev_parse_single("HEAD~2")?.detach();
+        drop(repository);
+
+        let orphan = gix::ObjectId::from_hex(git(path, &["commit-tree", "HEAD^{tree}", "-m", "orphan"])?.trim())?;
+        let orphan = orphan.to_string();
+        git(path, &["update-ref", "refs/worktree/tix/pins/unrelated", &orphan])?;
+        let tip_hex = tip.to_string();
+        let upstream = gix::ObjectId::from_hex(
+            git(path, &["commit-tree", "HEAD^{tree}", "-p", &tip_hex, "-m", "upstream"])?.trim(),
+        )?
+        .to_string();
+        git(path, &["update-ref", "refs/remotes/origin/main", &upstream])?;
+        git(path, &["config", "branch.main.remote", "origin"])?;
+        git(path, &["config", "branch.main.merge", "refs/heads/main"])?;
+
+        run(crate::test_repository::open(path)?, relative_args(To::Tip))?;
+        assert_eq!(
+            crate::test_repository::open(path)?.head_id()?,
+            tip,
+            "tip travel at the attached tip is a no-op"
+        );
+        let before = observable_state(path)?;
+        let err = run(crate::test_repository::open(path)?, relative_args(To::Child))
+            .expect_err("the visible tip has no child");
+        assert!(format!("{err:#}").contains("no child"));
+        assert_eq!(
+            observable_state(path)?,
+            before,
+            "a missing child leaves the repository unchanged"
+        );
+
+        run(crate::test_repository::open(path)?, relative_args(To::Parent))?;
+        assert_eq!(
+            crate::test_repository::open(path)?.head_id()?,
+            middle,
+            "parent travels down by one commit"
+        );
+        run(crate::test_repository::open(path)?, relative_args(To::First))?;
+        assert_eq!(
+            crate::test_repository::open(path)?.head_id()?,
+            root,
+            "first reaches this component's oldest commit"
+        );
+        run(crate::test_repository::open(path)?, relative_args(To::First))?;
+        assert_eq!(
+            crate::test_repository::open(path)?.head_id()?,
+            root,
+            "first travel at the oldest commit is a no-op"
+        );
+
+        let before = observable_state(path)?;
+        let err = run(crate::test_repository::open(path)?, relative_args(To::Parent))
+            .expect_err("the visible root has no parent");
+        assert!(format!("{err:#}").contains("no parent"));
+        assert_eq!(
+            observable_state(path)?,
+            before,
+            "a missing parent leaves the repository unchanged"
+        );
+
+        run(crate::test_repository::open(path)?, relative_args(To::Child))?;
+        assert_eq!(
+            crate::test_repository::open(path)?.head_id()?,
+            middle,
+            "child travels up by one commit"
+        );
+        run(crate::test_repository::open(path)?, relative_args(To::Tip))?;
+        let repository = crate::test_repository::open(path)?;
+        assert_eq!(repository.head_id()?, tip, "tip reaches this component's leaf");
+        assert_eq!(
+            repository.head()?.referent_name().expect("HEAD is attached"),
+            "refs/heads/main",
+            "travelling to the branch tip reattaches HEAD"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn first_stops_above_the_inferred_hidden_base() -> gix_testtools::Result {
+        let fixture = gix_testtools::scripted_fixture_writable("rebase_edit.sh")?;
+        let path = fixture.path();
+        git(path, &["config", "remote.origin.url", "."])?;
+        git(
+            path,
+            &["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"],
+        )?;
+        git(path, &["update-ref", "refs/remotes/origin/main", "main"])?;
+        git(
+            path,
+            &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"],
+        )?;
+        git(path, &["checkout", "-q", "-b", "topic"])?;
+        git(path, &["commit", "-q", "--allow-empty", "-m", "first topic commit"])?;
+        let first = crate::test_repository::open(path)?.head_id()?.detach();
+        git(path, &["commit", "-q", "--allow-empty", "-m", "topic tip"])?;
+
+        run(crate::test_repository::open(path)?, relative_args(To::First))?;
+
+        assert_eq!(
+            crate::test_repository::open(path)?.head_id()?,
+            first,
+            "first selects the oldest commit displayed above the inferred base"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn relative_target_ambiguity_lists_every_candidate() -> gix_testtools::Result {
+        let fixture = gix_testtools::scripted_fixture_writable("rebase_edit.sh")?;
+        let path = fixture.path();
+        let repository = crate::test_repository::open(path)?;
+        let old_tip = repository.head_id()?.detach();
+        let root = repository.rev_parse_single("HEAD~2")?.detach();
+        drop(repository);
+
+        let orphan = gix::ObjectId::from_hex(git(path, &["commit-tree", "HEAD^{tree}", "-m", "orphan"])?.trim())?;
+        let old_tip_hex = old_tip.to_string();
+        let orphan_hex = orphan.to_string();
+        let merge = gix::ObjectId::from_hex(
+            git(
+                path,
+                &[
+                    "commit-tree",
+                    "HEAD^{tree}",
+                    "-p",
+                    &old_tip_hex,
+                    "-p",
+                    &orphan_hex,
+                    "-m",
+                    "merge",
+                ],
+            )?
+            .trim(),
+        )?;
+        let merge_hex = merge.to_string();
+        let left = gix::ObjectId::from_hex(
+            git(path, &["commit-tree", "HEAD^{tree}", "-p", &merge_hex, "-m", "left"])?.trim(),
+        )?;
+        let right = gix::ObjectId::from_hex(
+            git(path, &["commit-tree", "HEAD^{tree}", "-p", &merge_hex, "-m", "right"])?.trim(),
+        )?;
+        git(path, &["update-ref", "refs/heads/main", &merge_hex, &old_tip_hex])?;
+        let left_hex = left.to_string();
+        let right_hex = right.to_string();
+        git(path, &["update-ref", "refs/worktree/tix/pins/left", &left_hex])?;
+        git(path, &["update-ref", "refs/worktree/tix/pins/right", &right_hex])?;
+
+        let repository = crate::test_repository::open(path)?;
+        let cases = [
+            (To::First, vec![root, orphan]),
+            (To::Parent, vec![old_tip, orphan]),
+            (To::Child, vec![left, right]),
+            (To::Tip, vec![left, right]),
+        ];
+        let expected = cases
+            .iter()
+            .map(|(to, candidates)| {
+                Ok::<_, Error>((
+                    *to,
+                    candidates
+                        .iter()
+                        .map(|id| crate::change_id::display_short(&repository, *id))
+                        .collect::<Result<Vec<_>>>()?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        drop(repository);
+        let before = observable_state(path)?;
+        for (to, candidates) in expected {
+            let err = run(crate::test_repository::open(path)?, relative_args(to))
+                .expect_err("multiple relative destinations are ambiguous");
+            let message = format!("{err:#}");
+            for candidate in candidates {
+                assert!(
+                    message.contains(&candidate),
+                    "{to:?} ambiguity lists candidate {candidate}: {message}"
+                );
+            }
+            assert!(
+                message.contains("tix travel REVSPEC"),
+                "ambiguity suggests direct travel: {message}"
+            );
+            assert_eq!(
+                observable_state(path)?,
+                before,
+                "ambiguity leaves the repository unchanged"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn replay_conflicts_are_unobservable_until_materialization_is_requested() -> gix_testtools::Result {
+        let fixture = gix_testtools::scripted_fixture_writable("rebase_conflict.sh")?;
+        let path = fixture.path();
+        git(
+            path,
+            &["config", "gitoxide.commit.committerDate", "2001-01-01T00:00:00 +0000"],
+        )?;
+        let repository = crate::test_repository::open(path)?;
+        let middle = repository.rev_parse_single("HEAD~1")?.detach();
+        std::fs::write(path.join("after"), "after\n")?;
+        git(path, &["add", "after"])?;
+        git(path, &["commit", "-q", "-m", "after"])?;
+        let root = repository.rev_parse_single("HEAD~3")?.detach();
+        git(path, &["checkout", "-q", "--detach", &root.to_string()])?;
+        let graph = crate::edit::loaded_graph(&repository)?;
+        crate::edit::rebase::perform(
+            &repository,
+            &graph,
+            crate::edit::rebase::Edit::Remove { target: middle },
+            crate::edit::rebase::Signature::RedoIfNeeded,
+            crate::edit::rebase::Tree::LeaveAsIsAndMark,
+        )?
+        .complete()?;
+        let tip = repository.find_reference("refs/heads/main")?.id().detach();
+        drop(repository);
+
+        git(path, &["checkout", "-q", "main"])?;
+        run(crate::test_repository::open(path)?, args(&root.to_string()))?;
+        std::fs::write(path.join("file"), "staged local change\n")?;
+        git(path, &["add", "file"])?;
+        std::fs::write(path.join("file"), "unstaged local change\n")?;
+        std::fs::write(path.join("untracked"), "untracked local change\n")?;
+        let before = gix_testtools::repository::snapshot(path)?;
+        let err = run(
+            crate::test_repository::open(path)?,
+            Args {
+                stash: true,
+                ..args(&tip.to_string())
+            },
+        )
+        .expect_err("a conflict needs explicit materialization");
+        assert!(
+            format!("{err:#}").contains("--materialize-conflicts"),
+            "the preview explains how to accept the conflict: {err:#}"
+        );
+        assert_eq!(
+            gix_testtools::repository::snapshot(path)?,
+            before,
+            "declining materialization leaves the complete repository unchanged"
+        );
+
+        let err = run(
+            crate::test_repository::open(path)?,
+            Args {
+                stash: true,
+                materialize_conflicts: true,
+                revision: Some(tip.to_string().into()),
+                to: None,
+            },
+        )
+        .expect_err("a materialized conflict remains an incomplete command");
+        assert!(
+            format!("{err:#}").contains("ready to resolve conflicts"),
+            "materialization reports that the worktree is ready for resolution: {err:#}"
+        );
+        assert!(
+            crate::test_repository::open(path)?
+                .index_or_empty()?
+                .entries()
+                .iter()
+                .any(|entry| entry.stage() != gix::index::entry::Stage::Unconflicted),
+            "opt-in materialization writes the unresolved index"
+        );
+        let stash_name = crate::edit::stash::reference(root)?.to_string();
+        assert_eq!(
+            git(path, &["show", &format!("{stash_name}:file")])?,
+            b"unstaged local change\n",
+            "materialization saves the departure worktree"
+        );
+        assert_eq!(
+            git(path, &["show", &format!("{stash_name}^2:file")])?,
+            b"staged local change\n",
+            "materialization saves the departure index"
+        );
+        assert_eq!(
+            git(path, &["show", &format!("{stash_name}^3:untracked")])?,
+            b"untracked local change\n",
+            "materialization saves untracked contents"
+        );
+        assert!(
+            !path.join("untracked").exists(),
+            "the departure's untracked changes stay in its stash"
+        );
+        Ok(())
+    }
+}

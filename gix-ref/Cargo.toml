@@ -2,18 +2,23 @@ lints.workspace = true
 
 [package]
 name = "gix-ref"
-version = "0.65.0"
+version = "0.69.1"
 repository = "https://github.com/GitoxideLabs/gitoxide"
 license = "MIT OR Apache-2.0"
 description = "A crate to handle git references"
 authors = ["Sebastian Thiel <sebastian.thiel@icloud.com>"]
 edition = "2024"
 include = ["/src/**/*", "/LICENSE-*"]
-rust-version = "1.85"
+rust-version = "1.88"
 
 [lib]
 doctest = false
 test = true
+
+[[test]]
+name = "threaded"
+path = "tests/threaded.rs"
+required-features = ["gix-parallel/parallel"]
 
 [features]
 ## Enable support for the SHA-1 hash by enabling the respective feature in the `gix-hash` crate.
@@ -22,23 +27,25 @@ sha1 = ["gix-hash/sha1"]
 sha256 = ["gix-hash/sha256"]
 ## Data structures implement `serde::Serialize` and `serde::Deserialize`.
 serde = ["dep:serde", "gix-hash/serde", "gix-actor/serde", "gix-object/serde"]
-## Enable support for thread-safety.
-parallel = ["gix-features/parallel"]
 
 [dependencies]
-gix-features = { version = "^0.48.1", path = "../gix-features", features = ["walkdir"] }
-gix-fs = { version = "^0.21.2", path = "../gix-fs" }
-gix-path = { version = "^0.12.2", path = "../gix-path" }
-gix-hash = { version = "^0.25.1", path = "../gix-hash" }
-gix-object = { version = "^0.62.0", path = "../gix-object" }
-gix-utils = { version = "^0.3.4", path = "../gix-utils" }
-gix-validate = { version = "^0.11.2", path = "../gix-validate" }
-gix-actor = { version = "^0.41.1", path = "../gix-actor" }
-gix-lock = { version = "^23.0.0", path = "../gix-lock" }
-gix-tempfile = { version = "^23.0.0", default-features = false, path = "../gix-tempfile" }
+gix-parallel = { version = "^0.50.1", path = "../gix-parallel" }
+gix-error = { version = "^0.5.2", path = "../gix-error", features = ["bstr"] }
+gix-fs = { version = "~1.0.0", path = "../gix-fs", features = [
+    "walkdir",
+    "unstable",
+] }
+gix-path = { version = "^0.14.1", path = "../gix-path" }
+gix-hash = { version = "^0.28.1", path = "../gix-hash" }
+gix-object = { version = "^0.66.1", path = "../gix-object" }
+gix-utils = { version = "^0.5.2", path = "../gix-utils" }
+gix-validate = { version = "^0.13.1", path = "../gix-validate" }
+gix-actor = { version = "^0.45.0", path = "../gix-actor" }
+gix-lock = { version = "^27.0.0", path = "../gix-lock" }
 
-thiserror = "2.0.18"
-serde = { version = "1.0.114", optional = true, default-features = false, features = ["derive"] }
+serde = { version = "1.0.114", optional = true, default-features = false, features = [
+    "derive",
+] }
 
 # packed refs
 memmap2 = "0.9.11"
@@ -46,12 +53,23 @@ memmap2 = "0.9.11"
 document-features = { version = "0.2.1", optional = true }
 
 [dev-dependencies]
-gix-testtools = { path = "../tests/tools", default-features = false }
+gix-fs = { path = "../gix-fs", features = ["unstable"] }
+gix-lock = { path = "../gix-lock", features = ["unstable"] }
+gix-testtools = { path = "../tests/tools", default-features = false, features = ["sha1", "sha256"] }
 gix-date = { path = "../gix-date" }
 gix-hash = { path = "../gix-hash", features = ["sha1", "sha256"] }
 gix-discover = { path = "../gix-discover" }
 gix-odb = { path = "../gix-odb" }
 insta = "1.46.3"
 
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2.186"
+
 [package.metadata.docs.rs]
 features = ["sha1", "document-features", "serde"]
+
+[package.metadata.qa]
+tests = [
+    { args = ["--all-features", "--features", "gix-parallel/parallel"], env = { GIX_TEST_FIXTURE_HASH = "sha1" } },
+    { args = ["--all-features", "--features", "gix-parallel/parallel"], env = { GIX_TEST_FIXTURE_HASH = "sha256" } },
+]

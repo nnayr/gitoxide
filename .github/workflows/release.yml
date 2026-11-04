@@ -9,22 +9,22 @@ on:
     # branches:
     #   - fix-releases
     tags:
-    # For now, real releases always use `workflow_dispatch`, and running the workflow on tag pushes
-    # is only done in testing. This is because we usually push too many tags at once for the `push`
-    # event to be triggered, since there are usually more than 3 crates tagged together. So the
-    # `push` trigger doesn't usually work. If we allow it, we risk running the workflow twice if
-    # it is also manually triggered based on the assumption that it would not run. See #1970 for
-    # details. See also the `run-release-workflow` and `roll-release` recipes in the `justfile`.
-    # - 'v*'
-      - 'v*-DO-NOT-USE'  # Pattern for tags used to test the workflow (usually done in a fork).
+      # For now, real releases always use `workflow_dispatch`, and running the workflow on tag pushes
+      # is only done in testing. This is because we usually push too many tags at once for the `push`
+      # event to be triggered, since there are usually more than 3 crates tagged together. So the
+      # `push` trigger doesn't usually work. If we allow it, we risk running the workflow twice if
+      # it is also manually triggered based on the assumption that it would not run. See #1970 for
+      # details. See also the `run-release-workflow` and `roll-release` recipes in the `justfile`.
+      # - 'v*'
+      - "v*-DO-NOT-USE" # Pattern for tags used to test the workflow (usually done in a fork).
   workflow_dispatch:
 
 permissions:
-  contents: read  # This is set more permissively in jobs that need `write`.
+  contents: read # This is set more permissively in jobs that need `write`.
 
 defaults:
   run:
-    shell: bash  # Use `bash` even in the Windows jobs.
+    shell: bash # Use `bash` even in the Windows jobs.
 
 jobs:
   # Create a draft release, initially with no binary assets attached.
@@ -32,15 +32,15 @@ jobs:
     runs-on: ubuntu-slim
 
     permissions:
-      contents: write  # Allows the use of `gh release create`.
+      contents: write # Allows the use of `gh release create`.
 
-#    env:
-#      # Set to force version number, e.g., when no tag exists.
-#      VERSION: TEST-0.0.0
+    #    env:
+    #      # Set to force version number, e.g., when no tag exists.
+    #      VERSION: TEST-0.0.0
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -85,7 +85,7 @@ jobs:
 
   # Build for a particular feature and target, and attach an archive for it.
   build-release:
-    needs: [ create-release ]
+    needs: [create-release]
 
     strategy:
       matrix:
@@ -108,7 +108,7 @@ jobs:
           - i686-pc-windows-msvc
           - aarch64-pc-windows-msvc
         # When changing these features, make the same change in build-macos-universal2-release.
-        feature: [ small, lean, max, max-pure ]
+        feature: [small, lean, max, max-pure]
         include:
           - rust: stable
           - target: x86_64-unknown-linux-musl
@@ -219,13 +219,13 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     permissions:
-      contents: write  # Allows the use of `gh release upload`.
+      contents: write # Allows the use of `gh release upload`.
 
     env:
-      RUST_BACKTRACE: '1'  # Emit backtraces on panics.
+      RUST_BACKTRACE: "1" # Emit backtraces on panics.
       CARGO_TERM_COLOR: always
-      CLICOLOR: '1'
-      CARGO: cargo  # On Linux, this will be changed to `cross` in a later step.
+      CLICOLOR: "1"
+      CARGO: cargo # On Linux, this will be changed to `cross` in a later step.
       FEATURE: ${{ matrix.feature }}
       VERSION: ${{ needs.create-release.outputs.version }}
       TARGET: ${{ matrix.target }}
@@ -235,7 +235,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -269,7 +269,17 @@ jobs:
 
       - name: Build release binary (with extra optimizations)
         run: |
-          "$CARGO" build --verbose --profile="$PROFILE" "$TARGET_FLAGS" --no-default-features --features="$FEATURE"
+          bash etc/scripts/remap-release-paths.sh build "$CARGO" build --verbose --profile="$PROFILE" "$TARGET_FLAGS" --no-default-features --features="$FEATURE"
+
+      - name: Check release binaries for local build paths
+        run: |
+          suffix=''
+          if [[ "$TARGET" == *-windows-* ]]; then
+            suffix='.exe'
+          fi
+          if ! bash etc/scripts/remap-release-paths.sh check "$TARGET_DIR/$PROFILE/gix$suffix" "$TARGET_DIR/$PROFILE/ein$suffix"; then
+            echo '::warning::Release binary path scan failed; see the output above. Continuing with packaging.'
+          fi
 
       - name: Determine archive basename
         run: echo "ARCHIVE=gitoxide-$FEATURE-$VERSION-$TARGET" >> "$GITHUB_ENV"
@@ -308,15 +318,15 @@ jobs:
   build-macos-universal2-release:
     runs-on: macos-latest
 
-    needs: [ create-release, build-release ]
+    needs: [create-release, build-release]
 
     strategy:
       matrix:
         # These features need to be exactly the same as the features in build-release.
-        feature: [ small, lean, max, max-pure ]
+        feature: [small, lean, max, max-pure]
 
     permissions:
-      contents: write  # Allows the use of `gh release upload`.
+      contents: write # Allows the use of `gh release upload`.
 
     env:
       BASH_ENV: ./helpers.sh
@@ -375,10 +385,10 @@ jobs:
   publish-release:
     runs-on: ubuntu-slim
 
-    needs: [ create-release, build-release, build-macos-universal2-release ]
+    needs: [create-release, build-release, build-macos-universal2-release]
 
     permissions:
-      contents: write  # Allows use of `gh release` for `upload`, `delete-asset`, and `edit`.
+      contents: write # Allows use of `gh release` for `upload`, `delete-asset`, and `edit`.
 
     env:
       REPOSITORY: ${{ github.repository }}
@@ -394,9 +404,11 @@ jobs:
       - name: Show all individual asset names
         run: cat assets.txt
 
-      # The `features` array is repeated because GHA doesn't support YAML anchors.
-      # We will check that the macOS `universal` features match the others exactly.
-      # In the future this and the next step may be removed, or expanded to do more validation.
+      # The `features` array is repeated rather than using YAML anchors. We will check that the macOS
+      # `universal` features match the others exactly. In the future this and the next step may be
+      # removed, or expanded to do more validation. (GHA supports YAML anchors, but zizmor's support
+      # is beta, and it warns on any input that contains them. For details, see
+      # https://docs.zizmor.sh/usage/#yaml-anchors.)
       - name: Extract macOS asset names by architecture
         run: |
           for arch in aarch64 x86_64 universal; do
@@ -444,11 +456,11 @@ jobs:
   announce-release:
     runs-on: ubuntu-slim
 
-    needs: [ create-release, publish-release ]
+    needs: [create-release, publish-release]
 
     permissions:
-      contents: write  # Needed to distinguish unpublished (still draft) from missing releases.
-      discussions: write  # For adding a comment in the announcement discussion.
+      contents: write # Needed to distinguish unpublished (still draft) from missing releases.
+      discussions: write # For adding a comment in the announcement discussion.
 
     env:
       REPOSITORY: ${{ github.repository }}
@@ -520,7 +532,7 @@ jobs:
   installation:
     strategy:
       matrix:
-        build: [ win-msvc, win-gnu, win32-msvc, win32-gnu ]
+        build: [win-msvc, win-gnu, win32-msvc, win32-gnu]
         include:
           - build: win-msvc
             os: windows-latest
@@ -546,7 +558,7 @@ jobs:
       TARGET: ${{ matrix.target }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install Rust
@@ -554,12 +566,12 @@ jobs:
           rustup update "$RUST"
           rustup default "$RUST"
           rustup target add "$TARGET"
-      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2.32.0
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
         with:
           msystem: MINGW${{ startsWith(matrix.target, 'i686-') && '32' || '64' }}
           pacboy: cc:p
           path-type: inherit
-      - name: 'Installation from crates.io: gitoxide'
+      - name: "Installation from crates.io: gitoxide"
         run: |
           cargo +"$RUST" install --target "$TARGET" --no-default-features \
             --features max-pure --target-dir install-artifacts --debug --force gitoxide

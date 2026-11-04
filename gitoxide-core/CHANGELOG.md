@@ -5,13 +5,716 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### New Features
+
+ - <csr-id-bc278ac4b79c31ff9e9cc2a3f0c3d435ca7c7f8d/> make trace output independently configurable
+   <!-- Byron -->
+   
+   Quick review only, as it's mostly about tracing and `gix` which both aren't super
+   important, and are seemingly working well. An extra agent-review couldn't
+   find anything either.
+   
+   <!-- agent -->
+   Replace the old boolean trace switch with a bounded `-t`/`--trace` counter:
+   forest INFO and DEBUG at one or two occurrences, then flat DEBUG and TRACE at
+   three or four. Keep `--threads` long-only and route tracing independently of
+   verbose and progress rendering, including commands with bespoke execution paths
+   and corpus runs.
+   
+   Initialize display tracing once before repository discovery, buffer it outside
+   `prodash`, and emit it after command and progress teardown. Format forest and
+   flat output with ANSI, then adapt the final stderr write so terminals get color
+   while pipes and `NO_COLOR` remain plain.
+   
+   Corpus worker subscribers share that sink while retaining their complete
+   JSON trace storage, and flat modes include completed spans. `gix tix` remains
+   delegated to Tix so it installs only one subscriber.
+
+### Bug Fixes
+
+ - <csr-id-159fc3125e6dda7afa295daa94da03f9173c1bc4/> confine organized repositories to their destination
+   <!-- agent -->
+   `ein tool organize --execute` used a repository's origin URL to construct a
+   move destination without resolving parent components or checking containment.
+   It was demonstrated percent-decoded path traversal moving a repository
+   outside the user-selected root.
+   
+   Resolve the completed destination with the existing `gix::path::realpath()`
+   helper, which handles existing symlinks and missing leaf components, then reject
+   paths outside the canonical destination before creating directories or moving
+   anything. The subsequent self-nesting check now also receives a resolved path.
+   
+   Disposable isolated repositories reproduce HTTP percent-encoded traversal, a
+   parent-directory hostname, SSH traversal, and an existing symlink escaping the
+   destination. A control retains the ordinary host/owner/repository layout and
+   `.git` suffix handling. Both escape regressions fail before the fix.
+   
+   Git reference: `urlmatch.c::url_normalize()` at `d38352cd43ab` also normalizes dot
+   segments; organizing repositories is gitoxide-specific and additionally needs
+   filesystem confinement.
+   Validation: all three focused organizer tests pass with the `organize` feature.
+ - <csr-id-f3225e908acccab7be9f25fd90656b6e871b3a27/> support SHA-256 in query path tracing
+   <!-- agent -->
+   `ein tool query . trace-path file` failed on SHA-256 repositories because
+   path history rows were decoded as `[u8; 20]`, although SQLite stores the
+   full 32-byte commit IDs.
+   
+   Decode the blob into `Vec<u8>` and use `ObjectId::try_from()` to select the
+   hash kind from its length while rejecting unsupported lengths. Add an
+   isolated journey test for SHA-1 and SHA-256 that checks the traced path,
+   diff statistics, and full commit ID against Git.
+
+### Commit Statistics
+
+<csr-read-only-do-not-edit/>
+
+ - 14 commits contributed to the release over the course of 12 calendar days.
+ - 13 days passed between releases.
+ - 3 commits were understood as [conventional](https://www.conventionalcommits.org).
+ - 0 issues like '(#ID)' were seen in commit messages
+
+### Commit Details
+
+<csr-read-only-do-not-edit/>
+
+<details><summary>view details</summary>
+
+ * **Uncategorized**
+    - Merge pull request #3032 from GitoxideLabs/sec-audit ([`1d7bac7`](https://github.com/GitoxideLabs/gitoxide/commit/1d7bac742f70b72ddda0c7294f4a97566b8db596))
+    - Confine organized repositories to their destination ([`159fc31`](https://github.com/GitoxideLabs/gitoxide/commit/159fc3125e6dda7afa295daa94da03f9173c1bc4))
+    - Merge pull request #3033 from GitoxideLabs/gix-cli-progress-cleanup ([`80f4b03`](https://github.com/GitoxideLabs/gitoxide/commit/80f4b03257da9a664468e7b75247023187565a34))
+    - Make trace output independently configurable ([`bc278ac`](https://github.com/GitoxideLabs/gitoxide/commit/bc278ac4b79c31ff9e9cc2a3f0c3d435ca7c7f8d))
+    - Merge pull request #3022 from GitoxideLabs/release-testtools ([`f819565`](https://github.com/GitoxideLabs/gitoxide/commit/f819565c2c4c56619c4888acef6cf3b8144cbccb))
+    - Use existing error helpers for guards and conversions ([`1c25831`](https://github.com/GitoxideLabs/gitoxide/commit/1c25831152a4ea5a1a016c9b7670a5d1abe25878))
+    - Use `or_error()` at public exception boundaries ([`535672e`](https://github.com/GitoxideLabs/gitoxide/commit/535672e333c28485795718fc1313f1f4aad30873))
+    - Merge pull request #3029 from cruessler/fix-minor-sha-256-issues-in-cli ([`6c12f2d`](https://github.com/GitoxideLabs/gitoxide/commit/6c12f2dc5cb0a17c7c2050c03e7f1fde7f02b469))
+    - Support SHA-256 in query path tracing ([`f3225e9`](https://github.com/GitoxideLabs/gitoxide/commit/f3225e908acccab7be9f25fd90656b6e871b3a27))
+    - Don't hardcode hash in `gix free index` ([`a8e3143`](https://github.com/GitoxideLabs/gitoxide/commit/a8e314336ff29f4f8e38aa1b9688dabcf04d3dd5))
+    - Merge pull request #3025 from GitoxideLabs/worktree-create ([`acf906f`](https://github.com/GitoxideLabs/gitoxide/commit/acf906f8fcdb8e8d143570737786543dc5a204a0))
+    - Merge pull request #3027 from cruessler/remove-sha-1-default-in-pipeline ([`06b0098`](https://github.com/GitoxideLabs/gitoxide/commit/06b0098a65d66b9c7c9e652c6b17a231f65b1039))
+    - Merge pull request #2977 from GitoxideLabs/worktree-create ([`d9f7c85`](https://github.com/GitoxideLabs/gitoxide/commit/d9f7c85915918e0d96e7705bc97b5ddd3fc629c5))
+    - Merge pull request #3020 from GitoxideLabs/report-september ([`5fb3dcf`](https://github.com/GitoxideLabs/gitoxide/commit/5fb3dcf6a86ac0c403776c8820bf5d23f187f7e1))
+</details>
+
+## 0.62.0 (2026-09-25)
+
+### New Features
+
+ - <csr-id-d9306539c890c8c57b65bbc33604c50d2bfc67cf/> add a `gix editor` command
+   <!-- agent -->
+   Provide a small plumbing command that opens zero or more paths with
+   `Repository::editor()`'s Git-compatible selection. Prepare editor definitions with
+   command-aware argument splitting so PATH-resolved programs run directly while
+   actual shell syntax still uses the shell, reject explicitly empty settings, and
+   honor ':' as the no-op editor.
+
+### Bug Fixes
+
+ - <csr-id-6f55c60b54e08a3e63cd01ae6bf8e82410501f2d/> validate received ref names before writing
+   <!-- agent -->
+   `gix free pack receive --refs-directory` joins network-advertised ref
+   names onto the output directory. Its leading-slash assertion did not
+   reject `refs/heads/../../../outside`, allowing the advertised object ID
+   to overwrite a file outside that directory.
+   
+   Use `gix::validate::reference::name()` before path conversion or directory
+   creation for every ref variant. Invalid names now return `InvalidInput`
+   instead of being written or triggering the absolute-path assertion.
+   The shared writer covers both blocking and async clients.
+   
+   Git reference: `fetch-pack.c::filter_refs()` rejects malformed `refs/`
+   names with `check_refname_format()`, and `remote.c::get_fetch_map()`
+   ignores invalid destination refs. The attached reproduction, run through
+   `jtt run` with Git 2.54.0, confirms that Git ignores the funny ref and the
+   fixed CLI returns an error without changing the outside sentinel. The
+   fake upload-pack was made to drain stdin to avoid an early-exit race.
+
+### Changed (BREAKING)
+
+ - <csr-id-64865b12ef1c5223d31e7f2293cb36405f19eb87/> migrate errors to gix-error
+   <!-- Byron -->
+   rubberstamp
+ - <csr-id-4b42e0ce80ae934cae4f102f44c392581758608f/> raise MSRV to Rust 1.88
+   <!-- agent -->
+   The newly published `dua-core` 3.3 release used by linked-worktree removal
+   requires Rust 1.88, so raise every workspace crate and the advertised badge
+   together.
+   
+   Keep the MSRV checks buildable by selecting the latest `sysinfo` and `rusqlite`
+   release lines that support Rust 1.88.
+
+### Commit Statistics
+
+<csr-read-only-do-not-edit/>
+
+ - 13 commits contributed to the release over the course of 31 calendar days.
+ - 32 days passed between releases.
+ - 4 commits were understood as [conventional](https://www.conventionalcommits.org).
+ - 1 unique issue was worked on: [#3005](https://github.com/GitoxideLabs/gitoxide/issues/3005)
+
+### Commit Details
+
+<csr-read-only-do-not-edit/>
+
+<details><summary>view details</summary>
+
+ * **[#3005](https://github.com/GitoxideLabs/gitoxide/issues/3005)**
+    - Validate received ref names before writing ([`6f55c60`](https://github.com/GitoxideLabs/gitoxide/commit/6f55c60b54e08a3e63cd01ae6bf8e82410501f2d))
+ * **Uncategorized**
+    - Release gix-error v0.4.0, gix-date v0.17.0, gix-actor v0.43.0, gix-trace v0.2.0, gix-validate v0.12.0, gix-path v0.13.0, gix-utils v0.4.0, gix-quote v0.9.0, gix-command v0.11.0, gix-features v0.50.0, gix-hash v0.27.0, gix-hashtable v0.17.0, gix-fs v0.23.0, gix-tempfile v25.0.0, gix-object v0.65.0, gix-glob v0.28.0, gix-attributes v0.36.0, gix-packetline v0.23.0, gix-filter v0.35.0, gix-chunk v0.9.0, gix-commitgraph v0.40.0, gix-revwalk v0.36.0, gix-traverse v0.62.0, gix-worktree-stream v0.37.0, gix-archive v0.37.0, gix-bitmap v0.5.0, gix-lock v25.0.0, gix-index v0.56.0, gix-config-value v0.20.0, gix-pathspec v0.21.0, gix-ignore v0.23.0, gix-worktree v0.57.0, gix-imara-diff v0.3.0, gix-diff v0.68.0, gix-blame v0.18.0, gix-ref v0.68.0, gix-sec v0.15.0, gix-config v0.61.0, gix-prompt v0.18.0, gix-url v0.39.0, gix-credentials v0.41.0, gix-discover v0.56.0, gix-dir v0.30.0, gix-mailmap v0.35.0, gix-revision v0.50.0, gix-merge v0.21.0, gix-negotiate v0.36.0, gix-note v0.2.0, gix-zlib v0.2.0, gix-pack v0.75.0, gix-odb v0.85.0, gix-macros v0.2.0, gix-refspec v0.46.0, gix-shallow v0.14.0, gix-transport v0.60.0, gix-protocol v0.66.0, gix-status v0.35.0, gix-submodule v0.35.0, gix-worktree-state v0.35.0, gix v0.88.0, gix-fsck v0.26.0, gitoxide-core v0.62.0, gix-tix v0.4.0, gitoxide v0.59.0, safety bump 60 crates ([`37860b3`](https://github.com/GitoxideLabs/gitoxide/commit/37860b34db26096c8187ef55bdf4b76705142733))
+    - Merge pull request #2847 from GitoxideLabs/gix-error-completion ([`6356013`](https://github.com/GitoxideLabs/gitoxide/commit/6356013bca0987c6c97ad7ba9d5347271979b51e))
+    - Migrate errors to gix-error ([`64865b1`](https://github.com/GitoxideLabs/gitoxide/commit/64865b12ef1c5223d31e7f2293cb36405f19eb87))
+    - Merge pull request #3007 from GitoxideLabs/add-ref-validation ([`a0e284c`](https://github.com/GitoxideLabs/gitoxide/commit/a0e284cc87277cdf18fce0297cdafd03b0053ac5))
+    - Merge pull request #2989 from GitoxideLabs/error-conversion-review ([`4b9ff51`](https://github.com/GitoxideLabs/gitoxide/commit/4b9ff511a49f7963e97a669ca82c6f6e833d8ea2))
+    - Merge pull request #2949 from GitoxideLabs/error-conversion-review ([`a095334`](https://github.com/GitoxideLabs/gitoxide/commit/a0953348e4d27f59222c1782119d2539a778cd4d))
+    - Raise MSRV to Rust 1.88 ([`4b42e0c`](https://github.com/GitoxideLabs/gitoxide/commit/4b42e0ce80ae934cae4f102f44c392581758608f))
+    - Merge pull request #2955 from GitoxideLabs/transport-url-encoding ([`7e35849`](https://github.com/GitoxideLabs/gitoxide/commit/7e35849b36646cff9722f6906a4527d64818a374))
+    - Release gix-path v0.12.6, gix-error v0.3.2, gix-command v0.10.1, gix-transport v0.59.2 ([`888677a`](https://github.com/GitoxideLabs/gitoxide/commit/888677ad2d63a2e3930a02add2de0b4b667a5581))
+    - Merge pull request #2942 from GitoxideLabs/error-conversion-review ([`a1d5a55`](https://github.com/GitoxideLabs/gitoxide/commit/a1d5a5520d597bdc33c1cf84c1d061b5bc1e382e))
+    - Add a `gix editor` command ([`d930653`](https://github.com/GitoxideLabs/gitoxide/commit/d9306539c890c8c57b65bbc33604c50d2bfc67cf))
+    - Merge pull request #2940 from GitoxideLabs/vendor-bisync ([`dda600d`](https://github.com/GitoxideLabs/gitoxide/commit/dda600d7ee29a6bda4cf1047d0d1782e76b16f98))
+</details>
+
+## 0.61.1 (2026-08-24)
+
+### Commit Statistics
+
+<csr-read-only-do-not-edit/>
+
+ - 4 commits contributed to the release over the course of 1 calendar day.
+ - 2 days passed between releases.
+ - 0 commits were understood as [conventional](https://www.conventionalcommits.org).
+ - 0 issues like '(#ID)' were seen in commit messages
+
+### Commit Details
+
+<csr-read-only-do-not-edit/>
+
+<details><summary>view details</summary>
+
+ * **Uncategorized**
+    - Release gix-packetline v0.22.2, gix-worktree-stream v0.36.1, gix-archive v0.36.1, gix-diff v0.67.1, gix-blame v0.17.1, gix-dir v0.29.1, gix-mailmap v0.34.1, gix-revision v0.49.1, gix-merge v0.20.1, gix-negotiate v0.35.1, gix-note v0.1.1, gix-pack v0.74.2, gix-macros v0.1.6, gix-refspec v0.45.1, gix-transport v0.59.1, gix-protocol v0.65.1, gix-status v0.34.1, gix-worktree-state v0.34.1, gix v0.87.1, gix-fsck v0.25.1, gitoxide-core v0.61.1, gix-tix v0.3.0, gitoxide v0.58.0, safety bump gitoxide v0.58.0 ([`3ebca8b`](https://github.com/GitoxideLabs/gitoxide/commit/3ebca8b66017ab2dd02a38f75f78f485bee1ded8))
+    - Merge pull request #2932 from GitoxideLabs/fundamental-types-comp ([`6704303`](https://github.com/GitoxideLabs/gitoxide/commit/6704303ed5ef3403b129e2b6cc4a9214432ffd03))
+    - Release gix-error v0.3.1, gix-hash v0.26.2, gix-object v0.64.1, gix-ref v0.67.1, gix-packetline v0.22.1, gix-pack v0.74.1, gix-testtools v0.20.0 ([`e52fe9d`](https://github.com/GitoxideLabs/gitoxide/commit/e52fe9d03e82437a25bdfb1098e7046ec7e1b558))
+    - Merge pull request #2933 from GitoxideLabs/report-august ([`b8914ff`](https://github.com/GitoxideLabs/gitoxide/commit/b8914ffda5bc8f6ea851aaf1f720140acfe96dbb))
+</details>
+
+## 0.61.0 (2026-08-22)
+
+### New Features
+
+ - <csr-id-d934f5b150146860b5a844218c3733869bfeb44f/> expose git notes in `gix::Repository`
+   <!-- agent -->
+   Add the notes feature and `Repository::notes` as the porcelain layer over `gix-note`
+   for repeated queries and mutations.
+   
+   Select the default notes ref from `core.notesRef`, including the `GIT_NOTES_REF`
+   environment override represented in `config::tree`, and fall back to
+   `refs/notes/commits`. Discover additional display refs from `notes.displayRef` or
+   `GIT_NOTES_DISPLAY_REF`, expand glob patterns, preserve display order, and avoid
+   duplicates.
+   
+   For mutations, accept conventional short notes-ref names, write note blobs and
+   notes commits, and update refs with compare-and-swap expectations so concurrent
+   changes are not silently overwritten.
+ - <csr-id-da39b92a4722d4e8eae47a78301cf005d2079835/> use Git signature configuration in `gix commit verify`
+   <!-- agent -->
+   Replace the command-specific GPG invocation with gix::Commit::verify_signature
+   so the CLI and library share one implementation and one interpretation of
+   repository configuration.
+   
+   This extends the command from hard-coded OpenPGP verification to the OpenPGP,
+   X.509, and SSH formats supported by Git, including configured programs and trust
+   policy. Preserve verifier diagnostics on stderr and fail when a signature is
+   invalid or insufficiently trusted.
+   
+   Enable the gix command feature in gitoxide-core to make the shared verification
+   API available.
+ - <csr-id-b1174b69b60b478be24f0b81787e95ac08564e7e/> support cloning a single revision
+   <!-- agent -->
+   A full object ID passed through with_ref_name() produced an object-ID refspec
+   mapping and panicked while clone assumed every mapping had a name. Branch and
+   tag checkout also retained ordinary clone tracking semantics instead of offering
+   a single-revision mode.
+   
+   Add PrepareFetch::with_revision() and gix clone --revision for full refs, HEAD,
+   and full object IDs. Revision clones use a one source-only implicit refspec,
+   detach HEAD to the fetched commit, create no ordinary refs, persist no fetch
+   refspec, and disable tag following. Existing with_ref_name() and --ref behavior
+   stays unchanged.
+   
+   This follows Git commit 337855629f59 (builtin/clone: teach git-clone(1) the
+   --revision= option) and its t/t5621-clone-revision.sh behavior.
+
+### Bug Fixes
+
+ - <csr-id-45e6d93fe48ed625b92363e94ed2053f2bc88e27/> peel revspecs to a commit in `gix merge-base`
+   The revspecs were resolved with `rev_parse_single()` and handed to the
+   commit-only merge-base traversal unchanged, so a revspec naming an annotated
+   tag arrived as the id of the tag object. No commit is found for such an id and
+   no error is raised. In a clone of this repository,
+   `gix merge-base HEAD cargo-smart-release-v0.10.0 cargo-smart-release-v0.1.0`
+   printed 0fa37f5d8c96aee551bb6442756059dc203a6cbc, dropping the tag and
+   computing the base of the two revspecs that were left, while `git merge-base`
+   with the same arguments prints ceb6dff13362a2b4318a551893217c1d11643b9f - the
+   commit the annotated tag points at. Git dereferences tags before computing
+   anything.
+   
+   Each revspec is now peeled to a commit before the traversal. Lightweight tags,
+   branches and raw commit ids resolve as before, and a revspec that cannot be
+   peeled to a commit is rejected with the peel error.
+
+### Commit Statistics
+
+<csr-read-only-do-not-edit/>
+
+ - 26 commits contributed to the release over the course of 30 calendar days.
+ - 30 days passed between releases.
+ - 4 commits were understood as [conventional](https://www.conventionalcommits.org).
+ - 1 unique issue was worked on: [#1930](https://github.com/GitoxideLabs/gitoxide/issues/1930)
+
+### Commit Details
+
+<csr-read-only-do-not-edit/>
+
+<details><summary>view details</summary>
+
+ * **[#1930](https://github.com/GitoxideLabs/gitoxide/issues/1930)**
+    - Support cloning a single revision ([`b1174b6`](https://github.com/GitoxideLabs/gitoxide/commit/b1174b69b60b478be24f0b81787e95ac08564e7e))
+ * **Uncategorized**
+    - Update manifests prior to release ([`ebe9095`](https://github.com/GitoxideLabs/gitoxide/commit/ebe9095f2888d3c12447ea5eed9d0afdb0fd5aeb))
+    - Merge pull request #2930 from GitoxideLabs/gix-notes ([`7424676`](https://github.com/GitoxideLabs/gitoxide/commit/7424676f86cd3f5a67c53f8db6baf0803e937d4a))
+    - Expose git notes in `gix::Repository` ([`d934f5b`](https://github.com/GitoxideLabs/gitoxide/commit/d934f5b150146860b5a844218c3733869bfeb44f))
+    - Merge pull request #2926 from cruessler/remove-object-hash-from-options ([`b2d919a`](https://github.com/GitoxideLabs/gitoxide/commit/b2d919a11655fdab5c47001ec1b21d7bbebe24c0))
+    - Merge pull request #2905 from GitoxideLabs/various-improvements ([`f3bbfad`](https://github.com/GitoxideLabs/gitoxide/commit/f3bbfadd4b4f1d72c85c62eb3d7ae337c922f945))
+    - Adapt to changes in `gix-object` (object signing) ([`723d3de`](https://github.com/GitoxideLabs/gitoxide/commit/723d3dedc7a327d19103b53bf80d661f23ee8aca))
+    - Use Git signature configuration in `gix commit verify` ([`da39b92`](https://github.com/GitoxideLabs/gitoxide/commit/da39b92a4722d4e8eae47a78301cf005d2079835))
+    - Merge pull request #2919 from cruessler/require-object-hash-in-file-store-at ([`e5452ba`](https://github.com/GitoxideLabs/gitoxide/commit/e5452baec8ad94736a9f489ec5135c46091eab97))
+    - Adapt to changes in `gix-ref` ([`5810922`](https://github.com/GitoxideLabs/gitoxide/commit/5810922cdb1c2028236b923f6003db7445da35ea))
+    - Merge pull request #2916 from cruessler/require-object-hash-in-store-at ([`dd8c759`](https://github.com/GitoxideLabs/gitoxide/commit/dd8c759e0343c2b5c9776c948d109e9d1ea5943b))
+    - Adapt to changes in `gix-odb` ([`a0b93a3`](https://github.com/GitoxideLabs/gitoxide/commit/a0b93a3877678720f4268adc37317c0f99a8be6d))
+    - Merge pull request #2896 from shuvamk/fix/merge-base-peel-tag ([`e1af444`](https://github.com/GitoxideLabs/gitoxide/commit/e1af44408cf26cb6448a59b2b32b92b265ba2e8a))
+    - Peel revspecs to a commit in `gix merge-base` ([`45e6d93`](https://github.com/GitoxideLabs/gitoxide/commit/45e6d93fe48ed625b92363e94ed2053f2bc88e27))
+    - Merge pull request #2892 from ameyypawar/rev-conformity ([`453c17c`](https://github.com/GitoxideLabs/gitoxide/commit/453c17c343c83b569ad817e6459fadf406926a42))
+    - Adapt to changes in `gix-revision`. ([`21c5614`](https://github.com/GitoxideLabs/gitoxide/commit/21c5614e1eb3cfa21d208083544913305b3986f1))
+    - Merge pull request #2719 from cruessler/blame-untracked-changes ([`95e0213`](https://github.com/GitoxideLabs/gitoxide/commit/95e0213259162d357e68fe459962cbcdce38590f))
+    - Review ([`2ea191f`](https://github.com/GitoxideLabs/gitoxide/commit/2ea191fffb63a2c21f5ed8c9f9f77cc91a763bcc))
+    - Align line numbers in output and start `gix blame` from worktree contents ([`86e90d8`](https://github.com/GitoxideLabs/gitoxide/commit/86e90d8626c01613220ae88100eb3815b31f30ef))
+    - Adapt to changes in `gix-blame` ([`93d4019`](https://github.com/GitoxideLabs/gitoxide/commit/93d4019fdd97200bebcd7b2197da7db74e678877))
+    - Merge pull request #2824 from GitoxideLabs/fetch-revision ([`7a34c17`](https://github.com/GitoxideLabs/gitoxide/commit/7a34c175866222ba6ebeb108d2594369a97d5526))
+    - Merge pull request #2879 from GitoxideLabs/remove-jwalk ([`b6492d3`](https://github.com/GitoxideLabs/gitoxide/commit/b6492d3a4b10d1c4b58988fac62171b65731b42d))
+    - Replace jwalk with dua-core ([`c49dc45`](https://github.com/GitoxideLabs/gitoxide/commit/c49dc457b879eb9f9d6c844878d82e11c185babd))
+    - Merge pull request #2867 from GitoxideLabs/fix-url-authority-parsing ([`cc3ee80`](https://github.com/GitoxideLabs/gitoxide/commit/cc3ee8060ad7a32ee8d2eb9139854be7f7561b70))
+    - Release gix-path v0.12.4, gix-command v0.9.2, gix-config-value v0.19.1, gix-url v0.37.1, gix-credentials v0.39.1, gix-transport v0.58.1 ([`ab4fcb0`](https://github.com/GitoxideLabs/gitoxide/commit/ab4fcb0364ec4d01115595198f383b1ad9c29808))
+    - Merge pull request #2812 from GitoxideLabs/report-july ([`ae8845a`](https://github.com/GitoxideLabs/gitoxide/commit/ae8845a47c4c87e0996a119822106cf09036340b))
+</details>
+
+## 0.60.0 (2026-07-23)
+
+### New Features
+
+ - <csr-id-06a927c422c73be8a433ef71ea9696770bffd31c/> add explicit gix config show subcommand.
+ - <csr-id-bd595de3f204fa431d681bde20774463cb72fbc5/> add `gix config list` for showing the git-configuration files.
+ - <csr-id-87a5e89ef78751282919c3882064b7d01c94170d/> add the `gix config fmt` subcommand
+   Expose the gix-config whitespace formatter as
+   `gix config fmt [--in-place] [in-file] [out-file]`: with no in-file it
+   formats the repository-local configuration, and with no out-file it writes
+   to stdout. The repository is only opened when the repository-local
+   configuration is needed, so formatting an explicit file works outside a
+   repository too.
+ - <csr-id-9316ff8168a2d147e5791663168ae3ee2a78d395/> add `gix status --untracked` flag
+   This allows to control how untracked files are folded, but also
+   can completely turn dirwalking off.
+ - <csr-id-6767b308dab7cb02b0946ce94bb1e05a1aecd370/> add `gix free remote refs` to list and write remote refs.
+   Add `gix free remote refs` to perform an upload-pack handshake, discover
+   the remote reference advertisement, and print the refs without negotiating
+   or receiving a pack.
+   
+   The command can also write the advertised refs into a standalone ref store:
+   
+   ```sh
+   gix free remote refs --refs-directory out-refs <url>
+   ```
+
+### Bug Fixes
+
+ - <csr-id-caabb38a8a1bbce83bbb23b869109f8c2539f355/> escape unsafe paths in gix index entries
+   --- agent
+   
+   Human-readable index entry output wrote repository-controlled path bytes
+   directly to stdout. Control characters could therefore alter terminal state,
+   rewrite visible output, or split one path across multiple lines.
+   
+   Add a crate-private writer that reuses a scratch buffer and emits BStr's
+   quoted debug representation only when its interior differs from the original
+   bytes. This keeps ordinary UTF-8 output unchanged while escaping terminal
+   controls, ambiguous syntax bytes, and invalid UTF-8 losslessly, without allocation.
+   Apply it to both simple and rich index output,
+   including complete submodule-prefixed paths.
+   
+   Git baseline: builtin/ls-files.c routes line-oriented names through
+   write_name_quoted_relative(), which delegates to quote.c's C-style path
+   quoting. This change follows the same behavioral rule that ordinary paths stay
+   readable while terminal-active bytes are not emitted literally.
+ - <csr-id-5f244b32c44795062b0aa9e352404cbd1412a844/> preserve multiple remote URLs
+   Configured remotes can have multiple remote.<name>.url or remote.<name>.pushUrl
+   values, but `gix::Remote` kept only one value because lookup used the singular
+   config accessor. That meant the most recent config value won, while Git exposes
+   every effective URL and uses the first one for the singular get-url form.
+   
+   Add ordered URL storage to `gix::Remote` and expose `Remote::urls(Direction)` for
+   all effective URLs. Keep Remote::url(Direction) as the singular compatibility
+   API, now returning the first effective URL. Fetch URLs used as push fallbacks
+   try pushInsteadOf first and then insteadOf, matching Git behavior.
+   
+   The regression fixture records Git 2.50.1 behavior with git remote get-url:
+   without --all it prints the first configured URL, and with --all it prints all
+   configured URLs in order for both fetch and push.
+ - <csr-id-0a5c62aa0aee5d70a25867aaf8c70c2adb27bec8/> pass through the allocation limit
+   This is particularly important in untrusted repositories, which
+   get a reduced allocation limit.
+
+### Changed (BREAKING)
+
+ - <csr-id-c3f2244541f0b6419d30782fbae825d33bd5fe16/> replace `maybe-async` with `bisync`.
+   Replace the globally feature-selected maybe-async dependency with bisync 0.3 and
+   re-export the locally selected macro mode from gix-protocol.
+   
+   Also use it to deduplicate portions which previously couldn't be handled.
+
+### Bug Fixes (BREAKING)
+
+ - <csr-id-b1851470ef477a3edfa3a96fa07c4472c2ae7962/> make exclude queries index-aware
+   <!-- agent -->
+   
+   `gix exclude query` reported ignore matches for tracked files and directories
+   containing tracked entries, unlike `git check-ignore`. Positional arguments were
+   also interpreted as pathspecs while stdin supplied paths.
+   
+   Treat positional and stdin input uniformly as paths, normalize them relative
+   to the repository, and suppress ignore matches for indexed files or directories
+   containing indexed entries. This changes positional arguments from pathspecs
+   to paths.
+   
+   Add journey coverage for tracked and untracked paths below ignored directories,
+   stdin from a nested working directory, ignore-pattern display, and positional
+   output order.
+
+### Commit Statistics
+
+<csr-read-only-do-not-edit/>
+
+ - 48 commits contributed to the release.
+ - 31 days passed between releases.
+ - 10 commits were understood as [conventional](https://www.conventionalcommits.org).
+ - 3 unique issues were worked on: [#1534](https://github.com/GitoxideLabs/gitoxide/issues/1534), [#2562](https://github.com/GitoxideLabs/gitoxide/issues/2562), [#2696](https://github.com/GitoxideLabs/gitoxide/issues/2696)
+
+### Thanks Clippy
+
+<csr-read-only-do-not-edit/>
+
+[Clippy](https://github.com/rust-lang/rust-clippy) helped 1 time to make code idiomatic. 
+
+### Commit Details
+
+<csr-read-only-do-not-edit/>
+
+<details><summary>view details</summary>
+
+ * **[#1534](https://github.com/GitoxideLabs/gitoxide/issues/1534)**
+    - Escape unsafe paths in gix index entries ([`caabb38`](https://github.com/GitoxideLabs/gitoxide/commit/caabb38a8a1bbce83bbb23b869109f8c2539f355))
+ * **[#2562](https://github.com/GitoxideLabs/gitoxide/issues/2562)**
+    - Make exclude queries index-aware ([`b185147`](https://github.com/GitoxideLabs/gitoxide/commit/b1851470ef477a3edfa3a96fa07c4472c2ae7962))
+ * **[#2696](https://github.com/GitoxideLabs/gitoxide/issues/2696)**
+    - Preserve multiple remote URLs ([`5f244b3`](https://github.com/GitoxideLabs/gitoxide/commit/5f244b32c44795062b0aa9e352404cbd1412a844))
+ * **Uncategorized**
+    - Release gix-actor v0.41.2, gix-features v0.49.0, gix-hash v0.26.0, gix-hashtable v0.16.0, gix-object v0.63.0, gix-glob v0.27.0, gix-attributes v0.34.0, gix-packetline v0.22.0, gix-filter v0.33.0, gix-fs v0.22.0, gix-chunk v0.7.3, gix-commitgraph v0.38.0, gix-revwalk v0.34.0, gix-traverse v0.60.0, gix-worktree-stream v0.35.0, gix-archive v0.35.0, gix-bitmap v0.3.3, gix-tempfile v24.0.0, gix-lock v24.0.0, gix-index v0.54.0, gix-pathspec v0.19.0, gix-ignore v0.22.0, gix-worktree v0.55.0, gix-imara-diff v0.2.4, gix-diff v0.66.0, gix-blame v0.16.0, gix-ref v0.66.0, gix-config v0.59.0, gix-discover v0.54.0, gix-dir v0.28.0, gix-mailmap v0.33.2, gix-revision v0.48.0, gix-merge v0.19.0, gix-negotiate v0.34.0, gix-zlib v0.1.0, gix-pack v0.73.0, gix-odb v0.83.0, gix-refspec v0.44.0, gix-shallow v0.13.0, gix-transport v0.58.0, gix-protocol v0.64.0, gix-status v0.33.0, gix-submodule v0.33.0, gix-worktree-state v0.33.0, gix v0.86.0, gix-fsck v0.24.0, gitoxide-core v0.60.0, gix-tix v0.1.0, gitoxide v0.56.0, safety bump 40 crates ([`842bc44`](https://github.com/GitoxideLabs/gitoxide/commit/842bc447e3aeacf5d9d36f7f8a01068eda4b7999))
+    - Update changelogs prior to release ([`cb6ec7d`](https://github.com/GitoxideLabs/gitoxide/commit/cb6ec7dce283943d811b1600b577f586d7a13e1f))
+    - Release gix-trace v0.1.21, gix-validate v0.11.3, gix-path v0.12.3, gix-utils v0.3.5, gix-config-value v0.19.0, gix-prompt v0.16.0, gix-sec v0.14.2, gix-url v0.37.0, gix-credentials v0.39.0, safety bump 18 crates ([`f0ec710`](https://github.com/GitoxideLabs/gitoxide/commit/f0ec71076aa1cef3181b77946ee556a89c651b8e))
+    - Merge pull request #2737 from GitoxideLabs/encoding-fallback-pony ([`2315ede`](https://github.com/GitoxideLabs/gitoxide/commit/2315ede714da6a43c885ed534f37901b2e1db687))
+    - Adapt to changes in `gix-filter` ([`552402f`](https://github.com/GitoxideLabs/gitoxide/commit/552402f6147b8ed4f412b9d24bf8408320b4a5d8))
+    - Merge pull request #2735 from GitoxideLabs/better-exclude-handling ([`02cb162`](https://github.com/GitoxideLabs/gitoxide/commit/02cb162e31fb7fed5f93d29c7447f68f690442df))
+    - Use `gix::Repository::normalize_path()` everywhere. ([`6dcf76a`](https://github.com/GitoxideLabs/gitoxide/commit/6dcf76a10da3525005128efe7c5570f65bfdc944))
+    - Merge pull request #2734 from GitoxideLabs/url-parse-convenience ([`e7af50e`](https://github.com/GitoxideLabs/gitoxide/commit/e7af50ea6c686593ba627fcf79fdb228a1f29193))
+    - Adapt to changes in gix-url ([`271454b`](https://github.com/GitoxideLabs/gitoxide/commit/271454b5d544e2af2d17db454e72800dbc87acfe))
+    - Merge pull request #2731 from GitoxideLabs/control-chars-escape ([`da88f6f`](https://github.com/GitoxideLabs/gitoxide/commit/da88f6f028bcd8d37dcabfcdebd986c569ce0e25))
+    - Merge pull request #2729 from GitoxideLabs/improvements ([`9949e9f`](https://github.com/GitoxideLabs/gitoxide/commit/9949e9fdfa27a6630a8a12f7da07cbdd5c03aeed))
+    - Adapt to changes in `gix` ([`1dbf871`](https://github.com/GitoxideLabs/gitoxide/commit/1dbf871eec88403b9dc7adb9857c2badea132475))
+    - Merge pull request #2728 from GitoxideLabs/try-bisync ([`adf4b7a`](https://github.com/GitoxideLabs/gitoxide/commit/adf4b7af7eed083c871a6572cb41316dcf6e568e))
+    - Merge pull request #2636 from ameyypawar/gix-config-formatter ([`cfd3899`](https://github.com/GitoxideLabs/gitoxide/commit/cfd389911b33a80576519a228e60d51a789df857))
+    - Add explicit gix config show subcommand. ([`06a927c`](https://github.com/GitoxideLabs/gitoxide/commit/06a927c422c73be8a433ef71ea9696770bffd31c))
+    - Add `gix config list` for showing the git-configuration files. ([`bd595de`](https://github.com/GitoxideLabs/gitoxide/commit/bd595de3f204fa431d681bde20774463cb72fbc5))
+    - Review ([`1825e85`](https://github.com/GitoxideLabs/gitoxide/commit/1825e858f5145f536dc7b78f756e65857ae96f2d))
+    - Replace `maybe-async` with `bisync`. ([`c3f2244`](https://github.com/GitoxideLabs/gitoxide/commit/c3f2244541f0b6419d30782fbae825d33bd5fe16))
+    - Add the `gix config fmt` subcommand ([`87a5e89`](https://github.com/GitoxideLabs/gitoxide/commit/87a5e89ef78751282919c3882064b7d01c94170d))
+    - Merge pull request #2721 from GitoxideLabs/remove-kstring ([`e70732a`](https://github.com/GitoxideLabs/gitoxide/commit/e70732a7cad4b5dca4890d394908c858ab406906))
+    - Adapt to changes in `gix-attributes` ([`e11d7a2`](https://github.com/GitoxideLabs/gitoxide/commit/e11d7a2c734882e4ddb74c82ce5fe50b46265467))
+    - Merge pull request #2722 from GitoxideLabs/reasons ([`c16b5a1`](https://github.com/GitoxideLabs/gitoxide/commit/c16b5a1892704b7c72a253bdd74a6848dd61032a))
+    - Replace lint allowances with expectations ([`43ff87a`](https://github.com/GitoxideLabs/gitoxide/commit/43ff87a73897b70313e3a58e7de82231be5b59ad))
+    - Merge pull request #2667 from GitoxideLabs/lifetime-free-config-parser ([`55b5158`](https://github.com/GitoxideLabs/gitoxide/commit/55b51580c2b018f9f35b4b865fe86a28a5c0ff84))
+    - Adapt to changes in `gix-config` ([`376e946`](https://github.com/GitoxideLabs/gitoxide/commit/376e94627bf694d78314e044ece058fe09a54dec))
+    - Merge pull request #2715 from GitoxideLabs/fixup-credentials ([`299d16b`](https://github.com/GitoxideLabs/gitoxide/commit/299d16b467d6ecbd74da71bc17d2b0b6cd62c109))
+    - Adapt the credential command to explicit context options in `gix-credentials` ([`f88cf10`](https://github.com/GitoxideLabs/gitoxide/commit/f88cf1003704d2df53c7266fd85657bc270bcfd4))
+    - Merge pull request #2714 from GitoxideLabs/fix-credentials-parsing ([`cf3053a`](https://github.com/GitoxideLabs/gitoxide/commit/cf3053a3c18e2de788cdaa9f41b5bd343bdc0091))
+    - Release gix-path v0.12.2, gix-error v0.2.5, gix-utils v0.3.4, gix-date v0.15.6, gix-url v0.36.2, gix-credentials v0.38.2 ([`27aec47`](https://github.com/GitoxideLabs/gitoxide/commit/27aec474c113cc885d44631b329454dc1ad0fed2))
+    - Merge pull request #2698 from GitoxideLabs/multi-remote-url ([`7056d62`](https://github.com/GitoxideLabs/gitoxide/commit/7056d62dd3fda005f55a1f59ce36179000749013))
+    - Add missing SHA256 archive ([`432e2b1`](https://github.com/GitoxideLabs/gitoxide/commit/432e2b1c57abf191e1093e3d91904d99bd4fb422))
+    - Merge pull request #2695 from ameyypawar/fix/2024-compression-level ([`6e1c4a2`](https://github.com/GitoxideLabs/gitoxide/commit/6e1c4a24813d99ad0bbfb231618210ffe6a5cd6a))
+    - Review ([`f1ac335`](https://github.com/GitoxideLabs/gitoxide/commit/f1ac3359c3d88f550219116f1f3e8cb107f5f86f))
+    - Adapt to configurable zlib compression levels ([`846c7c1`](https://github.com/GitoxideLabs/gitoxide/commit/846c7c1d67fa99ed4b2446fee849d3b00aedc070))
+    - Merge pull request #2702 from ameyypawar/fix/2694-exn-source-chain ([`e9c973d`](https://github.com/GitoxideLabs/gitoxide/commit/e9c973d9476bef293bec89cd683cb60b02a85e52))
+    - Thanks clippy ([`d533f0c`](https://github.com/GitoxideLabs/gitoxide/commit/d533f0c7a6a6b20cbcfe5a755d472b921e38b4a1))
+    - Merge pull request #2691 from GitoxideLabs/gix-pack-missing-cap ([`0052e42`](https://github.com/GitoxideLabs/gitoxide/commit/0052e4256803a9905eacf80eb27be23cbffe7359))
+    - Pass through the allocation limit ([`0a5c62a`](https://github.com/GitoxideLabs/gitoxide/commit/0a5c62aa0aee5d70a25867aaf8c70c2adb27bec8))
+    - Merge pull request #2547 from special-bread/windows-status-performance ([`3e43c42`](https://github.com/GitoxideLabs/gitoxide/commit/3e43c42e96502d7fb0998ba05efcdf67d07eb957))
+    - Add `gix status --untracked` flag ([`9316ff8`](https://github.com/GitoxideLabs/gitoxide/commit/9316ff8168a2d147e5791663168ae3ee2a78d395))
+    - Merge pull request #2684 from GitoxideLabs/dependabot/cargo/cargo-f4a9952650 ([`677795b`](https://github.com/GitoxideLabs/gitoxide/commit/677795bad1b1c7d23c8069a11a226f3da3b430e4))
+    - Bump the cargo group with 8 updates ([`b4b9844`](https://github.com/GitoxideLabs/gitoxide/commit/b4b984406c891fade4b7ce90569901206483ea37))
+    - Merge pull request #2659 from willstott101/fix-ref-transaction-toctou ([`43dd683`](https://github.com/GitoxideLabs/gitoxide/commit/43dd6839d7d63c396c7c296244a5d87a92f09804))
+    - Add `gix free remote refs` to list and write remote refs. ([`6767b30`](https://github.com/GitoxideLabs/gitoxide/commit/6767b308dab7cb02b0946ce94bb1e05a1aecd370))
+    - Merge pull request #2646 from GitoxideLabs/report ([`1b1541e`](https://github.com/GitoxideLabs/gitoxide/commit/1b1541ed7a457afd48385c1ee39113949a9f5263))
+</details>
+
+## 0.59.0 (2026-06-22)
+
+### Bug Fixes
+
+ - <csr-id-d8107abf566cbbc54a5a346e04385931dcb0a3ee/> use main repo when listing worktrees
+
+### Commit Statistics
+
+<csr-read-only-do-not-edit/>
+
+ - 11 commits contributed to the release over the course of 27 calendar days.
+ - 27 days passed between releases.
+ - 1 commit was understood as [conventional](https://www.conventionalcommits.org).
+ - 0 issues like '(#ID)' were seen in commit messages
+
+### Thanks Clippy
+
+<csr-read-only-do-not-edit/>
+
+[Clippy](https://github.com/rust-lang/rust-clippy) helped 1 time to make code idiomatic. 
+
+### Commit Details
+
+<csr-read-only-do-not-edit/>
+
+<details><summary>view details</summary>
+
+ * **Uncategorized**
+    - Release gix-date v0.15.5, gix-hashtable v0.15.2, gix-object v0.62.0, gix-attributes v0.33.2, gix-filter v0.32.0, gix-revwalk v0.33.0, gix-traverse v0.59.0, gix-worktree-stream v0.34.0, gix-archive v0.34.0, gix-tempfile v23.0.2, gix-index v0.53.0, gix-worktree v0.54.0, gix-imara-diff v0.2.3, gix-diff v0.65.0, gix-blame v0.15.0, gix-ref v0.65.0, gix-config v0.58.0, gix-discover v0.53.0, gix-dir v0.27.0, gix-revision v0.47.0, gix-merge v0.18.0, gix-negotiate v0.33.0, gix-pack v0.72.0, gix-odb v0.82.0, gix-refspec v0.43.0, gix-transport v0.57.2, gix-protocol v0.63.0, gix-status v0.32.0, gix-submodule v0.32.0, gix-worktree-state v0.32.0, gix v0.85.0, gix-fsck v0.23.0, gitoxide-core v0.59.0, gitoxide v0.55.0, safety bump 28 crates ([`6428edc`](https://github.com/GitoxideLabs/gitoxide/commit/6428edc82fc8a16d5ef34ca2d49aa6fdff3645fe))
+    - Merge pull request #2615 from shvvkz/fix/worktree-list-output ([`14eee82`](https://github.com/GitoxideLabs/gitoxide/commit/14eee8295da5f4889e0c9a8a5b5623584977a2f3))
+    - Review ([`646f8b2`](https://github.com/GitoxideLabs/gitoxide/commit/646f8b28d003ad5206b633028aa41c88303f233e))
+    - Use main repo when listing worktrees ([`d8107ab`](https://github.com/GitoxideLabs/gitoxide/commit/d8107abf566cbbc54a5a346e04385931dcb0a3ee))
+    - Merge pull request #2635 from GitoxideLabs/dependabot/cargo/cargo-7b971a5e8c ([`155ff6d`](https://github.com/GitoxideLabs/gitoxide/commit/155ff6d345ba49ff72cb25c08a8b9dfae8c41bc7))
+    - Bump the cargo group with 40 updates ([`9402adc`](https://github.com/GitoxideLabs/gitoxide/commit/9402adc4c854f72906392a157b848a0ff36900a2))
+    - Merge pull request #2628 from GitoxideLabs/dependabot/cargo/tar-0.4.46 ([`5aadd6e`](https://github.com/GitoxideLabs/gitoxide/commit/5aadd6ed92c97ac364a743d23da0151960b50e3b))
+    - Thanks clippy ([`137794d`](https://github.com/GitoxideLabs/gitoxide/commit/137794df983c852495f96bbb203cd4ebeab3269b))
+    - Merge pull request #2549 from GitoxideLabs/no-dupl-compute ([`69caccd`](https://github.com/GitoxideLabs/gitoxide/commit/69caccd2a3acd92f0f2731d62ffb885f0d6e9091))
+    - Adapt to changes in `gix-object` (more `Write` methods) ([`955b440`](https://github.com/GitoxideLabs/gitoxide/commit/955b440ee2d5a1c28a90bf40224ba9e19baa597d))
+    - Merge pull request #2618 from GitoxideLabs/report ([`f7d4f33`](https://github.com/GitoxideLabs/gitoxide/commit/f7d4f33b58503996ae90497b69ce4c3a757982ac))
+</details>
+
+## 0.58.0 (2026-05-26)
+
+### New Features
+
+ - <csr-id-add4cf4c0d2ce0f331a619ffd31f709a3b9f0bff/> `gix dirwalk` as a way to run gix-dir directly
+   This is mostly for testing walks specifically, without needing them as part
+   of `gix clean` or `gix status`.
+ - <csr-id-6ab327e54a71ca5e4d555bfedfffd81359d8b529/> add `gix merge tree --message ''` to allow creating commits
+   This is useful for controlling cherry-picks precisely.
+
+### Commit Statistics
+
+<csr-read-only-do-not-edit/>
+
+ - 13 commits contributed to the release over the course of 28 calendar days.
+ - 28 days passed between releases.
+ - 2 commits were understood as [conventional](https://www.conventionalcommits.org).
+ - 0 issues like '(#ID)' were seen in commit messages
+
+### Commit Details
+
+<csr-read-only-do-not-edit/>
+
+<details><summary>view details</summary>
+
+ * **Uncategorized**
+    - Release gix-error v0.2.4, gix-date v0.15.4, gix-actor v0.41.1, gix-trace v0.1.20, gix-validate v0.11.2, gix-path v0.12.1, gix-utils v0.3.3, gix-features v0.48.1, gix-hash v0.25.1, gix-hashtable v0.15.1, gix-object v0.61.0, gix-glob v0.26.1, gix-quote v0.7.2, gix-attributes v0.33.1, gix-command v0.9.1, gix-packetline v0.21.4, gix-filter v0.31.0, gix-fs v0.21.2, gix-chunk v0.7.2, gix-commitgraph v0.37.1, gix-revwalk v0.32.0, gix-traverse v0.58.0, gix-worktree-stream v0.33.0, gix-archive v0.33.0, gix-bitmap v0.3.2, gix-tempfile v23.0.1, gix-lock v23.0.1, gix-index v0.52.0, gix-config-value v0.18.1, gix-pathspec v0.18.1, gix-ignore v0.21.1, gix-worktree v0.53.0, gix-imara-diff v0.2.2, gix-diff v0.64.0, gix-blame v0.14.0, gix-ref v0.64.0, gix-sec v0.14.1, gix-config v0.57.0, gix-prompt v0.15.1, gix-url v0.36.1, gix-credentials v0.38.1, gix-discover v0.52.0, gix-dir v0.26.0, gix-mailmap v0.33.1, gix-revision v0.46.0, gix-merge v0.17.0, gix-negotiate v0.32.0, gix-pack v0.71.0, gix-odb v0.81.0, gix-refspec v0.42.0, gix-shallow v0.12.1, gix-transport v0.57.1, gix-protocol v0.62.0, gix-status v0.31.0, gix-submodule v0.31.0, gix-worktree-state v0.31.0, gix v0.84.0, gix-fsck v0.22.0, gitoxide-core v0.58.0, gitoxide v0.54.0, safety bump 27 crates ([`10c58bb`](https://github.com/GitoxideLabs/gitoxide/commit/10c58bb56597d9335611da121aac21f9b09b6e5b))
+    - Merge pull request #2584 from GitoxideLabs/improvements ([`1322a36`](https://github.com/GitoxideLabs/gitoxide/commit/1322a36599d252a822dbc4548763a2db75816075))
+    - `gix dirwalk` as a way to run gix-dir directly ([`add4cf4`](https://github.com/GitoxideLabs/gitoxide/commit/add4cf4c0d2ce0f331a619ffd31f709a3b9f0bff))
+    - Merge pull request #2568 from GitoxideLabs/dependabot/cargo/cargo-56d6b174d8 ([`ab2fee1`](https://github.com/GitoxideLabs/gitoxide/commit/ab2fee14651202fcb7b3d8178932090c73492014))
+    - Update crates to Rust 2024 edition ([`2cb17b2`](https://github.com/GitoxideLabs/gitoxide/commit/2cb17b2e7f6009693a55af907614f705a29d8c29))
+    - Remove rust_2018_idioms lint declarations ([`e10d5f6`](https://github.com/GitoxideLabs/gitoxide/commit/e10d5f662df2ee05f973a3167ad215a330ee74e1))
+    - Merge pull request #2543 from cruessler/run-gix-worktree-stream-tests-with-sha-256 ([`23af41a`](https://github.com/GitoxideLabs/gitoxide/commit/23af41ab13d4fa894c2c2774a096fef5438bef7d))
+    - Adapt to changes in `gix_object::Data` ([`4309fa4`](https://github.com/GitoxideLabs/gitoxide/commit/4309fa4a98fd613f8e346ed0274d0edec8dfab1f))
+    - Adapt to changes in `gix-testtools`and rename `hash_kind` -> `object_hash` ([`d9648e8`](https://github.com/GitoxideLabs/gitoxide/commit/d9648e85c53616fe2fb79e19ee0a42967127cc2f))
+    - Adapt to changes in gix-worktree-stream ([`c82d822`](https://github.com/GitoxideLabs/gitoxide/commit/c82d822fd4d5bde06915f5c9e082af0348597890))
+    - Merge pull request #2557 from GitoxideLabs/cherry-pick ([`0771cb2`](https://github.com/GitoxideLabs/gitoxide/commit/0771cb2fc6e1b08a2d8e14b9f1226f555ed59b79))
+    - Add `gix merge tree --message ''` to allow creating commits ([`6ab327e`](https://github.com/GitoxideLabs/gitoxide/commit/6ab327e54a71ca5e4d555bfedfffd81359d8b529))
+    - Merge pull request #2546 from GitoxideLabs/fix-2545 ([`adb8328`](https://github.com/GitoxideLabs/gitoxide/commit/adb8328952478c443ead5f5a8c6851928b377b37))
+</details>
+
+## 0.57.0 (2026-04-28)
+
+### Bug Fixes (BREAKING)
+
+ - <csr-id-91c854e7b9f41738d0fde825cd474b8c00c1a49b/> remove `winnow` and replace it with hand-implemented parsers everywhere.
+   This will allow for simplified maintenance and editing (both human and machine)
+   down the road, and enable additional performance optimisations.
+   
+   Parser compbinators to me ultimately were a failed experiment as I couldn't maintain
+   them anyway, with it being too difficult for me to grasp and express everything
+   in its very own kind of language, with a lot of different things to consider.
+   
+   Note that this also removes detailed errors from all parsers that previously
+   used `winnow`, with the option to re-add those if there is demand.
+
+### Commit Statistics
+
+<csr-read-only-do-not-edit/>
+
+ - 4 commits contributed to the release over the course of 2 calendar days.
+ - 4 days passed between releases.
+ - 1 commit was understood as [conventional](https://www.conventionalcommits.org).
+ - 0 issues like '(#ID)' were seen in commit messages
+
+### Commit Details
+
+<csr-read-only-do-not-edit/>
+
+<details><summary>view details</summary>
+
+ * **Uncategorized**
+    - Release gix-error v0.2.3, gix-date v0.15.3, gix-actor v0.41.0, gix-path v0.12.0, gix-features v0.48.0, gix-hash v0.25.0, gix-hashtable v0.15.0, gix-object v0.60.0, gix-glob v0.26.0, gix-attributes v0.33.0, gix-command v0.9.0, gix-filter v0.30.0, gix-fs v0.21.0, gix-commitgraph v0.37.0, gix-revwalk v0.31.0, gix-traverse v0.57.0, gix-worktree-stream v0.32.0, gix-archive v0.32.0, gix-tempfile v23.0.0, gix-lock v23.0.0, gix-index v0.51.0, gix-config-value v0.18.0, gix-pathspec v0.18.0, gix-ignore v0.21.0, gix-worktree v0.52.0, gix-imara-diff v0.2.1, gix-diff v0.63.0, gix-blame v0.13.0, gix-ref v0.63.0, gix-sec v0.14.0, gix-config v0.56.0, gix-prompt v0.15.0, gix-url v0.36.0, gix-credentials v0.38.0, gix-discover v0.51.0, gix-dir v0.25.0, gix-mailmap v0.33.0, gix-revision v0.45.0, gix-merge v0.16.0, gix-negotiate v0.31.0, gix-pack v0.70.0, gix-odb v0.80.0, gix-refspec v0.41.0, gix-shallow v0.12.0, gix-transport v0.57.0, gix-protocol v0.61.0, gix-status v0.30.0, gix-submodule v0.30.0, gix-worktree-state v0.30.0, gix v0.83.0, gix-fsck v0.21.0, gitoxide-core v0.57.0, gitoxide v0.53.0, safety bump 48 crates ([`53f880c`](https://github.com/GitoxideLabs/gitoxide/commit/53f880c7604232c367870088176e42efd8a5b783))
+    - Adapt to changes in `gix-object` ([`91bfab0`](https://github.com/GitoxideLabs/gitoxide/commit/91bfab0694673b3234b52f30fa9c8ec4322ddb9d))
+    - Remove `winnow` and replace it with hand-implemented parsers everywhere. ([`91c854e`](https://github.com/GitoxideLabs/gitoxide/commit/91c854e7b9f41738d0fde825cd474b8c00c1a49b))
+    - Merge pull request #2540 from GitoxideLabs/reporting ([`4d5ba23`](https://github.com/GitoxideLabs/gitoxide/commit/4d5ba231685e8ff36195603c57193aa1cd21fa8e))
+</details>
+
+## 0.56.0 (2026-04-24)
+
+### Chore
+
+ - <csr-id-3e05ca352597ef5966fa4dc4f52456c2424cddad/> add package.include directives to control which files are packaged.
+
+### New Features
+
+ - <csr-id-ab2016f634d3138ec9312b541558bbb2da27f3c7/> add `gix free trust` to easily check the assigned trust level of any given path
+   This is particularly useful on Windows, which makes it easy to probe existing paths
+   with ownership that might be complex to reproduce otherwise.
+
+### New Features (BREAKING)
+
+ - <csr-id-91d0c261c2ca4e3f771f37ea0ed11adbc533829b/> enforce the specification of `alloc_init_bytes` to handle untrusted input
+   This breaking change is intended to force a decision about how
+   much memory allocation an untrusted party can command by tempering
+   with binary file formats.
+ - <csr-id-8094f5dcd4f24f4d54f7fbe7f716f80f2974b586/> Use `imara-diff-v2` with git sliders processing
+   The slider post-processing imrpoves the diff quality for about 8% slower diffs.
+   Line-counts, however, will be 50% faster to compute.
+
+### Commit Statistics
+
+<csr-read-only-do-not-edit/>
+
+ - 23 commits contributed to the release over the course of 32 calendar days.
+ - 33 days passed between releases.
+ - 4 commits were understood as [conventional](https://www.conventionalcommits.org).
+ - 0 issues like '(#ID)' were seen in commit messages
+
+### Thanks Clippy
+
+<csr-read-only-do-not-edit/>
+
+[Clippy](https://github.com/rust-lang/rust-clippy) helped 1 time to make code idiomatic. 
+
+### Commit Details
+
+<csr-read-only-do-not-edit/>
+
+<details><summary>view details</summary>
+
+ * **Uncategorized**
+    - Update changelogs prior to release ([`f9fbcba`](https://github.com/GitoxideLabs/gitoxide/commit/f9fbcba28278f3fb2ad7969c2d00ac6765165724))
+    - Merge pull request #2530 from GitoxideLabs/advisories ([`63b8419`](https://github.com/GitoxideLabs/gitoxide/commit/63b841907ce30b36bb50da5aae3a9e1a06eadf64))
+    - Merge pull request #2510 from GitoxideLabs/folder-identity-on-windows ([`a96587c`](https://github.com/GitoxideLabs/gitoxide/commit/a96587c23b267f74065ac9bed2e50de69113e67f))
+    - Enforce the specification of `alloc_init_bytes` to handle untrusted input ([`91d0c26`](https://github.com/GitoxideLabs/gitoxide/commit/91d0c261c2ca4e3f771f37ea0ed11adbc533829b))
+    - Adapt to changes in gix-pack ([`02e420b`](https://github.com/GitoxideLabs/gitoxide/commit/02e420b6f8a2e62b063c01be24aa812bcc3cb585))
+    - Add `gix free trust` to easily check the assigned trust level of any given path ([`ab2016f`](https://github.com/GitoxideLabs/gitoxide/commit/ab2016f634d3138ec9312b541558bbb2da27f3c7))
+    - Merge pull request #2497 from cruessler/pass-hash-len-to-tree-ref-iter ([`7d50c30`](https://github.com/GitoxideLabs/gitoxide/commit/7d50c30040b8854a0129d86bd30535cb570ca75e))
+    - Adapt to changes in `gix-object` ([`6df1d55`](https://github.com/GitoxideLabs/gitoxide/commit/6df1d553b03e2809aa4f651e3ec48aad4688696e))
+    - Merge pull request #2513 from GitoxideLabs/v2-diff ([`2a5db88`](https://github.com/GitoxideLabs/gitoxide/commit/2a5db88d0330b0d125de4b6f3819f17a7f76f4b8))
+    - Thanks clippy ([`e4f380e`](https://github.com/GitoxideLabs/gitoxide/commit/e4f380eff3b0440002f7e9b64a14ddcfbe63192a))
+    - Address auto-review ([`cff3c16`](https://github.com/GitoxideLabs/gitoxide/commit/cff3c169276e9553ffd71fd9c85155be6cb908f2))
+    - Use `imara-diff-v2` with git sliders processing ([`8094f5d`](https://github.com/GitoxideLabs/gitoxide/commit/8094f5dcd4f24f4d54f7fbe7f716f80f2974b586))
+    - Merge pull request #2518 from GitoxideLabs/improvements ([`444a92b`](https://github.com/GitoxideLabs/gitoxide/commit/444a92b0fa1df406cf2f36f8dbe82c2859e04e0b))
+    - Add package.include directives to control which files are packaged. ([`3e05ca3`](https://github.com/GitoxideLabs/gitoxide/commit/3e05ca352597ef5966fa4dc4f52456c2424cddad))
+    - Merge pull request #2514 from mtsgrd/fix/body-ref-trailer-as-sole-body-content ([`c261237`](https://github.com/GitoxideLabs/gitoxide/commit/c261237f64c9032e72998a3bbf7ca9abf08c83b8))
+    - Adapt to changes in `gix-object` ([`58f7595`](https://github.com/GitoxideLabs/gitoxide/commit/58f75954d59c05b1532b8be4251beed2a0fbdc30))
+    - Merge pull request #2499 from GitoxideLabs/dependabot/cargo/cargo-17cc682121 ([`44020e0`](https://github.com/GitoxideLabs/gitoxide/commit/44020e01d2f037d94a3625fbc323d203718dcc66))
+    - Bump the cargo group with 26 updates ([`9d04035`](https://github.com/GitoxideLabs/gitoxide/commit/9d040352ca432b23e666eb0163267170d0926401))
+    - Merge pull request #2493 from GitoxideLabs/improvements ([`af1ad55`](https://github.com/GitoxideLabs/gitoxide/commit/af1ad55a12a949bdcb77688757690020b23188c9))
+    - Adapt to changes in `gix-config` ([`7bda16a`](https://github.com/GitoxideLabs/gitoxide/commit/7bda16a697fcc52a255f6cbef12d4a329238f45d))
+    - Merge pull request #2485 from GitoxideLabs/fintohaps/fix-ls-refs-prefixing ([`700ad9e`](https://github.com/GitoxideLabs/gitoxide/commit/700ad9ea517d8b2f2a2f7948d9e0bd0df1962a56))
+    - Fail on missing explicit refs after exact ls-refs` ([`df41a64`](https://github.com/GitoxideLabs/gitoxide/commit/df41a64851de31b5b5581b39efe18af4e5becfbc))
+    - Merge pull request #2480 from GitoxideLabs/report ([`98bae84`](https://github.com/GitoxideLabs/gitoxide/commit/98bae84fe534879899489c6f2c5e8cfcc863116d))
+</details>
+
+## 0.55.0 (2026-03-22)
+
+### Chore
+
+ - <csr-id-2427e8264c7e8e1e58d905b127a68f1dd1cc5e2a/> add docs-rs metadata so that crates can build on docs.rs
+
+### New Features
+
+ - <csr-id-33dc7d7151e1eb54471c363f6601ea33d7218f51/> `ein t hours -p` now respects `co-authored-by` message trailers.
+   They are also passed through the mailmap, and are deduplicated.
+ - <csr-id-383291689c659a2cc0bee7687f5a9b9f7a3659a4/> add `sha1` and `sha256` features to `gix`.
+   This way one can control which hashes are compiled in exactly,
+   while having reasonable defaults automatically.
+
+### Commit Statistics
+
+<csr-read-only-do-not-edit/>
+
+ - 11 commits contributed to the release.
+ - 28 days passed between releases.
+ - 3 commits were understood as [conventional](https://www.conventionalcommits.org).
+ - 0 issues like '(#ID)' were seen in commit messages
+
+### Commit Details
+
+<csr-read-only-do-not-edit/>
+
+<details><summary>view details</summary>
+
+ * **Uncategorized**
+    - Add docs-rs metadata so that crates can build on docs.rs ([`2427e82`](https://github.com/GitoxideLabs/gitoxide/commit/2427e8264c7e8e1e58d905b127a68f1dd1cc5e2a))
+    - Release gix-error v0.2.1, gix-date v0.15.1, gix-path v0.11.2, gix-features v0.46.2, gix-hash v0.23.0, gix-hashtable v0.13.0, gix-object v0.58.0, gix-packetline v0.21.2, gix-filter v0.28.0, gix-fs v0.19.2, gix-commitgraph v0.35.0, gix-revwalk v0.29.0, gix-traverse v0.55.0, gix-worktree-stream v0.30.0, gix-archive v0.30.0, gix-tempfile v21.0.2, gix-lock v21.0.2, gix-index v0.49.0, gix-pathspec v0.16.1, gix-ignore v0.19.1, gix-worktree v0.50.0, gix-diff v0.61.0, gix-blame v0.11.0, gix-ref v0.61.0, gix-sec v0.13.2, gix-config v0.54.0, gix-prompt v0.14.1, gix-credentials v0.37.1, gix-discover v0.49.0, gix-dir v0.23.0, gix-revision v0.43.0, gix-merge v0.14.0, gix-negotiate v0.29.0, gix-pack v0.68.0, gix-odb v0.78.0, gix-refspec v0.39.0, gix-shallow v0.10.0, gix-transport v0.55.1, gix-protocol v0.59.0, gix-status v0.28.0, gix-submodule v0.28.0, gix-worktree-state v0.28.0, gix v0.81.0, gix-fsck v0.19.0, gitoxide-core v0.55.0, gitoxide v0.52.0, safety bump 31 crates ([`c389a2c`](https://github.com/GitoxideLabs/gitoxide/commit/c389a2ccb32b36c1178a1352a2bb3229aef3b016))
+    - Merge pull request #2463 from GitoxideLabs/improvements ([`b4a778d`](https://github.com/GitoxideLabs/gitoxide/commit/b4a778d63b1d0f2a968a4628b46536f67302028d))
+    - `ein t hours -p` now respects `co-authored-by` message trailers. ([`33dc7d7`](https://github.com/GitoxideLabs/gitoxide/commit/33dc7d7151e1eb54471c363f6601ea33d7218f51))
+    - Merge pull request #2454 from GitoxideLabs/dependabot/cargo/cargo-da044b9bb0 ([`6183fd0`](https://github.com/GitoxideLabs/gitoxide/commit/6183fd092d7acd43763fe15be400ce81e7172775))
+    - Bump the cargo group with 68 updates ([`6bdb331`](https://github.com/GitoxideLabs/gitoxide/commit/6bdb33145e8aa81ba0dae5caafc675c591569715))
+    - Merge pull request #2441 from cruessler/remove-sha-1-from-default-features ([`e8bf096`](https://github.com/GitoxideLabs/gitoxide/commit/e8bf096c07205a41089a697a9726f075d3515643))
+    - Add `sha1` and `sha256` features to `gix`. ([`3832916`](https://github.com/GitoxideLabs/gitoxide/commit/383291689c659a2cc0bee7687f5a9b9f7a3659a4))
+    - Merge pull request #2445 from GitoxideLabs/improvements ([`6a7287c`](https://github.com/GitoxideLabs/gitoxide/commit/6a7287c9247120167e49154463f7e86c25100649))
+    - Add `cargo machete` CI job including exclusions ([`abd0724`](https://github.com/GitoxideLabs/gitoxide/commit/abd072444ff076557aa7e4c5b76ad7c47d488a4a))
+    - Merge pull request #2442 from GitoxideLabs/report ([`f7277f3`](https://github.com/GitoxideLabs/gitoxide/commit/f7277f3c9e3e5130edb714ff5bd3db06b7f589b3))
+</details>
+
 ## 0.54.0 (2026-02-22)
 
 ### Commit Statistics
 
 <csr-read-only-do-not-edit/>
 
- - 9 commits contributed to the release over the course of 31 calendar days.
+ - 10 commits contributed to the release over the course of 31 calendar days.
  - 31 days passed between releases.
  - 0 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
@@ -23,6 +726,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <details><summary>view details</summary>
 
  * **Uncategorized**
+    - Release gix-error v0.2.0, gix-date v0.15.0, gix-actor v0.40.0, gix-object v0.57.0, gix-quote v0.7.0, gix-attributes v0.31.0, gix-command v0.8.0, gix-filter v0.27.0, gix-chunk v0.7.0, gix-commitgraph v0.34.0, gix-revwalk v0.28.0, gix-traverse v0.54.0, gix-worktree-stream v0.29.0, gix-archive v0.29.0, gix-bitmap v0.3.0, gix-index v0.48.0, gix-pathspec v0.16.0, gix-worktree v0.49.0, gix-diff v0.60.0, gix-blame v0.10.0, gix-ref v0.60.0, gix-config v0.53.0, gix-prompt v0.14.0, gix-url v0.35.2, gix-credentials v0.37.0, gix-discover v0.48.0, gix-dir v0.22.0, gix-mailmap v0.32.0, gix-revision v0.42.0, gix-merge v0.13.0, gix-negotiate v0.28.0, gix-pack v0.67.0, gix-odb v0.77.0, gix-refspec v0.38.0, gix-shallow v0.9.0, gix-transport v0.55.0, gix-protocol v0.58.0, gix-status v0.27.0, gix-submodule v0.27.0, gix-worktree-state v0.27.0, gix v0.80.0, gix-fsck v0.18.0, gitoxide-core v0.54.0, gitoxide v0.51.0, safety bump 42 crates ([`ecf90fc`](https://github.com/GitoxideLabs/gitoxide/commit/ecf90fccb9d43bff320c17f46fdc3f5832533a52))
     - Merge branch 'release' ([`9327b73`](https://github.com/GitoxideLabs/gitoxide/commit/9327b73785227f1322a327cb48fbb0800e1286ae))
     - Release gix-error v0.1.0, gix-date v0.14.0, gix-actor v0.39.0, gix-trace v0.1.18, gix-path v0.11.1, gix-features v0.46.1, gix-hash v0.22.1, gix-object v0.56.0, gix-quote v0.6.2, gix-attributes v0.30.1, gix-command v0.7.1, gix-packetline v0.21.1, gix-filter v0.26.0, gix-fs v0.19.1, gix-chunk v0.6.0, gix-commitgraph v0.33.0, gix-revwalk v0.27.0, gix-traverse v0.53.0, gix-worktree-stream v0.28.0, gix-archive v0.28.0, gix-bitmap v0.2.16, gix-tempfile v21.0.1, gix-lock v21.0.1, gix-index v0.47.0, gix-config-value v0.17.1, gix-pathspec v0.15.1, gix-worktree v0.48.0, gix-diff v0.59.0, gix-blame v0.9.0, gix-ref v0.59.0, gix-sec v0.13.1, gix-config v0.52.0, gix-prompt v0.13.1, gix-url v0.35.1, gix-credentials v0.36.0, gix-discover v0.47.0, gix-dir v0.21.0, gix-mailmap v0.31.0, gix-revision v0.41.0, gix-merge v0.12.0, gix-negotiate v0.27.0, gix-pack v0.66.0, gix-odb v0.76.0, gix-refspec v0.37.0, gix-shallow v0.8.1, gix-transport v0.54.0, gix-protocol v0.57.0, gix-status v0.26.0, gix-submodule v0.26.0, gix-worktree-state v0.26.0, gix v0.79.0, safety bump 35 crates ([`d66ac10`](https://github.com/GitoxideLabs/gitoxide/commit/d66ac1057a5b7bfb608d4e6be585c69fb692bfee))
     - Merge pull request #2420 from cruessler/remove-imara-diff-0-1-in-gix-blame ([`28fbeb8`](https://github.com/GitoxideLabs/gitoxide/commit/28fbeb86a9b82b3eb69b6e3618e286b2507204eb))
@@ -56,7 +760,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <csr-read-only-do-not-edit/>
 
  - 25 commits contributed to the release over the course of 21 calendar days.
- - 21 days passed between releases.
+ - 22 days passed between releases.
  - 4 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 2 unique issues were worked on: [#2363](https://github.com/GitoxideLabs/gitoxide/issues/2363), [#2385](https://github.com/GitoxideLabs/gitoxide/issues/2385)
 
@@ -126,17 +830,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <csr-id-ab3cce472efc4f6469d99a0d3a425d58ac2140b9/>
 <csr-id-c26efb9e733cb33a38ef885eded915e17e61bd9c/>
 
-### Refactor (BREAKING)
-
- - <csr-id-ab3cce472efc4f6469d99a0d3a425d58ac2140b9/> split async and blocking implementations for Handshake::fetch_or_extract_refmap()
- - <csr-id-c26efb9e733cb33a38ef885eded915e17e61bd9c/> split Handshake::fetch_or_extract_refmap()
-
 ### Commit Statistics
 
 <csr-read-only-do-not-edit/>
 
  - 9 commits contributed to the release.
- - 29 days passed between releases.
+ - 30 days passed between releases.
  - 2 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -173,29 +872,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
  - <csr-id-0ed01645e2284f86e1afaf1486f08cad3243ed76/> add `Repository::set_workdir()`.
    Force this repository instance to use the given worktree directory.
 
-### Other
-
- - <csr-id-6f469a6fea59c88e6c69a5f94b0bc8a5977cb75b/> Remove `doc_auto_cfg` feature to fix docs.rs documentation.
-   It is part of `doc_cfg` feature since https://github.com/rust-lang/rust/pull/138907
-   
-   This fixes the docs.rs build
-
 ### Bug Fixes (BREAKING)
 
  - <csr-id-c2050d0ec74e2c2d1d70b68e57bbb79e196796b9/> make gix-transport I/O mode features additive
-
-### Refactor (BREAKING)
-
- - <csr-id-36c2be80e61a7a0ef637a5385e1960de13261984/> simplify gix-protocol handshake API by avoiding duplicates that remove the `server` parameter.
- - <csr-id-19a005135b91641a19a3a70fd714985ce1203333/> hoist handshake ref handling out of transport code
- - <csr-id-37ab03687a940c89131141b882e5ef1a7fef85be/> store fetch refspecs in Options
- - <csr-id-f05dfab881481de5de1d23e3266cad9c069f59c5/> flatten RefMap::new() arguments
 
 ### Commit Statistics
 
 <csr-read-only-do-not-edit/>
 
  - 28 commits contributed to the release.
+ - 31 days passed between releases.
  - 9 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 1 unique issue was worked on: [#2198](https://github.com/GitoxideLabs/gitoxide/issues/2198)
 
@@ -328,7 +1014,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <csr-read-only-do-not-edit/>
 
  - 27 commits contributed to the release over the course of 79 calendar days.
- - 79 days passed between releases.
+ - 80 days passed between releases.
  - 4 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -381,6 +1067,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <csr-read-only-do-not-edit/>
 
  - 3 commits contributed to the release.
+ - 1 day passed between releases.
  - 0 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -421,6 +1108,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <csr-read-only-do-not-edit/>
 
  - 22 commits contributed to the release.
+ - 21 days passed between releases.
  - 2 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -480,29 +1168,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
  - <csr-id-76b7ec6951ba1b3829903ecbba2ddde836afbc20/> use ToGitUnlessBinaryToTextIsPresent
  - <csr-id-dbb15328d7b26aaa51ceadcd5a8cb021155023b3/> add first 'debug' version of `gix diff file`
 
-### Refactor
-
- - <csr-id-d535dbc966fe5e7adc7ab81ee18e840dffaf361f/> use UnifiedDiff instead of UnifiedDiffBuilder
- - <csr-id-dd366a52d46078729a6e36468211b97c92c2921d/> use revspecs for revision and path
-
-### Bug Fixes
-
- - <csr-id-b07f907ba2e01849744c72df35dac57b624f2f85/> Adapt to changes in gix-actor
-   Use the committer date and author date that are now backed by bytes and
-   interpret these bytes into a `gix_date::Time` on demand.
- - <csr-id-77a3a1b85521ec87495a73151dd422e2cde49f99/> Use less ambiguous "kB" for SI kilobyte
-   `gix free pack verify --statistics` formerly used "KB" for
-   kilobytes (i.e., SI decimal kilobytes, units of 1000 bytes). This
-   was somewhat ambiguous because it is occasionally also used for
-   kibibytes (i.e., IEC binary kibibytes, units of 1024 bytes).
-   
-   Kilobytes and kibibytes can be more precisely distinguished by
-   using kB for kilobytes (since "k" is the SI prefix for "kilo") and
-   KiB for kibibytes (since decimal kilobytes are never written KiB).
-   
-   This adapts `gitoxide-core` to changes in `bytesize` and, in so
-   doing, allows the SI unit symbol "kB" to be used.
-
 ### Changed (BREAKING)
 
  - <csr-id-54e57649f0e0b15c0bd1d3233e41524cb91a8cb9/> adjust hash verification return types for the common interface
@@ -516,6 +1181,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <csr-read-only-do-not-edit/>
 
  - 28 commits contributed to the release.
+ - 76 days passed between releases.
  - 7 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -728,6 +1394,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <csr-read-only-do-not-edit/>
 
  - 19 commits contributed to the release.
+ - 33 days passed between releases.
  - 4 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -778,41 +1445,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
    For now it only supports the standard merge-base, but more derivatives
    can be added easily on demand.
 
-### Other
-
- - <csr-id-64ff0a77062d35add1a2dd422bb61075647d1a36/> Update gitoxide repository URLs
-   This updates `Byron/gitoxide` URLs to `GitoxideLabs/gitoxide` in:
-   
-   - Markdown documentation, except changelogs and other such files
-     where such changes should not be made.
-   
-   - Documentation comments (in .rs files).
-   
-   - Manifest (.toml) files, for the value of the `repository` key.
-   
-   - The comments appearing at the top of a sample hook that contains
-     a repository URL as an example.
-   
-   When making these changes, I also allowed my editor to remove
-   trailing whitespace in any lines in files already being edited
-   (since, in this case, there was no disadvantage to allowing this).
-   
-   The gitoxide repository URL changed when the repository was moved
-   into the recently created GitHub organization `GitoxideLabs`, as
-   detailed in #1406. Please note that, although I believe updating
-   the URLs to their new canonical values is useful, this is not
-   needed to fix any broken links, since `Byron/gitoxide` URLs
-   redirect (and hopefully will always redirect) to the coresponding
-   `GitoxideLabs/gitoxide` URLs.
-   
-   While this change should not break any URLs, some affected URLs
-   were already broken. This updates them, but they are still broken.
-   They will be fixed in a subsequent commit.
-   
-   This also does not update `Byron/gitoxide` URLs in test fixtures
-   or test cases, nor in the `Makefile`. (It may make sense to change
-   some of those too, but it is not really a documentation change.)
-
 ### Bug Fixes (BREAKING)
 
  - <csr-id-17573779688e755a786546d5e42ab533088cd726/> remove all workspace dependencies
@@ -824,18 +1456,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
    
    We declare this breaking to enforce a proper re-release.
 
-### Refactor (BREAKING)
-
- - <csr-id-45b71554f6437fbfe3ead020ff182f77cd57e47f/> Use the new `tree_with_rewrites` plumbing implementation.
-   This merges `object::tree::diff::change::Event` into `object::tree::diff::Change`
-   as well.
-
 ### Commit Statistics
 
 <csr-read-only-do-not-edit/>
 
  - 31 commits contributed to the release over the course of 60 calendar days.
- - 60 days passed between releases.
+ - 61 days passed between releases.
  - 8 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -968,7 +1594,7 @@ A maintenance release without user-facing changes.
 <csr-read-only-do-not-edit/>
 
  - 4 commits contributed to the release.
- - 1 day passed between releases.
+ - 2 days passed between releases.
  - 2 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 1 unique issue was worked on: [#1466](https://github.com/GitoxideLabs/gitoxide/issues/1466)
 
@@ -1075,7 +1701,7 @@ A maintenance release without user-facing changes.
 <csr-read-only-do-not-edit/>
 
  - 8 commits contributed to the release over the course of 10 calendar days.
- - 38 days passed between releases.
+ - 39 days passed between releases.
  - 1 commit was understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -1132,6 +1758,7 @@ A maintenance release without user-facing changes.
 <csr-read-only-do-not-edit/>
 
  - 28 commits contributed to the release.
+ - 48 days passed between releases.
  - 7 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 1 unique issue was worked on: [#1330](https://github.com/GitoxideLabs/gitoxide/issues/1330)
 
@@ -1253,7 +1880,7 @@ A maintenance release without user-facing changes.
 <csr-read-only-do-not-edit/>
 
  - 15 commits contributed to the release over the course of 21 calendar days.
- - 22 days passed between releases.
+ - 23 days passed between releases.
  - 3 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 2 unique issues were worked on: [#1172](https://github.com/GitoxideLabs/gitoxide/issues/1172), [#1177](https://github.com/GitoxideLabs/gitoxide/issues/1177)
 
@@ -1318,6 +1945,7 @@ A maintenance release without user-facing changes.
 <csr-read-only-do-not-edit/>
 
  - 32 commits contributed to the release.
+ - 54 days passed between releases.
  - 6 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -1378,6 +2006,7 @@ A maintenance release without user-facing changes.
 <csr-read-only-do-not-edit/>
 
  - 4 commits contributed to the release.
+ - 1 day passed between releases.
  - 1 commit was understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -1486,12 +2115,6 @@ A maintenance release without user-facing changes.
    
    - https://github.com/NixOS/nixpkgs/issues/253911
 
-### Chore (BREAKING)
-
- - <csr-id-ed327f6163f54756e58c20f86a563a97efb256ca/> update to the latest `prodash`
-   It makes proper usage of `Progress` types easier and allows them to be used
-   as `dyn` traits as well.
-
 ### Bug Fixes (BREAKING)
 
  - <csr-id-072ee32f693a31161cd6a843da6582d13efbb20b/> use `dyn` trait where possible.
@@ -1567,7 +2190,7 @@ A maintenance release without user-facing changes.
 <csr-read-only-do-not-edit/>
 
  - 27 commits contributed to the release over the course of 29 calendar days.
- - 30 days passed between releases.
+ - 31 days passed between releases.
  - 5 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -1663,10 +2286,6 @@ A maintenance release without user-facing changes.
 
 <csr-id-bcad5c22049d56a25ef69d6c7a3344e78f9a1d4d/>
 
-### Chore
-
- - <csr-id-bcad5c22049d56a25ef69d6c7a3344e78f9a1d4d/> Add `clippy::redundant-closure-for-method-calls` lint
-
 ### New Features
 
  - <csr-id-c494cfd6f80cf273107c626d0f2cbe054db378ee/> `gix --trace` to also print tree-like instrumentation
@@ -1756,10 +2375,6 @@ A maintenance release without user-facing changes.
 
 <csr-id-dbc6cbb4363c2532f81b0bd6e351c4577bb9e9a3/>
 
-### Chore
-
- - <csr-id-dbc6cbb4363c2532f81b0bd6e351c4577bb9e9a3/> inline format args
-
 ### New Features
 
  - <csr-id-042f2e1388236e3e50b2b148afb28d59803396b5/> `gix index entries` now works on bare repositories.
@@ -1790,7 +2405,7 @@ A maintenance release without user-facing changes.
 <csr-read-only-do-not-edit/>
 
  - 42 commits contributed to the release over the course of 40 calendar days.
- - 40 days passed between releases.
+ - 41 days passed between releases.
  - 10 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -1916,6 +2531,7 @@ A maintenance release without user-facing changes.
 <csr-read-only-do-not-edit/>
 
  - 44 commits contributed to the release.
+ - 62 days passed between releases.
  - 10 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 2 unique issues were worked on: [#792](https://github.com/GitoxideLabs/gitoxide/issues/792), [#814](https://github.com/GitoxideLabs/gitoxide/issues/814)
 
@@ -2030,7 +2646,7 @@ A maintenance release without user-facing changes.
 <csr-read-only-do-not-edit/>
 
  - 47 commits contributed to the release.
- - 7 days passed between releases.
+ - 8 days passed between releases.
  - 0 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -2172,7 +2788,7 @@ A maintenance release without user-facing changes.
 <csr-read-only-do-not-edit/>
 
  - 18 commits contributed to the release over the course of 30 calendar days.
- - 30 days passed between releases.
+ - 31 days passed between releases.
  - 3 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -2251,7 +2867,7 @@ A maintenance release without user-facing changes.
 <csr-read-only-do-not-edit/>
 
  - 14 commits contributed to the release over the course of 8 calendar days.
- - 10 days passed between releases.
+ - 11 days passed between releases.
  - 1 commit was understood as [conventional](https://www.conventionalcommits.org).
  - 1 unique issue was worked on: [#591](https://github.com/GitoxideLabs/gitoxide/issues/591)
 
@@ -2323,6 +2939,7 @@ A maintenance release without user-facing changes.
 <csr-read-only-do-not-edit/>
 
  - 82 commits contributed to the release.
+ - 47 days passed between releases.
  - 8 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 3 unique issues were worked on: [#450](https://github.com/GitoxideLabs/gitoxide/issues/450), [#536](https://github.com/GitoxideLabs/gitoxide/issues/536), [#XXX](https://github.com/GitoxideLabs/gitoxide/issues/XXX)
 
@@ -2547,10 +3164,6 @@ A maintenance release without user-facing changes.
 
 <csr-id-f7f136dbe4f86e7dee1d54835c420ec07c96cd78/>
 
-### Chore
-
- - <csr-id-f7f136dbe4f86e7dee1d54835c420ec07c96cd78/> uniformize deny attributes
-
 ### New Features
 
  - <csr-id-5d6d5ca305615568dfedbcc10ea86294c0a0472d/> `gix remote refs` to list all remote references of a suitable remote.
@@ -2572,7 +3185,7 @@ A maintenance release without user-facing changes.
 <csr-read-only-do-not-edit/>
 
  - 20 commits contributed to the release over the course of 5 calendar days.
- - 6 days passed between releases.
+ - 7 days passed between releases.
  - 5 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 1 unique issue was worked on: [#450](https://github.com/GitoxideLabs/gitoxide/issues/450)
 
@@ -2898,23 +3511,6 @@ A maintenance release without user-facing changes.
 <csr-id-2290d006705ff47ad780b009fe58ee422b3285af/>
 <csr-id-424c9b3a2b467f5a1e339700257cd4ab72e2e692/>
 
-### Refactor (BREAKING)
-
- - <csr-id-bbc6efeceb26050973e1425e68a52e51b9df4572/> clarify different repository types much better
- - <csr-id-4d2d433e7e98ac42db858688edac06e68ee4d10d/> Remove light* features, add 'lean-async' in its place; remove termion support
- - <csr-id-ebc7f47708a63c3df4415ba0e702660d976dfb3e/> remove pack-cache from `Find::try_find(…)`
-   With the new architecture this can be an implementation detail without
-   forcing it to be Sync.
- - <csr-id-2290d006705ff47ad780b009fe58ee422b3285af/> move gix_pack::data::Object to gix_object::Data, massively alter gix_odb::Find trait
-   This will break a lot, but has to happen to prepare these traits for the
-   next generation of object databases.
-
-### Other
-
- - <csr-id-424c9b3a2b467f5a1e339700257cd4ab72e2e692/> Try to make Handle usable for pack creation
-   It's nearly there, but for some reason the boxed dyn traits don't get to
-   be Send even though it's specified.
-
 ### Bug Fixes
 
  - <csr-id-84ade1d23060f10bf6c8529f8f693d06660b4f4e/> Allow resolution of in-pack ref-deltas
@@ -2980,7 +3576,7 @@ A maintenance release without user-facing changes.
 <csr-read-only-do-not-edit/>
 
  - 144 commits contributed to the release over the course of 156 calendar days.
- - 165 days passed between releases.
+ - 166 days passed between releases.
  - 26 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 14 unique issues were worked on: [#215](https://github.com/GitoxideLabs/gitoxide/issues/215), [#247](https://github.com/GitoxideLabs/gitoxide/issues/247), [#263](https://github.com/GitoxideLabs/gitoxide/issues/263), [#266](https://github.com/GitoxideLabs/gitoxide/issues/266), [#279](https://github.com/GitoxideLabs/gitoxide/issues/279), [#287](https://github.com/GitoxideLabs/gitoxide/issues/287), [#293](https://github.com/GitoxideLabs/gitoxide/issues/293), [#298](https://github.com/GitoxideLabs/gitoxide/issues/298), [#301](https://github.com/GitoxideLabs/gitoxide/issues/301), [#329](https://github.com/GitoxideLabs/gitoxide/issues/329), [#333](https://github.com/GitoxideLabs/gitoxide/issues/333), [#364](https://github.com/GitoxideLabs/gitoxide/issues/364), [#366](https://github.com/GitoxideLabs/gitoxide/issues/366), [#67](https://github.com/GitoxideLabs/gitoxide/issues/67)
 
@@ -3160,7 +3756,7 @@ A maintenance release to properly dealing with previously breaking changes in `g
 <csr-read-only-do-not-edit/>
 
  - 3 commits contributed to the release.
- - 3 days passed between releases.
+ - 4 days passed between releases.
  - 0 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 1 unique issue was worked on: [#222](https://github.com/GitoxideLabs/gitoxide/issues/222)
 
@@ -3191,24 +3787,6 @@ A maintenance release to properly dealing with previously breaking changes in `g
 <csr-id-0456312dddbd9ffd01e29c6705bb794cb1abb414/>
 
 This is a maintenance release signalling breaking changes because some of the crates it depends on have breaking changes.
-
-### Refactor
-
- - <csr-id-71c628d46088ab455b54eb2330d24dcff96c911d/> Use 'cache::Object' trait where it matters
- - <csr-id-8fe461281842b58aa11437445637c6e587bedd63/> split data::output::count::objects into files
-
-### Other
-
- - <csr-id-54a64a588ff72515451a3d0343306ac4abe1cb35/> try to create persistent Easy iterator, but can't make it Send…
-   …which is fair as it contains borrowed RefCells, which really would have
-   to be owned to work for this, which would in turn require the Ancestor's
-   struct to be kind of self-referential
- - <csr-id-66292fd1076c2c9db4694c5ded09799a0be11a03/> set package cache via RepositoryAccessExt
- - <csr-id-7d2b6b66e09ff39727fccd68d190679b52d90126/> prepare for configurable pack cache
-
-### Chore
-
- - <csr-id-0456312dddbd9ffd01e29c6705bb794cb1abb414/> fix immediate dereference warning
 
 ### New Features
 
@@ -3292,7 +3870,7 @@ This is a maintenance release signalling breaking changes because some of the cr
 <csr-read-only-do-not-edit/>
 
  - 8 commits contributed to the release over the course of 8 calendar days.
- - 8 days passed between releases.
+ - 9 days passed between releases.
  - 0 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -3402,7 +3980,7 @@ This is a maintenance release signalling breaking changes because some of the cr
 <csr-read-only-do-not-edit/>
 
  - 2 commits contributed to the release over the course of 3 calendar days.
- - 4 days passed between releases.
+ - 5 days passed between releases.
  - 0 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -3420,10 +3998,6 @@ This is a maintenance release signalling breaking changes because some of the cr
 ## v0.10.0 (2021-08-10)
 
 <csr-id-8802fa7e28ea8fcd3ef8dbca84be4e1f55eca665/>
-
-### Other
-
- - <csr-id-8802fa7e28ea8fcd3ef8dbca84be4e1f55eca665/> this version fails to detect any git repo
 
 ### Commit Statistics
 
@@ -3602,18 +4176,12 @@ This is a maintenance release signalling breaking changes because some of the cr
 <csr-id-747a13e9a1fe5200c53055dd961507c9fef667e1/>
 <csr-id-e7971a924df0ab958d56239f48eaafda30f15159/>
 
-### Other
-
- - <csr-id-747a13e9a1fe5200c53055dd961507c9fef667e1/> :borrowed::Object => gix-odb::data::Object
- - <csr-id-e7971a924df0ab958d56239f48eaafda30f15159/> pack-verify: be explicit about pack-cache choice in relation to algorithm
-   Only when doing less-memory the pack cache is even used.
-
 ### Commit Statistics
 
 <csr-read-only-do-not-edit/>
 
  - 34 commits contributed to the release over the course of 27 calendar days.
- - 30 days passed between releases.
+ - 31 days passed between releases.
  - 2 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -3670,15 +4238,6 @@ This is a maintenance release signalling breaking changes because some of the cr
 
 <csr-id-b85a3891a08248aaa0d7ec429940c9793a2ddcd1/>
 <csr-id-0f4265fa93060f47637ac7e9bd286d4918b3db62/>
-
-### Other
-
- - <csr-id-b85a3891a08248aaa0d7ec429940c9793a2ddcd1/> make it work with bare and non-bare repositories
-   This was previously handled correctly by `git` itself, and unfortunately
-   the journey tests don't cover this particular case.
-   
-   Maybe something to improve at some point, note taken.
- - <csr-id-0f4265fa93060f47637ac7e9bd286d4918b3db62/> Make client state meaning explicit
 
 ### Commit Statistics
 
@@ -3769,6 +4328,7 @@ This is a maintenance release signalling breaking changes because some of the cr
 <csr-read-only-do-not-edit/>
 
  - 2 commits contributed to the release.
+ - 1 day passed between releases.
  - 0 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -3857,7 +4417,7 @@ This is a maintenance release signalling breaking changes because some of the cr
 <csr-read-only-do-not-edit/>
 
  - 33 commits contributed to the release over the course of 28 calendar days.
- - 30 days passed between releases.
+ - 31 days passed between releases.
  - 0 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -3999,10 +4559,6 @@ This is a maintenance release signalling breaking changes because some of the cr
 ## v0.1.0 (2020-07-12)
 
 <csr-id-91c8fc1f0c50af55d7cb233bbe813c6d12fe11bc/>
-
-### Other
-
- - <csr-id-91c8fc1f0c50af55d7cb233bbe813c6d12fe11bc/> get rid of failure crate in favor of quick-error
 
 ### Commit Statistics
 

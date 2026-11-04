@@ -5,7 +5,8 @@ use std::{
     sync::Arc,
 };
 
-use gix_features::io::pipe;
+use gix_error::{Class, Error, ErrorExt, Result, ResultExt, message};
+use gix_utils::io::pipe;
 use parking_lot::Mutex;
 
 use crate::client::blocking_io::http::{
@@ -16,34 +17,19 @@ use crate::client::blocking_io::http::{
     traits::PostBodyDataKind,
 };
 
-/// The error returned by the 'remote' helper, a purely internal construct to perform http requests.
-#[derive(Debug, thiserror::Error)]
-#[expect(missing_docs)]
-pub enum Error {
-    #[error(transparent)]
-    Reqwest(#[from] reqwest::Error),
-    #[error("Could not finish reading all data to post to the remote")]
-    ReadPostBody(#[from] std::io::Error),
-    #[error("Request configuration failed")]
-    ConfigureRequest(#[from] Box<dyn std::error::Error + Send + Sync + 'static>),
-    #[error(transparent)]
-    Redirect(#[from] redirect::Error),
-    /// fu4 (rolfdb fork): reading the `ssl_ca_info` CA bundle failed.
-    #[error("Could not read CA info file at '{}'", path.display())]
-    ReadCaInfo {
-        path: std::path::PathBuf,
-        source: std::io::Error,
-    },
-}
-
-impl crate::IsSpuriousError for Error {
-    fn is_spurious(&self) -> bool {
-        match self {
-            Error::Reqwest(err) => {
-                err.is_timeout() || err.is_connect() || err.status().is_some_and(|status| status.is_server_error())
-            }
-            _ => false,
+fn classify_reqwest(err: reqwest::Error) -> Error {
+    let class = match err.status() {
+        Some(reqwest::StatusCode::FORBIDDEN) => Some(Class::PermissionDenied),
+        Some(reqwest::StatusCode::CONFLICT) => Some(Class::Conflict),
+        Some(reqwest::StatusCode::NOT_IMPLEMENTED) => Some(Class::Unsupported),
+        _ if err.is_timeout() || err.is_connect() || err.status().is_some_and(|status| status.is_server_error()) => {
+            Some(Class::Retryable)
         }
+        _ => None,
+    };
+    match class {
+        Some(class) => Error::from_error(gix_error::ClassificationMarker::with_source(class, err)),
+        None => Error::from_error(err),
     }
 }
 
@@ -59,7 +45,7 @@ impl Default for Remote {
         let (res_send, res_recv) = std::sync::mpsc::sync_channel(0);
         let redirected_base_url_shared = Arc::new(Mutex::new(None));
         let redirected_base_url_shared_for_field = redirected_base_url_shared.clone();
-        let handle = std::thread::spawn(move || -> Result<(), Error> {
+        let handle = std::thread::spawn(gix_trace::in_thread(move || -> Result {
             let mut follow = None;
             let redirect_action = Arc::new(Mutex::new(RedirectAction::Stop));
             let redirect_tail = Arc::new(Mutex::new(String::new()));
@@ -83,10 +69,13 @@ impl Default for Remote {
                 config,
             } in req_recv
             {
-                // fu4 (rolfdb fork): (re)build the client when the TLS-trust options change.
+                // (Re)build the client on first use, and whenever the fu4 TLS-trust options change.
                 let tls_key: TlsTrustKey = (config.ssl_ca_info.clone(), config.ssl_verify, config.ssl_version);
                 if !client_and_tls.as_ref().is_some_and(|(_, key)| key == &tls_key) {
-                    client_and_tls = Some((build_client(&redirect_action, &redirect_tail, &tls_key)?, tls_key));
+                    client_and_tls = Some((
+                        build_client(&redirect_action, &redirect_tail, &config, &tls_key)?,
+                        tls_key,
+                    ));
                 }
                 let client = &client_and_tls.as_ref().expect("client built above").0;
                 let redirected_base_url = redirected_base_url_shared.lock().clone();
@@ -116,21 +105,25 @@ impl Default for Remote {
                 req_builder = match upload_body_kind {
                     Some(PostBodyDataKind::BoundedAndFitsIntoMemory) => {
                         let mut buf = Vec::<u8>::with_capacity(512);
-                        post_body_rx.read_to_end(&mut buf)?;
+                        post_body_rx
+                            .read_to_end(&mut buf)
+                            .or_raise(|| message("Could not finish reading all data to post to the remote"))?;
                         req_builder.body(buf)
                     }
                     Some(PostBodyDataKind::Unbounded) => req_builder.body(reqwest::blocking::Body::new(post_body_rx)),
                     None => req_builder,
                 };
-                let mut req = req_builder.build()?;
+                let mut req = req_builder
+                    .build()
+                    .map_err(classify_reqwest)
+                    .or_raise(|| message("Could not build HTTP request"))?;
                 let mut has_configure_request = false;
-                if let Some(ref mut request_options) = config.backend.as_ref().and_then(|backend| backend.lock().ok()) {
-                    if let Some(options) = request_options.downcast_mut::<super::Options>() {
-                        if let Some(configure_request) = &mut options.configure_request {
-                            has_configure_request = true;
-                            configure_request(&mut req)?;
-                        }
-                    }
+                if let Some(ref mut request_options) = config.backend.as_ref().and_then(|backend| backend.lock().ok())
+                    && let Some(options) = request_options.downcast_mut::<super::Options>()
+                    && let Some(configure_request) = &mut options.configure_request
+                {
+                    has_configure_request = true;
+                    configure_request(&mut req).or_raise(|| message("Request configuration failed"))?;
                 }
 
                 let follow = follow.get_or_insert(config.follow_redirects);
@@ -146,35 +139,50 @@ impl Default for Remote {
                     *follow = FollowRedirects::None;
                 }
 
-                let mut res = match client
-                    .execute(req)
-                    .and_then(reqwest::blocking::Response::error_for_status)
-                {
+                let mut www_authenticate = Vec::new();
+                let mut res = match client.execute(req).and_then(|res| {
+                    if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+                        www_authenticate = res
+                            .headers()
+                            .get_all(reqwest::header::WWW_AUTHENTICATE)
+                            .iter()
+                            .map(|value| value.as_bytes().into())
+                            .collect();
+                    }
+                    res.error_for_status()
+                }) {
                     Ok(res) => res,
                     Err(err) => {
                         // `error_for_status()` preserves the final URL for HTTP error responses. Capture it here so
                         // authentication retries after redirected 401 responses use the redirected base URL.
-                        if let Some(actual_url) = err.url().map(reqwest::Url::as_str) {
-                            if actual_url != effective_url {
-                                let new_base_url = redirect::base_url(actual_url, &base_url, url.clone())?;
-                                *redirected_base_url_shared.lock() = Some(new_base_url);
-                            }
+                        if let Some(actual_url) = err.url().map(reqwest::Url::as_str)
+                            && actual_url != effective_url
+                        {
+                            let new_base_url = redirect::base_url(actual_url, &base_url, url.clone())?;
+                            *redirected_base_url_shared.lock() = Some(new_base_url);
                         }
                         let err = match err.status() {
+                            Some(reqwest::StatusCode::UNAUTHORIZED) => std::io::Error::new(
+                                std::io::ErrorKind::PermissionDenied,
+                                crate::client::AuthenticationRequired { www_authenticate },
+                            ),
                             Some(status) => {
-                                let kind = if status == reqwest::StatusCode::UNAUTHORIZED {
-                                    std::io::ErrorKind::PermissionDenied
-                                } else if status.is_server_error() {
+                                let kind = if status.is_server_error() && status != reqwest::StatusCode::NOT_IMPLEMENTED
+                                {
                                     std::io::ErrorKind::ConnectionAborted
                                 } else {
                                     std::io::ErrorKind::Other
                                 };
-                                std::io::Error::new(kind, format!("Received HTTP status {}", status.as_str()))
+                                std::io::Error::new(
+                                    kind,
+                                    classify_reqwest(err)
+                                        .and_raise(message!("Received HTTP status {}", status.as_str())),
+                                )
                             }
                             // Preserve the `reqwest::Error` as the source so the underlying cause -- e.g. a
                             // connection or TLS failure -- isn't lost. It was previously stringified, which
                             // dead-ended `source()` and hid the real reason a request failed. See #2140.
-                            None => std::io::Error::other(err),
+                            None => std::io::Error::other(classify_reqwest(err)),
                         };
                         headers_tx.channel.send(Err(err)).ok();
                         continue;
@@ -213,7 +221,7 @@ impl Default for Remote {
                 }
             }
             Ok(())
-        });
+        }));
 
         Remote {
             handle: Some(handle),
@@ -227,7 +235,7 @@ impl Default for Remote {
 
 /// utilities
 impl Remote {
-    fn restore_thread_after_failure(&mut self) -> http::Error {
+    fn restore_thread_after_failure(&mut self) -> Error {
         let err_that_brought_thread_down = self
             .handle
             .take()
@@ -235,10 +243,10 @@ impl Remote {
             .join()
             .expect("handler thread should never panic")
             .expect_err("something should have gone wrong with curl (we join on error only)");
+        let config = std::mem::take(&mut self.config);
         *self = Remote::default();
-        http::Error::InitHttpClient {
-            source: Box::new(err_that_brought_thread_down),
-        }
+        self.config = config;
+        err_that_brought_thread_down.and_raise(message("Could not initialize the http client"))
     }
 
     fn make_request(
@@ -247,7 +255,7 @@ impl Remote {
         base_url: &str,
         headers: impl IntoIterator<Item = impl AsRef<str>>,
         upload_body_kind: Option<PostBodyDataKind>,
-    ) -> Result<http::PostResponse<pipe::Reader, pipe::Reader, pipe::Writer>, http::Error> {
+    ) -> Result<http::PostResponse<pipe::Reader, pipe::Reader, pipe::Writer>> {
         let mut header_map = reqwest::header::HeaderMap::new();
         for header_line in headers {
             insert_header(&mut header_map, header_line.as_ref());
@@ -317,7 +325,7 @@ impl http::Http for Remote {
         url: &str,
         base_url: &str,
         headers: impl IntoIterator<Item = impl AsRef<str>>,
-    ) -> Result<http::GetResponse<Self::Headers, Self::ResponseBody>, http::Error> {
+    ) -> Result<http::GetResponse<Self::Headers, Self::ResponseBody>> {
         self.make_request(url, base_url, headers, None).map(Into::into)
     }
 
@@ -327,11 +335,11 @@ impl http::Http for Remote {
         base_url: &str,
         headers: impl IntoIterator<Item = impl AsRef<str>>,
         post_body_kind: PostBodyDataKind,
-    ) -> Result<http::PostResponse<Self::Headers, Self::ResponseBody, Self::PostBody>, http::Error> {
+    ) -> Result<http::PostResponse<Self::Headers, Self::ResponseBody, Self::PostBody>> {
         self.make_request(url, base_url, headers, Some(post_body_kind))
     }
 
-    fn configure(&mut self, config: &dyn Any) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    fn configure(&mut self, config: &dyn Any) -> Result {
         if let Some(config) = config.downcast_ref::<http::Options>() {
             self.config = config.clone();
         }
@@ -374,15 +382,28 @@ type TlsTrustKey = (
 fn build_client(
     redirect_action: &Arc<Mutex<RedirectAction>>,
     redirect_tail: &Arc<Mutex<String>>,
+    config: &http::Options,
     tls: &TlsTrustKey,
-) -> Result<reqwest::blocking::Client, Error> {
-    // The builder chain is copied verbatim from the upstream eager build (its redirect state machine
-    // reads the shared `redirect_action`/`redirect_tail` the request loop mutates per request); fu4
-    // only splices in `apply_tls_options` before `.build()`. Kept in lockstep with the upstream
-    // closure — if this drifts, re-copy it from reqwest/remote.rs's `Default for Remote`.
-    let builder = reqwest::blocking::ClientBuilder::new()
+) -> Result<reqwest::blocking::Client> {
+    // Order matters: the fu4 TLS-trust options derived from Git configuration come first, then the
+    // application-supplied `configure_client` callback may refine the builder, and finally Git's redirect
+    // policy is installed so the callback cannot replace it. The redirect state machine reads the shared
+    // `redirect_action`/`redirect_tail` the request loop mutates per request.
+    let mut builder = reqwest::blocking::ClientBuilder::new()
         .connect_timeout(std::time::Duration::from_secs(20))
-        .http1_title_case_headers()
+        .http1_title_case_headers();
+    builder = apply_tls_options(builder, tls)?;
+    if let Some(backend) = config.backend.as_ref() {
+        let mut backend = backend
+            .lock()
+            .map_err(|_| message("HTTP backend configuration lock is poisoned").raise())?;
+        if let Some(options) = backend.downcast_mut::<super::Options>()
+            && let Some(configure_client) = options.configure_client.as_mut()
+        {
+            builder = configure_client(builder).or_raise(|| message("HTTP client configuration failed"))?;
+        }
+    }
+    builder
         .redirect(reqwest::redirect::Policy::custom({
             let redirect_action = redirect_action.clone();
             let redirect_tail = redirect_tail.clone();
@@ -424,9 +445,10 @@ fn build_client(
                     RedirectAction::Stop => attempt.stop(),
                 }
             }
-        }));
-    let builder = apply_tls_options(builder, tls)?;
-    Ok(builder.build()?)
+        }))
+        .build()
+        .map_err(classify_reqwest)
+        .or_raise(|| message("Could not initialize HTTP client"))
 }
 
 #[cfg(any(
@@ -437,24 +459,25 @@ fn build_client(
 fn apply_tls_options(
     mut builder: reqwest::blocking::ClientBuilder,
     (ssl_ca_info, ssl_verify, ssl_version): &TlsTrustKey,
-) -> Result<reqwest::blocking::ClientBuilder, Error> {
+) -> Result<reqwest::blocking::ClientBuilder> {
     if let Some(path) = ssl_ca_info {
-        let pem = std::fs::read(path).map_err(|source| Error::ReadCaInfo {
-            path: path.clone(),
-            source,
-        })?;
+        let pem = std::fs::read(path).or_raise(|| message!("Could not read CA info file at '{}'", path.display()))?;
         // Replace (not augment) the trust store: `http.sslCAInfo` — like curl's CAINFO — makes the
         // supplied bundle the ONLY trusted roots. `tls_certs_only` both installs it and disables
         // reqwest's built-in/native roots (reqwest 0.13.4; the older per-cert `add_root_certificate`
         // merely augmented, leaving the public CA set trusted alongside it).
-        builder = builder.tls_certs_only(reqwest::Certificate::from_pem_bundle(&pem)?);
+        builder = builder.tls_certs_only(
+            reqwest::Certificate::from_pem_bundle(&pem)
+                .map_err(classify_reqwest)
+                .or_raise(|| message!("Could not parse CA info file at '{}'", path.display()))?,
+        );
     }
     if !ssl_verify {
         builder = builder.danger_accept_invalid_certs(true);
     }
     if let Some(range) = ssl_version {
         // Fail-closed vs curl: on a rustls backend a floor below TLS 1.2 makes the `.build()` in
-        // `build_client` error (rustls speaks only 1.2/1.3), surfacing as `http::Error::InitHttpClient`
+        // `build_client` error (rustls speaks only 1.2/1.3), surfacing as an HTTP client initialization error
         // rather than connecting on a weaker protocol as curl+OpenSSL might. Deliberate — we refuse the
         // downgrade instead of silently honoring it.
         let (min, max) = range.min_max();
@@ -477,7 +500,7 @@ fn apply_tls_options(
 fn apply_tls_options(
     builder: reqwest::blocking::ClientBuilder,
     _tls: &TlsTrustKey,
-) -> Result<reqwest::blocking::ClientBuilder, Error> {
+) -> Result<reqwest::blocking::ClientBuilder> {
     Ok(builder)
 }
 

@@ -15,14 +15,7 @@ fn fixture_hash_kind() -> gix_hash::Kind {
 }
 
 fn open_odb(objects_dir: impl Into<std::path::PathBuf>) -> std::io::Result<gix_odb::Handle> {
-    gix_odb::at_opts(
-        objects_dir,
-        Vec::new(),
-        gix_odb::store::init::Options {
-            object_hash: fixture_hash_kind(),
-            ..Default::default()
-        },
-    )
+    gix_odb::at(objects_dir, fixture_hash_kind())
 }
 
 fn normalize_patch_snapshot(input: &str) -> String {
@@ -81,7 +74,8 @@ mod tree;
 mod tree_with_rewrites;
 
 mod util {
-    use gix_object::{Write, find::Error};
+    use gix_error::Result;
+    use gix_object::Write;
 
     pub type ObjectDb = gix_odb::memory::Proxy<gix_object::find::Never>;
 
@@ -90,7 +84,7 @@ mod util {
     }
 
     /// Insert `data` and return its hash. That can be used to find it again.
-    pub fn insert(db: &ObjectDb, data: &str) -> Result<gix_hash::ObjectId, Error> {
+    pub fn insert(db: &ObjectDb, data: &str) -> Result<gix_hash::ObjectId> {
         db.write_buf(gix_object::Kind::Blob, data.as_bytes())
     }
 }

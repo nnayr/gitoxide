@@ -1,3 +1,5 @@
+use gix_error::Result;
+use gix_error::{bail, validation};
 use gix_hash::ObjectId;
 use gix_object::bstr::BString;
 use smallvec::SmallVec;
@@ -7,7 +9,6 @@ use std::{
     ops::{AddAssign, Range, SubAssign},
 };
 
-use crate::Error;
 use crate::file::function::tokens_for_diffing;
 
 /// A type to represent one or more line ranges to blame in a file.
@@ -54,7 +55,7 @@ impl BlameRanges {
     ///
     /// Note that the input range is 1-based inclusive, as used by git, and
     /// the output is a zero-based `BlameRanges` instance.
-    pub fn from_one_based_inclusive_range(range: RangeInclusive<u32>) -> Result<Self, Error> {
+    pub fn from_one_based_inclusive_range(range: RangeInclusive<u32>) -> Result<Self> {
         let zero_based_range = Self::inclusive_to_zero_based_exclusive(range)?;
         Ok(Self::PartialFile(vec![zero_based_range]))
     }
@@ -65,7 +66,7 @@ impl BlameRanges {
     /// the output is a zero-based `BlameRanges` instance.
     ///
     /// If the input vector is empty, the result will be `WholeFile`.
-    pub fn from_one_based_inclusive_ranges(ranges: Vec<RangeInclusive<u32>>) -> Result<Self, Error> {
+    pub fn from_one_based_inclusive_ranges(ranges: Vec<RangeInclusive<u32>>) -> Result<Self> {
         if ranges.is_empty() {
             return Ok(Self::WholeFile);
         }
@@ -82,9 +83,11 @@ impl BlameRanges {
     }
 
     /// Convert a 1-based inclusive range to a 0-based exclusive range.
-    fn inclusive_to_zero_based_exclusive(range: RangeInclusive<u32>) -> Result<Range<u32>, Error> {
+    fn inclusive_to_zero_based_exclusive(range: RangeInclusive<u32>) -> Result<Range<u32>> {
         if range.start() == &0 {
-            return Err(Error::InvalidOneBasedLineRange);
+            bail!(validation(
+                "Invalid line range was given, line range is expected to be a 1-based inclusive range in the format '<start>,<end>'"
+            ));
         }
         let start = range.start() - 1;
         let end = *range.end();
@@ -96,7 +99,7 @@ impl BlameRanges {
     /// Add a single range to blame.
     ///
     /// The new range will be merged with any overlapping existing ranges.
-    pub fn add_one_based_inclusive_range(&mut self, new_range: RangeInclusive<u32>) -> Result<(), Error> {
+    pub fn add_one_based_inclusive_range(&mut self, new_range: RangeInclusive<u32>) -> Result {
         let zero_based_range = Self::inclusive_to_zero_based_exclusive(new_range)?;
         self.merge_zero_based_exclusive_range(zero_based_range);
 
@@ -190,6 +193,46 @@ pub struct BlamePathEntry {
     pub parent_index: usize,
 }
 
+/// The starting point for [`file()`](crate::file()).
+pub enum Start<'a> {
+    /// Start from a specific commit.
+    Commit(ObjectId),
+    /// Start from `contents`, then continue from `first_suspect`.
+    ///
+    /// Lines that only exist in `contents` are attributed to the null id,
+    /// i.e. "not committed yet".
+    ///
+    /// It is assumed that the data in `contents` is ready to be used for diffing, in particular
+    /// that it has been run through the configured worktree filters.
+    ///
+    /// See [Pipeline::convert_to_diffable()](gix_diff::blob::Pipeline::convert_to_diffable) for
+    /// how to obtain the contents of a worktree file by running them through the configured
+    /// worktree filters.
+    Contents {
+        /// The commit to start from after it has been compared to `contents`.
+        first_suspect: ObjectId,
+        /// The contents to start the blame from, typically read from the worktree.
+        // TODO(blame): add a type so rename tracking can avoid comparing blobs with symlinks.
+        //              Blob is hard-coded in at least once place.
+        contents: std::borrow::Cow<'a, [u8]>,
+    },
+}
+
+impl std::fmt::Debug for Start<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Start::Commit(id) => f.debug_tuple("Commit").field(id).finish(),
+            Start::Contents {
+                first_suspect,
+                contents,
+            } => f
+                .debug_struct("Contents")
+                .field("first_suspect", first_suspect)
+                .field("contents_len", &contents.len())
+                .finish(),
+        }
+    }
+}
 /// The outcome of [`file()`](crate::file()).
 #[derive(Debug, Default, Clone)]
 pub struct Outcome {

@@ -30,6 +30,18 @@ fn empty_quotes_are_empty() {
 }
 
 #[test]
+fn unquoted_whitespace_after_empty_quotes_is_ignored() {
+    assert_eq!(&*normalize("\"\"  x"), "x");
+    assert_eq!(&*normalize("\"\"  \"x\""), "x");
+    assert_eq!(&*normalize("\" \"  x"), "   x", "quoted whitespace starts the value");
+    assert_eq!(
+        &*normalize(r#""  \tx""#),
+        "  \tx",
+        "quoted whitespace remains significant"
+    );
+}
+
+#[test]
 fn all_quoted_is_unquoted() {
     assert!(
         matches!(
@@ -72,7 +84,11 @@ fn quotes_are_removed_from_partially_quoted_values() {
 
 #[test]
 fn newline_tab_and_backspace_escapes_are_interpreted() {
-    assert_eq!(&*normalize(r"\n\ta\b"), "\n\t");
+    assert_eq!(
+        &*normalize(r"\n\ta\b"),
+        "\n\ta\x08",
+        "`\\b` is the backspace character (0x08), matching git, not a request to delete the preceding character"
+    );
 }
 
 #[test]

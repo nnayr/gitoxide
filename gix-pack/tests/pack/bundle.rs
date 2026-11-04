@@ -25,7 +25,7 @@ mod locate {
         use crate::{PACKS_AND_INDICES, fixture_path};
 
         #[test]
-        fn all() -> Result<(), Box<dyn std::error::Error>> {
+        fn all() -> gix_testtools::TestResult {
             for (index_path, data_path) in PACKS_AND_INDICES {
                 // both paths are equivalent
                 pack::Bundle::at(fixture_path(index_path), gix_hash::Kind::Sha1)?;
@@ -49,7 +49,7 @@ mod locate {
     }
 
     #[test]
-    fn blob() -> Result<(), Box<dyn std::error::Error>> {
+    fn blob() -> gix_testtools::TestResult {
         let mut out = Vec::new();
         let obj = locate("bd46bb3f5bb4ca5431770c4fde0735fb89d382f3", &mut out);
 
@@ -65,7 +65,7 @@ mod locate {
     }
 
     #[test]
-    fn tree() -> Result<(), Box<dyn std::error::Error>> {
+    fn tree() -> gix_testtools::TestResult {
         let mut out = Vec::new();
         let obj = locate("e90926b07092bccb7bf7da445fae6ffdfacf3eae", &mut out);
 
@@ -75,7 +75,7 @@ mod locate {
     }
 
     #[test]
-    fn commit() -> Result<(), Box<dyn std::error::Error>> {
+    fn commit() -> gix_testtools::TestResult {
         let mut out = Vec::new();
         let obj = locate("779c5451ba9fe210ffd1f55db202e55f51acecac", &mut out);
 
@@ -87,15 +87,21 @@ mod locate {
 
 #[cfg(all(not(feature = "wasm"), feature = "streaming-input"))]
 mod write_to_directory {
-    use std::{fs, path::Path, sync::atomic::AtomicBool};
+    use crate::Result;
+    use std::{
+        fs,
+        io::{Cursor, Write},
+        path::Path,
+        sync::atomic::AtomicBool,
+    };
 
-    use gix_features::progress;
     use gix_odb::pack;
     use gix_testtools::tempfile::TempDir;
+    use gix_utils::progress;
 
-    use crate::{SMALL_PACK, SMALL_PACK_INDEX, error_chain_contains_message, fixture_path};
+    use crate::{SMALL_PACK, SMALL_PACK_INDEX, fixture_path};
 
-    fn expected_outcome() -> Result<pack::bundle::write::Outcome, Box<dyn std::error::Error>> {
+    fn expected_outcome() -> Result<pack::bundle::write::Outcome> {
         Ok(pack::bundle::write::Outcome {
             index: pack::index::write::Outcome {
                 index_version: pack::index::Version::V2,
@@ -112,7 +118,7 @@ mod write_to_directory {
     }
 
     #[test]
-    fn without_providing_one() -> Result<(), Box<dyn std::error::Error>> {
+    fn without_providing_one() -> gix_testtools::TestResult {
         let res = write_pack(None::<&Path>, SMALL_PACK)?;
         assert_eq!(res, expected_outcome()?);
         assert_eq!(
@@ -124,12 +130,14 @@ mod write_to_directory {
     }
 
     #[test]
-    fn given_a_directory() -> Result<(), Box<dyn std::error::Error>> {
+    fn given_a_directory() -> gix_testtools::TestResult {
         let dir = TempDir::new()?;
         let mut res = write_pack(Some(&dir), SMALL_PACK)?;
         let (index_path, data_path, keep_path) = (res.index_path.take(), res.data_path.take(), res.keep_path.take());
         assert_eq!(res, expected_outcome()?);
-        let mut sorted_entries = fs::read_dir(&dir)?.filter_map(Result::ok).collect::<Vec<_>>();
+        let mut sorted_entries = fs::read_dir(&dir)?
+            .filter_map(std::result::Result::ok)
+            .collect::<Vec<_>>();
         sorted_entries.sort_by_key(fs::DirEntry::file_name);
         assert_eq!(
             sorted_entries.len(),
@@ -150,8 +158,132 @@ mod write_to_directory {
         Ok(())
     }
 
+    /// A forward reference is a `REF_DELTA` stored before the object named as its base.
+    /// Unlike `OFS_DELTA`, its object ID can name an object at any position in the pack.
+    ///
+    /// Git normally writes bases first, but sends thin packs which omit bases the receiver
+    /// already has. `index-pack --fix-thin` makes such packs self-contained by appending
+    /// those bases, leaving the original deltas as forward references.
     #[test]
-    fn respects_alloc_limit_bytes() -> Result<(), Box<dyn std::error::Error>> {
+    fn in_pack_ref_deltas_with_forward_references() -> gix_testtools::TestResult {
+        for object_hash in [gix_hash::Kind::Sha1, gix_hash::Kind::Sha256] {
+            for objects in [
+                &[b"A".as_slice(), b"B".as_slice()][..],
+                &[b"A".as_slice(), b"B".as_slice(), b"C".as_slice()][..],
+            ] {
+                let pack_data = ref_delta_pack(object_hash, objects, pack::data::Version::V2)?;
+                for lookup in [None, Some(gix_object::find::Never)] {
+                    let dir = TempDir::new()?;
+                    let mut input = Cursor::new(pack_data.clone());
+                    let outcome = pack::Bundle::write_to_directory(
+                        &mut input,
+                        Some(dir.as_ref()),
+                        &mut progress::Discard,
+                        &AtomicBool::new(false),
+                        lookup,
+                        object_hash,
+                        pack::bundle::write::Options {
+                            thread_limit: None,
+                            iteration_mode: pack::data::input::Mode::Verify,
+                            index_version: pack::index::Version::V2,
+                            alloc_limit_bytes: None,
+                            compression: gix_zlib::Compression::BEST_SPEED,
+                        },
+                    )?;
+                    assert_eq!(
+                        outcome.index.num_objects as usize,
+                        objects.len(),
+                        "all in-pack objects are indexed"
+                    );
+
+                    let bundle = outcome
+                        .to_bundle()
+                        .transpose()?
+                        .expect("writing to a directory creates a bundle");
+                    let mut buf = Vec::new();
+                    for expected in objects {
+                        let id = gix_object::compute_hash(object_hash, gix_object::Kind::Blob, expected)?;
+                        let object = bundle
+                            .find(
+                                &id,
+                                &mut buf,
+                                &mut gix_zlib::Inflate::default(),
+                                &mut pack::cache::Never,
+                            )?
+                            .expect("object is indexed")
+                            .0;
+                        assert_eq!(object.kind, gix_object::Kind::Blob);
+                        assert_eq!(object.data, *expected, "the ref-delta is fully resolved");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn version_3_with_thin_pack_lookup() -> gix_testtools::TestResult {
+        let object_hash = gix_hash::Kind::Sha1;
+        let pack_data = ref_delta_pack(
+            object_hash,
+            &[b"A".as_slice(), b"B".as_slice()],
+            pack::data::Version::V3,
+        )?;
+        let outcome = pack::Bundle::write_to_directory(
+            &mut Cursor::new(pack_data),
+            Some(TempDir::new()?.as_ref()),
+            &mut progress::Discard,
+            &AtomicBool::new(false),
+            Some(gix_object::find::Never),
+            object_hash,
+            pack::bundle::write::Options {
+                iteration_mode: pack::data::input::Mode::Verify,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(
+            outcome.pack_version,
+            pack::data::Version::V3,
+            "the rewritten pack preserves its supported input version"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unresolved_ref_delta_base_is_reported() -> gix_testtools::TestResult {
+        let object_hash = gix_hash::Kind::Sha1;
+        let base_id = object_hash.null();
+        let delta = [0, 0];
+        let mut pack_data = pack::data::header::encode(pack::data::Version::V2, 1).to_vec();
+        pack::data::entry::Header::RefDelta { base_id }.write_to(delta.len() as u64, &mut pack_data)?;
+        pack_data.extend(deflate(&delta)?);
+        let mut hasher = gix_hash::hasher(object_hash);
+        hasher.update(&pack_data);
+        pack_data.extend_from_slice(hasher.try_finalize()?.as_slice());
+
+        let err = pack::Bundle::write_to_directory(
+            &mut Cursor::new(pack_data),
+            None,
+            &mut progress::Discard,
+            &AtomicBool::new(false),
+            None::<gix_object::find::Never>,
+            object_hash,
+            pack::bundle::write::Options {
+                thread_limit: None,
+                iteration_mode: pack::data::input::Mode::Verify,
+                index_version: pack::index::Version::V2,
+                alloc_limit_bytes: None,
+                compression: gix_zlib::Compression::BEST_SPEED,
+            },
+        )
+        .expect_err("a ref-delta without an in-pack or external base cannot be indexed");
+        assert!(err.is_not_found(), "an unresolved base is classified as not found");
+        insta::assert_debug_snapshot!(gix_testtools::redact_debug_snapshot(&(err), &[]), "the missing base id is retained in the error chain", @"The ref-delta base object Oid(1) could not be found");
+        Ok(())
+    }
+
+    #[test]
+    fn respects_alloc_limit_bytes() -> gix_testtools::TestResult {
         let pack_file = fs::File::open(fixture_path(SMALL_PACK))?;
         static SHOULD_INTERRUPT: AtomicBool = AtomicBool::new(false);
 
@@ -163,21 +295,18 @@ mod write_to_directory {
             &mut progress::Discard,
             &SHOULD_INTERRUPT,
             None::<gix_object::find::Never>,
+            gix_hash::Kind::Sha1,
             pack::bundle::write::Options {
                 thread_limit: None,
                 iteration_mode: pack::data::input::Mode::Verify,
                 index_version: pack::index::Version::V2,
-                object_hash: gix_hash::Kind::Sha1,
                 alloc_limit_bytes: prevent_allocation,
                 compression: gix_zlib::Compression::BEST_SPEED,
             },
         )
-        .expect_err("a zero allocation limit rejects the first non-empty decoded object");
+        .expect_err("a zero allocation limit rejects non-empty delta-tree storage");
 
-        assert!(
-            error_chain_contains_message(&err, "Entry too large to fit in memory"),
-            "bundle writing must forward its allocation limit to index writing"
-        );
+        insta::assert_debug_snapshot!(err, "bundle writing must forward its allocation limit to index writing", @"The pack delta tree is too large to fit in memory");
         Ok(())
     }
 
@@ -185,28 +314,66 @@ mod write_to_directory {
         entry.path().file_name().unwrap().to_str().unwrap().to_owned()
     }
 
-    fn write_pack(
-        directory: Option<impl AsRef<Path>>,
-        pack_file: &str,
-    ) -> Result<pack::bundle::write::Outcome, Box<dyn std::error::Error>> {
+    fn write_pack(directory: Option<impl AsRef<Path>>, pack_file: &str) -> Result<pack::bundle::write::Outcome> {
         let pack_file = fs::File::open(fixture_path(pack_file))?;
         static SHOULD_INTERRUPT: AtomicBool = AtomicBool::new(false);
-        pack::Bundle::write_to_directory_eagerly(
+        Ok(pack::Bundle::write_to_directory_eagerly(
             Box::new(pack_file),
             None,
             directory,
             &mut progress::Discard,
             &SHOULD_INTERRUPT,
             None::<gix_object::find::Never>,
+            gix_hash::Kind::Sha1,
             pack::bundle::write::Options {
                 thread_limit: None,
                 iteration_mode: pack::data::input::Mode::Verify,
                 index_version: pack::index::Version::V2,
-                object_hash: gix_hash::Kind::Sha1,
                 alloc_limit_bytes: None,
                 compression: gix_zlib::Compression::BEST_SPEED,
             },
-        )
-        .map_err(Into::into)
+        )?)
+    }
+
+    /// Build a complete pack whose one-byte blobs form a forward `REF_DELTA` chain.
+    /// `objects` lists the base first, but entries are written in reverse dependency order:
+    ///
+    /// ```text
+    /// objects = [A, B, C]
+    ///
+    /// increasing pack offset ────────────────────────────────────────────────►
+    /// [REF_DELTA base=oid(B), yields C] → [REF_DELTA base=oid(A), yields B] → [BLOB A]
+    /// ```
+    ///
+    /// Each arrow points to the entry needed as the base, so every delta refers forward.
+    /// With `[A, B]`, the first entry is omitted, leaving `B → A`.
+    fn ref_delta_pack(
+        object_hash: gix_hash::Kind,
+        objects: &[&'static [u8]],
+        version: pack::data::Version,
+    ) -> Result<Vec<u8>> {
+        let mut pack_data = pack::data::header::encode(version, objects.len() as u32).to_vec();
+        for pair in objects.windows(2).rev() {
+            let (base, resolved) = (pair[0], pair[1]);
+            let base_id = gix_object::compute_hash(object_hash, gix_object::Kind::Blob, base)?;
+            let delta = [1, 1, 1, resolved[0]];
+            pack::data::entry::Header::RefDelta { base_id }.write_to(delta.len() as u64, &mut pack_data)?;
+            pack_data.extend(deflate(&delta)?);
+        }
+        let base = objects[0];
+        pack::data::entry::Header::Blob.write_to(base.len() as u64, &mut pack_data)?;
+        pack_data.extend(deflate(base)?);
+
+        let mut hasher = gix_hash::hasher(object_hash);
+        hasher.update(&pack_data);
+        pack_data.extend_from_slice(hasher.try_finalize()?.as_slice());
+        Ok(pack_data)
+    }
+
+    fn deflate(input: &[u8]) -> Result<Vec<u8>> {
+        let mut out = gix_zlib::stream::deflate::Write::new(Vec::new(), gix_zlib::Compression::BEST_SPEED);
+        out.write_all(input)?;
+        out.flush()?;
+        Ok(out.into_inner())
     }
 }

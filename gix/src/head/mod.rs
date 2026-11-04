@@ -55,7 +55,7 @@ impl<'repo> Head<'repo> {
     /// # let repo = doctest::open_repo(doctest::basic_repo_dir()?)?;
     /// let head = repo.head()?;
     ///
-    /// assert_eq!(head.referent_name().expect("branch head").as_bstr(), "refs/heads/main");
+    /// assert_eq!(head.referent_name().expect("branch head"), "refs/heads/main");
     /// # Ok(()) }
     /// ```
     pub fn referent_name(&self) -> Option<&FullNameRef> {
@@ -111,7 +111,7 @@ impl<'repo> Head<'repo> {
     /// # let repo = doctest::open_repo(doctest::basic_repo_dir()?)?;
     /// let branch = repo.head()?.try_into_referent().expect("symbolic head");
     ///
-    /// assert_eq!(branch.name().as_bstr(), "refs/heads/main");
+    /// assert_eq!(branch, "refs/heads/main");
     /// # Ok(()) }
     /// ```
     pub fn try_into_referent(self) -> Option<crate::Reference<'repo>> {
@@ -124,7 +124,7 @@ impl<'repo> Head<'repo> {
 
 mod remote {
     use super::Head;
-    use crate::{Remote, remote};
+    use crate::{Remote, Result, remote};
 
     /// Remote
     impl<'repo> Head<'repo> {
@@ -139,10 +139,7 @@ mod remote {
         /// handle detached heads, i.e. obtain a remote even in case of detached heads,
         /// or call [`Repository::find_fetch_remote(…)`](crate::Repository::find_fetch_remote()) for the highest-level way of finding
         /// the right remote, just like `git fetch` does.
-        pub fn into_remote(
-            self,
-            direction: remote::Direction,
-        ) -> Option<Result<Remote<'repo>, remote::find::existing::Error>> {
+        pub fn into_remote(self, direction: remote::Direction) -> Option<Result<Remote<'repo>>> {
             let repo = self.repo;
             self.try_into_referent()?
                 .remote(direction)

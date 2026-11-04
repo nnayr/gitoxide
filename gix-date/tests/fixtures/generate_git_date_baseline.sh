@@ -1,46 +1,53 @@
 #!/usr/bin/env bash
 set -eu -o pipefail
 
+# Keep local-timezone fallbacks reproducible on every machine.
+export TZ=UTC
+
 git init
 
 function baseline() {
     local test_date="$1" # first argument is the date to test
     local test_name="$2" # second argument is the format name for re-formatting
 
-    local status=0
-    git -c section.key="$test_date" config --type=expiry-date section.key || status="$?"
+    # Use Git's strict date parser, as commit dates must not fall back to approxidate.
+    local status=0 ident seconds
+    ident=$(GIT_AUTHOR_DATE="$test_date" git var GIT_AUTHOR_IDENT) || status="$?"
 
     {
       echo "$test_date"
       echo "$test_name"
       echo "$status"
       if [ "$status" = 0 ]; then
-        git -c section.key="$test_date" config --type=expiry-date section.key
+        seconds="${ident##*> }"
+        echo "${seconds% *}"
       else
         echo '-1'
       fi
+      echo ''
     } >> baseline.git
 }
 
-# Relative dates use a fixed "now" timestamp for reproducibility
-# GIT_TEST_DATE_NOW sets Git's internal "now" to a specific Unix timestamp
-# We use 1000000000 (Sun Sep 9 01:46:40 UTC 2001) as our reference point
+# Relative dates use a fixed "now" timestamp for reproducibility. The optional third argument can
+# override the default 1000000000 (Sun Sep 9 01:46:40 UTC 2001) for calendar edge cases.
 function baseline_relative() {
     local test_date="$1" # first argument is the relative date to test
     local test_name="$2" # second argument is the format name (usually empty for relative dates)
+    local now="${3:-1000000000}" # case-specific reference time, recorded as the fifth field
 
     local status=0
-    GIT_TEST_DATE_NOW=1000000000 git -c section.key="$test_date" config --type=expiry-date section.key || status="$?"
+    GIT_TEST_DATE_NOW="$now" git -c section.key="$test_date" config --type=expiry-date section.key || status="$?"
 
     {
       echo "$test_date"
       echo "$test_name"
       echo "$status"
       if [ "$status" = 0 ]; then
-        GIT_TEST_DATE_NOW=1000000000 git -c section.key="$test_date" config --type=expiry-date section.key
+        GIT_TEST_DATE_NOW="$now" git -c section.key="$test_date" config --type=expiry-date section.key
       else
         echo '-1'
       fi
+      echo "$now"
     } >> baseline.git
 }
 
@@ -91,6 +98,12 @@ baseline '1970-01-01 00:00:00 Z' ''
 # baseline '20080214T203045' ''
 baseline '20080214T203045-04:00' ''
 
+# Short compact times must split off the timezone after HHMM or HH.
+baseline '20080214T2030-04:00' ''
+baseline '20080214T2030-0400' ''
+baseline '20080214T2030+05:30' ''
+baseline '20080214T20-0400' ''
+
 # Subsecond precision (Git ignores the subseconds)
 baseline '2008-02-14 20:30:45.019-04:00' ''
 
@@ -99,6 +112,15 @@ baseline '2008-02-14 20:30:45 -0015' ''  # 15-minute offset
 baseline '2008-02-14 20:30:45 -05' ''    # 2-digit hour offset
 baseline '2008-02-14 20:30:45 -05:00' '' # colon-separated offset
 baseline '2008-02-14 20:30:45 +00' ''    # 2-digit +00
+
+# Git accepts offsets through ±23:59. Wider offsets fall back to the local timezone;
+# GIT_ONLY records that Git accepts the date while gix-date deliberately rejects it.
+baseline '2022-01-01 12:00:00 +2359' 'ISO8601'
+baseline '2022-01-01 12:00:00 -2359' 'ISO8601'
+baseline '2022-01-01 12:00:00 +2400' 'GIT_ONLY'
+baseline '2022-01-01 12:00:00 -2400' 'GIT_ONLY'
+baseline '2022-01-01T12:00:00+24:00' 'GIT_ONLY'
+baseline '2022-01-01 12:00:00 +2559' 'GIT_ONLY'
 
 # Timezone edge cases from git t0006
 baseline '1970-01-01 00:00:00 +0000' ''
@@ -119,6 +141,12 @@ baseline '100000000' 'UNIX'
 baseline '946684800' 'UNIX'  # 2000-01-01 00:00:00 UTC
 baseline '1466000000' 'UNIX'  # from git t0006
 
+# Bare numbers below the epoch threshold must not silently become timestamps (#3001).
+# Leading zeroes do not turn a smaller value into an epoch timestamp.
+for test_date in 20080214 19700101 99999999 020080214 0 -1000; do
+    baseline "$test_date" ''
+done
+
 # RAW format: "SECONDS +/-ZZZZ"
 # Note: Git only treats timestamps >= 100000000 as raw format.
 # Smaller numbers are interpreted as date components.
@@ -130,8 +158,17 @@ baseline '946684800 +0000' 'RAW'
 baseline '1466000000 +0200' 'RAW'  # from git t0006
 baseline '1466000000 -0200' 'RAW'  # from git t0006
 
-# Note: Git does not support negative timestamps through --type=expiry-date
-# gix-date does support them, but they can't be tested via the baseline.
+# Git accepts a leading `@` before either of the two forms above. Re-formatting is not checked,
+# as the `@` isn't reproduced.
+baseline '@1234567890' ''
+baseline '@100000000' ''
+baseline '@1660874655 +0800' ''
+baseline '@1466000000 -0200' ''
+baseline '@0 +0000' ''
+baseline '@20080214 +0000' ''
+baseline '@99999999 +0000' ''
+
+# Negative timestamps in explicit @ or raw form are a gix-date extension covered by unit tests.
 
 # ============================================================================
 # RELATIVE DATE FORMATS from git t0006
@@ -188,6 +225,28 @@ baseline_relative '3 months ago' ''
 baseline_relative '12 months ago' ''
 baseline_relative '24 months ago' ''
 
+# Month-end normalization, leap years, and pair ordering. Each expected value comes directly from
+# Git using the case-specific "now" in the third argument.
+baseline_relative '1 month ago' '' 1774958400              # Mar 31 -> invalid Feb 31 -> Mar 3, not Feb 28
+baseline_relative '1 month ago' '' 1780228800              # May 31 -> invalid Apr 31 -> May 1, not Apr 30
+baseline_relative '6 months ago' '' 1788177600             # Multi-month subtraction still preserves day 31 into February
+baseline_relative '1 month ago' '' 1774872000              # Mar 30 -> invalid Feb 30 -> Mar 2 in a common year
+baseline_relative '1 month ago' '' 1711800000              # Mar 30 -> Mar 1 because leap February has 29 days
+baseline_relative '1 month ago' '' 1711886400              # Mar 31 -> Mar 2 because leap February has 29 days
+baseline_relative '1 year ago' '' 1709208000               # Leap day -> invalid Feb 29 in a common year -> Mar 1
+baseline_relative '12 months ago' '' 1709208000             # Month arithmetic must match the preceding year case
+baseline_relative '2 months ago' '' 1774958400             # Control: target January has day 31, so no rollover
+baseline_relative '1 year ago' '' 1774958400               # Control: target March has day 31, so no rollover
+baseline_relative '1 day 1 month ago' '' 1775044800         # Day first creates Mar 31, which rolls over through February
+baseline_relative '1 month 1 day ago' '' 1775044800         # Month first lands on Mar 1, proving input-order evaluation
+baseline_relative '1 month 1 year ago' '' 1711886400        # Month then year normalizes leap February before subtracting a year
+baseline_relative '1 year 1 month ago' '' 1711886400        # Year then month reaches common February and differs from prior case
+baseline_relative '1 month 1 month ago' '' 1774958400       # First rollover is normalized before the second month is subtracted
+baseline_relative '23 months ago' '' 1769860800            # Multi-year month subtraction targets leap February
+baseline_relative '1 month 1 day 1 month ago' '' 1780228800 # A day between month pairs changes the second pair's starting day
+baseline_relative '1 month 1 month 1 day ago' '' 1780228800 # Moving that day last produces a different result
+baseline_relative '1 day 1 day ago' '' 1774958400           # Repeated fixed units accumulate instead of replacing each other
+
 # Years - from git t0006 check_relative 630000000 = 20 years
 baseline_relative '1 year ago' ''
 baseline_relative '2 years ago' ''
@@ -195,3 +254,27 @@ baseline_relative '10 years ago' ''
 baseline_relative '20 years ago' ''
 
 # Note that we can't necessarily put 64bit dates here yet as `git` on the system might not yet support it.
+
+# ============================================================================
+# RELATIVE FORMS GIT ACCEPTS BEYOND "<n> <unit> ago"
+# ============================================================================
+# ascii-alnum is the for relevant partitions, so anything else separates them.
+baseline_relative '1.hour.ago' ''
+baseline_relative '1-hour-ago' ''
+
+# Unit names are case-insensitive
+baseline_relative '2 HOURS ago' ''
+baseline_relative '2 Days ago' ''
+baseline_relative '2 Days ago 1 hour' ''
+baseline_relative '2 Days 1 hour ago' ''
+baseline_relative '2 Days and 1 hour ago' ''
+
+# Counts can be spelled out, 1-10.
+baseline_relative 'zero days ago' ''
+baseline_relative 'two days ago' ''
+baseline_relative 'ten minutes ago' ''
+baseline_relative 'eleven minutes ago' ''
+
+# `last` is a count of one, and the trailing `ago` is not required.
+baseline_relative 'last week' ''
+baseline_relative 'last day ago' ''

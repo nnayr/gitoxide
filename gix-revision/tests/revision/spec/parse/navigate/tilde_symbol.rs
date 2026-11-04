@@ -4,8 +4,16 @@ use crate::spec::parse::{parse, try_parse};
 
 #[test]
 fn without_anchor_is_invalid() {
-    let err = try_parse("~").unwrap_err().into_inner();
-    assert!(err.message.contains("tilde needs to follow an anchor"));
+    let err = try_parse("~").unwrap_err();
+    let err = err
+        .downcast_any_ref::<gix_error::Message>()
+        .expect("the parser message is retained");
+    insta::assert_debug_snapshot!(err, "without anchor is invalid", @r#"
+    Message {
+        message: "tilde needs to follow an anchor, like @~",
+        class: Validation,
+    }
+    "#);
 }
 
 #[test]
@@ -20,13 +28,14 @@ fn single_is_first_ancestor() {
 }
 
 #[test]
-fn followed_by_zero_is_no_op() {
+fn followed_by_zero_is_forwarded_to_the_delegate() {
     let rec = parse("@~0");
 
     assert!(rec.kind.is_none());
     assert_eq!(rec.get_ref(0), "HEAD");
     assert_eq!(rec.prefix[0], None);
-    assert_eq!(rec.calls, 1);
+    assert_eq!(rec.traversal[0], Traversal::NthAncestor(0));
+    assert_eq!(rec.calls, 2);
 }
 
 #[test]
@@ -42,8 +51,9 @@ fn multiple_calls_stack() {
             Traversal::NthAncestor(1),
             Traversal::NthAncestor(1),
             Traversal::NthAncestor(10),
+            Traversal::NthAncestor(0),
             Traversal::NthAncestor(20),
         ]
     );
-    assert_eq!(rec.calls, 5);
+    assert_eq!(rec.calls, 6);
 }

@@ -1,15 +1,36 @@
-use std::time::SystemTime;
-
 use gix_date::Time;
-use gix_error::Exn;
+use gix_testtools::TestResult;
 
 #[test]
 fn time_without_offset_defaults_to_utc() {
     // Git parses datetime without offset and defaults to UTC (+0000)
-    let result = gix_date::parse("1979-02-26 18:30:00", Some(SystemTime::now()));
+    let result = gix_date::parse("1979-02-26 18:30:00", Some(gix_date::Zoned::now()));
     assert!(result.is_ok(), "Git parses datetime without offset, defaulting to UTC");
     let time = result.unwrap();
     assert_eq!(time.offset, 0, "Offset should default to UTC (+0000)");
+}
+
+#[test]
+fn from_str_errors_are_classified_and_retain_input() {
+    for input in ["", "not a time", "2005-04-07T22:13:09", "invalid 🕰"] {
+        let err: gix_error::Error = input
+            .parse::<Time>()
+            .expect_err("FromStr only accepts raw Git signature times");
+        assert!(err.is_validation(), "invalid times remain validation failures");
+        assert_eq!(
+            err.metadata().next().and_then(|values| values.get("input")),
+            Some(&gix_error::MetadataValue::Bytes(input.as_bytes().into())),
+            "the public error preserves the exact invalid input bytes"
+        );
+        assert_eq!(
+            err.probable_cause()
+                .downcast_ref::<gix_error::Message>()
+                .expect("the validation message remains available for inspection")
+                .message,
+            "invalid time",
+            "raising the error preserves the original diagnostic"
+        );
+    }
 }
 
 #[test]
@@ -27,7 +48,7 @@ fn parse_header_is_not_too_lenient() {
 #[test]
 fn short() {
     assert_eq!(
-        gix_date::parse("1979-02-26", Some(SystemTime::now())).unwrap(),
+        gix_date::parse("1979-02-26", Some(gix_date::Zoned::now())).unwrap(),
         Time {
             seconds: 288835200,
             offset: 0,
@@ -64,7 +85,7 @@ fn git_rfc2822() {
 }
 
 #[test]
-fn raw() -> Result<(), Exn<gix_date::Error>> {
+fn raw() -> TestResult {
     assert_eq!(
         gix_date::parse("1660874655 +0800", None)?,
         Time {
@@ -178,10 +199,7 @@ fn git_default() {
 
 #[test]
 fn invalid_dates_can_be_produced_without_current_time() {
-    assert_eq!(
-        gix_date::parse("foobar", None).unwrap_err().to_string(),
-        "Unknown date format: \"foobar\""
-    );
+    insta::assert_debug_snapshot!(gix_date::parse("foobar", None).expect_err("invalid dates can be produced without current time"), "invalid dates can be produced without current time", @r#"Unknown date format, input="foobar""#);
 }
 
 /// Tests for compact ISO8601 formats (YYYYMMDDTHHMMSS variants)
@@ -260,7 +278,11 @@ mod fuzz {
     #[test]
     fn invalid_but_does_not_cause_panic() {
         for input in ["-9999-1-1", "7	-𬞋", "5 ڜ-09", "-4 week ago Z", "8960609 day ago"] {
-            gix_date::parse(input, Some(std::time::UNIX_EPOCH)).ok();
+            gix_date::parse(
+                input,
+                Some(jiff::Timestamp::UNIX_EPOCH.to_zoned(jiff::tz::TimeZone::UTC)),
+            )
+            .ok();
         }
     }
 }

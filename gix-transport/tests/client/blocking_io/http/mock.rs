@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use bstr::ByteVec;
+use bstr::{ByteSlice, ByteVec};
 use gix_transport::{
     Protocol,
     client::{TransportWithoutIO, blocking_io::http},
@@ -34,9 +34,8 @@ pub struct Server {
 impl Server {
     fn normalize_http_response(mut response: Vec<u8>) -> Vec<u8> {
         let split = response
-            .windows(2)
-            .position(|window| window == b"\n\n")
-            .or_else(|| response.windows(4).position(|window| window == b"\r\n\r\n"))
+            .find(b"\n\n")
+            .or_else(|| response.find(b"\r\n\r\n"))
             .expect("HTTP fixture with header/body separator");
         let separator_len = if response[split..].starts_with(b"\r\n\r\n") {
             4
@@ -57,6 +56,9 @@ impl Server {
 
         let mut out = Vec::with_capacity(header.len() + body.len() + 32);
         for line in header.lines() {
+            if line.to_ascii_lowercase().starts_with("connection:") {
+                continue;
+            }
             if line.to_ascii_lowercase().starts_with("content-length:") {
                 out.extend_from_slice(format!("Content-Length: {}", body.len()).as_bytes());
             } else {
@@ -64,7 +66,8 @@ impl Server {
             }
             out.extend_from_slice(b"\r\n");
         }
-        out.extend_from_slice(b"\r\n");
+        // Each command serves exactly one request on a new connection.
+        out.extend_from_slice(b"Connection: close\r\n\r\n");
         out.extend_from_slice(&body);
         out
     }

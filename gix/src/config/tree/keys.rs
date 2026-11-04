@@ -1,12 +1,10 @@
-#![allow(clippy::result_large_err)]
-use std::{
-    error::Error,
-    fmt::{Debug, Formatter},
-};
+use std::fmt::{Debug, Formatter};
 
 use gix_config::KeyRef;
+use gix_error::ResultExt;
 
 use crate::{
+    Result,
     bstr::{BStr, ByteSlice},
     config,
     config::tree::{Key, Link, Note, Section, SubSectionRequirement},
@@ -25,6 +23,8 @@ pub struct Any<T: Validate = validate::All> {
     pub link: Option<Link>,
     /// A note about this key.
     pub note: Option<Note>,
+    /// The value to use if this key is unset.
+    pub default_value: Option<&'static [u8]>,
     /// The way validation and transformation should happen.
     validate: T,
 }
@@ -47,6 +47,7 @@ impl<T: Validate> Any<T> {
             subsection_requirement: Some(SubSectionRequirement::Never),
             link: None,
             note: None,
+            default_value: None,
             validate,
         }
     }
@@ -68,9 +69,17 @@ impl<T: Validate> Any<T> {
         self
     }
 
-    /// Set a link to another key which serves as fallback to provide a value if this key is not set.
+    /// Record another key as fallback if this key is not set.
+    ///
+    /// This is descriptive metadata; consumers must apply the fallback during value resolution.
     pub const fn with_fallback(mut self, key: &'static dyn Key) -> Self {
         self.link = Some(Link::FallbackKey(key));
+        self
+    }
+
+    /// Set the value to use if this key is unset.
+    pub const fn with_default(mut self, value: &'static [u8]) -> Self {
+        self.default_value = Some(value);
         self
     }
 
@@ -94,23 +103,20 @@ impl<T: Validate> Any<T> {
         &'static self,
         value: impl gix_utils::AsBStr,
         op: gix_refspec::parse::Operation,
-    ) -> Result<gix_refspec::RefSpec, config::refspec::Error> {
+    ) -> Result<gix_refspec::RefSpec> {
         let value = value.as_bstr();
         gix_refspec::parse(value.as_bstr(), op)
             .map(|spec| spec.to_owned())
-            .map_err(|err| config::refspec::Error::from_value(self, value.into()).with_source(err))
+            .or_raise(|| config::key::error_with_value(self, "Could not parse refspec", value))
     }
 
     /// Try to interpret `value` as UTF-8 encoded string.
-    pub fn try_into_string(
-        &'static self,
-        value: impl gix_utils::AsBStr,
-    ) -> Result<std::string::String, config::string::Error> {
-        use crate::bstr::ByteVec;
-        Vec::from(value.as_bstr().to_owned()).into_string().map_err(|err| {
-            let utf8_err = err.utf8_error().clone();
-            config::string::Error::from_value(self, err.into_vec().into()).with_source(utf8_err)
-        })
+    pub fn try_into_string(&'static self, value: impl gix_utils::AsBStr) -> Result<std::string::String> {
+        let value = value.as_bstr();
+        Ok(value
+            .to_str()
+            .or_raise(|| config::key::error_with_value(self, "Could not decode UTF-8 string", value))?
+            .to_owned())
     }
 }
 
@@ -131,8 +137,21 @@ impl<T: Validate> Key for Any<T> {
         self.name
     }
 
-    fn validate(&self, value: &BStr) -> Result<(), config::tree::key::validate::Error> {
-        Ok(self.validate.validate(value)?)
+    fn validate(&self, value: &BStr) -> Result<()> {
+        use gix_error::ErrorExt;
+
+        self.validate.validate(value).map_err(|err| {
+            let mut context = gix_error::message("Invalid configuration value").with("key", self.logical_name());
+            if !err.metadata().any(|metadata| {
+                matches!(metadata.get("input"), Some(gix_error::MetadataValue::Bytes(input)) if input == value)
+            }) {
+                context.values.insert("input", value);
+            }
+            if let Some(environment) = self.environment_override() {
+                context = context.with("environment_override", environment);
+            }
+            err.and_raise(context)
+        })
     }
 
     fn section(&self) -> &dyn Section {
@@ -149,6 +168,10 @@ impl<T: Validate> Key for Any<T> {
 
     fn note(&self) -> Option<&Note> {
         self.note.as_ref()
+    }
+
+    fn default_value(&self) -> Option<&BStr> {
+        self.default_value.map(BStr::new)
     }
 }
 
@@ -229,8 +252,10 @@ pub type FetchRefSpec = Any<validate::FetchRefSpec>;
 mod duration {
     use std::time::Duration;
 
+    use gix_error::ResultExt;
+
     use crate::{
-        config,
+        Result, config,
         config::tree::{Section, keys::DurationInMilliseconds},
     };
 
@@ -241,11 +266,8 @@ mod duration {
         }
 
         /// Return a valid duration as parsed from an integer that is interpreted as milliseconds.
-        pub fn try_into_duration(
-            &'static self,
-            value: Result<Option<i64>, gix_config::value::Error>,
-        ) -> Result<Option<std::time::Duration>, config::duration::Error> {
-            let Some(value) = value.map_err(|err| config::duration::Error::from(self).with_source(err))? else {
+        pub fn try_into_duration(&'static self, value: Result<Option<i64>>) -> Result<Option<std::time::Duration>> {
+            let Some(value) = value.or_raise(|| config::key::error(self, "Invalid duration in milliseconds"))? else {
                 return Ok(None);
             };
             Ok(Some(match value {
@@ -259,10 +281,11 @@ mod duration {
 mod lock_timeout {
     use std::time::Duration;
 
+    use gix_error::ResultExt;
     use gix_lock::acquire::Fail;
 
     use crate::{
-        config,
+        Result, config,
         config::tree::{Section, keys::LockTimeout},
     };
 
@@ -275,9 +298,9 @@ mod lock_timeout {
         /// Return information on how long to wait for locked files.
         pub fn try_into_lock_timeout(
             &'static self,
-            value: Result<Option<i64>, gix_config::value::Error>,
-        ) -> Result<Option<gix_lock::acquire::Fail>, config::lock_timeout::Error> {
-            let Some(value) = value.map_err(|err| config::lock_timeout::Error::from(self).with_source(err))? else {
+            value: Result<Option<i64>>,
+        ) -> Result<Option<gix_lock::acquire::Fail>> {
+            let Some(value) = value.or_raise(|| config::key::error(self, "Invalid lock timeout"))? else {
                 return Ok(None);
             };
             Ok(Some(match value {
@@ -292,8 +315,10 @@ mod lock_timeout {
 }
 
 mod compression {
+    use gix_error::{OptionExt, ResultExt};
+
     use crate::{
-        config,
+        Result, config,
         config::tree::{Section, keys::Compression},
     };
 
@@ -307,9 +332,9 @@ mod compression {
         /// zlib default, just like `git` does.
         pub fn try_into_compression(
             &'static self,
-            value: Result<Option<i64>, gix_config::value::Error>,
-        ) -> Result<Option<gix_zlib::Compression>, config::key::GenericError> {
-            let Some(value) = value.map_err(|err| config::key::GenericError::from(self).with_source(err))? else {
+            value: Result<Option<i64>>,
+        ) -> Result<Option<gix_zlib::Compression>> {
+            let Some(value) = value.or_raise(|| config::key::error(self, "Invalid compression level"))? else {
                 return Ok(None);
             };
             match value {
@@ -318,7 +343,7 @@ mod compression {
                     .ok()
                     .and_then(gix_zlib::Compression::new)
                     .map(Some)
-                    .ok_or_else(|| config::key::GenericError::from(self)),
+                    .ok_or_raise(|| config::key::error_with_value(self, "Invalid compression level", level)),
             }
         }
     }
@@ -346,7 +371,10 @@ mod refspecs {
 }
 
 mod url {
+    use gix_error::ResultExt;
+
     use crate::{
+        Result,
         bstr::ByteSlice,
         config,
         config::tree::{
@@ -362,10 +390,10 @@ mod url {
         }
 
         /// Try to parse `value` as URL.
-        pub fn try_into_url(&'static self, value: impl gix_utils::AsBStr) -> Result<gix_url::Url, config::url::Error> {
+        pub fn try_into_url(&'static self, value: impl gix_utils::AsBStr) -> Result<gix_url::Url> {
             let value = value.as_bstr();
             gix_url::parse(value.as_bstr())
-                .map_err(|err| config::url::Error::from_value(self, value.into()).with_source(err))
+                .or_raise(|| config::key::error_with_value(self, "Could not parse URL", value))
         }
     }
 }
@@ -399,7 +427,13 @@ impl Path {
 }
 
 mod workers {
-    use crate::config::tree::{Section, keys::UnsignedInteger};
+    use gix_error::ResultExt;
+
+    use crate::{
+        Result,
+        config::key,
+        config::tree::{Section, keys::UnsignedInteger},
+    };
 
     impl UnsignedInteger {
         /// Create a new instance.
@@ -407,47 +441,35 @@ mod workers {
             Self::new_with_validate(name, section, super::validate::UnsignedInteger)
         }
 
-        /// Convert `value` into a `usize` or wrap it into a specialized error.
-        pub fn try_into_usize(
-            &'static self,
-            value: Result<Option<i64>, gix_config::value::Error>,
-        ) -> Result<Option<usize>, crate::config::unsigned_integer::Error> {
-            let value = value.map_err(|err| crate::config::unsigned_integer::Error::from(self).with_source(err))?;
+        /// Convert `value` into a `usize`, attaching key metadata on failure.
+        pub fn try_into_usize(&'static self, value: Result<Option<i64>>) -> Result<Option<usize>> {
+            let value = value.or_raise(|| key::error(self, "Could not parse an unsigned integer"))?;
             value
                 .map(|value| {
-                    value
-                        .try_into()
-                        .map_err(|_| crate::config::unsigned_integer::Error::from(self))
+                    usize::try_from(value)
+                        .or_raise(|| key::error_with_value(self, "Could not parse an unsigned integer", value))
                 })
                 .transpose()
         }
 
-        /// Convert `value` into a `u64` or wrap it into a specialized error.
-        pub fn try_into_u64(
-            &'static self,
-            value: Result<Option<i64>, gix_config::value::Error>,
-        ) -> Result<Option<u64>, crate::config::unsigned_integer::Error> {
-            let value = value.map_err(|err| crate::config::unsigned_integer::Error::from(self).with_source(err))?;
+        /// Convert `value` into a `u64`, attaching key metadata on failure.
+        pub fn try_into_u64(&'static self, value: Result<Option<i64>>) -> Result<Option<u64>> {
+            let value = value.or_raise(|| key::error(self, "Could not parse an unsigned integer"))?;
             value
                 .map(|value| {
-                    value
-                        .try_into()
-                        .map_err(|_| crate::config::unsigned_integer::Error::from(self))
+                    u64::try_from(value)
+                        .or_raise(|| key::error_with_value(self, "Could not parse an unsigned integer", value))
                 })
                 .transpose()
         }
 
-        /// Convert `value` into a `u32` or wrap it into a specialized error.
-        pub fn try_into_u32(
-            &'static self,
-            value: Result<Option<i64>, gix_config::value::Error>,
-        ) -> Result<Option<u32>, crate::config::unsigned_integer::Error> {
-            let value = value.map_err(|err| crate::config::unsigned_integer::Error::from(self).with_source(err))?;
+        /// Convert `value` into a `u32`, attaching key metadata on failure.
+        pub fn try_into_u32(&'static self, value: Result<Option<i64>>) -> Result<Option<u32>> {
+            let value = value.or_raise(|| key::error(self, "Could not parse an unsigned integer"))?;
             value
                 .map(|value| {
-                    value
-                        .try_into()
-                        .map_err(|_| crate::config::unsigned_integer::Error::from(self))
+                    u32::try_from(value)
+                        .or_raise(|| key::error_with_value(self, "Could not parse an unsigned integer", value))
                 })
                 .transpose()
         }
@@ -456,13 +478,15 @@ mod workers {
 
 mod time {
     use crate::{
+        Result,
         bstr::ByteSlice,
+        config::key,
         config::tree::{
             Section,
             keys::{Time, validate},
         },
     };
-    use gix_error::Exn;
+    use gix_error::ResultExt;
 
     impl Time {
         /// Create a new instance.
@@ -471,26 +495,31 @@ mod time {
         }
 
         /// Convert the `value` into a date if possible, with `now` as reference time for relative dates.
+        /// Failures include the [key metadata](crate::config::tree::Key::validate) and the value bytes as `input`.
+        /// Date parsing failures retain the cause documented by [`gix_date::parse()`].
         pub fn try_into_time(
             &self,
             value: impl gix_utils::AsBStr,
-            now: Option<std::time::SystemTime>,
-        ) -> Result<gix_date::Time, Exn<gix_date::Error>> {
+            now: Option<gix_date::Zoned>,
+        ) -> Result<gix_date::Time> {
             let value = value.as_bstr();
             gix_date::parse(
                 value
                     .as_bstr()
                     .to_str()
-                    .map_err(|_| gix_date::Error::new_with_input("UTF8 conversion failed", value))?,
+                    .or_raise(|| key::error_with_value(self, "Could not decode date as UTF-8", value))?,
                 now,
             )
+            .or_raise(|| key::error_with_value(self, "Could not parse date", value))
         }
     }
 }
 
 mod boolean {
+    use gix_error::ResultExt;
+
     use crate::{
-        config,
+        Result, config,
         config::tree::{
             Section,
             keys::{Boolean, validate},
@@ -506,17 +535,17 @@ mod boolean {
         /// Process the `value` into a result with an improved error message.
         ///
         /// `value` is expected to be provided by [`gix_config::File::boolean()`].
-        pub fn enrich_error(
-            &'static self,
-            value: Result<Option<bool>, gix_config::value::Error>,
-        ) -> Result<Option<bool>, config::boolean::Error> {
-            value.map_err(|err| config::boolean::Error::from(self).with_source(err))
+        pub fn enrich_error(&'static self, value: Result<Option<bool>>) -> Result<Option<bool>> {
+            value.or_raise(|| config::key::error(self, "Invalid boolean"))
         }
     }
 }
 
 mod remote_name {
+    use gix_error::ResultExt;
+
     use crate::{
+        Result,
         bstr::BString,
         config,
         config::tree::{Section, keys::RemoteName},
@@ -529,16 +558,9 @@ mod remote_name {
         }
 
         /// Try to validate `name` as symbolic remote name and return it.
-        #[expect(
-            clippy::result_large_err,
-            reason = "will be removed once `gix-error` is used consistently"
-        )]
-        pub fn try_into_symbolic_name(
-            &'static self,
-            name: impl gix_utils::AsBStr,
-        ) -> Result<BString, config::remote::symbolic_name::Error> {
-            crate::remote::name::validated(name.as_bstr().to_owned())
-                .map_err(|err| config::remote::symbolic_name::Error::from(self).with_source(err))
+        pub fn try_into_symbolic_name(&'static self, name: impl gix_utils::AsBStr) -> Result<BString> {
+            let name = name.as_bstr();
+            crate::remote::name::validated(name.to_owned()).or_raise(|| config::key::error(self, "Invalid remote name"))
         }
     }
 }
@@ -546,14 +568,18 @@ mod remote_name {
 /// Provide a way to validate a value, or decode a value from `git-config`.
 pub trait Validate {
     /// Validate `value` or return an error.
-    fn validate(&self, value: &BStr) -> Result<(), Box<dyn Error + Send + Sync + 'static>>;
+    /// Errors with input context include invalid value bytes as `input` [metadata](crate::Error::metadata()).
+    fn validate(&self, value: &BStr) -> Result;
 }
 
 /// various implementations of the `Validate` trait.
 pub mod validate {
-    use std::{borrow::Cow, error::Error};
+    use std::borrow::Cow;
+
+    use crate::error::{ResultExt, validation};
 
     use crate::{
+        Result,
         bstr::{BStr, ByteSlice},
         config::tree::keys::Validate,
         remote,
@@ -564,7 +590,7 @@ pub mod validate {
     pub struct All;
 
     impl Validate for All {
-        fn validate(&self, _value: &BStr) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+        fn validate(&self, _value: &BStr) -> Result {
             Ok(())
         }
     }
@@ -574,9 +600,9 @@ pub mod validate {
     pub struct Time;
 
     impl Validate for Time {
-        fn validate(&self, value: &BStr) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
-            gix_date::parse(value.to_str()?, std::time::SystemTime::now().into())
-                .map_err(gix_error::Exn::into_inner)?;
+        fn validate(&self, value: &BStr) -> Result {
+            let value = value.to_str().or_raise(|| validation("Date must be valid UTF-8"))?;
+            gix_date::parse(value, gix_date::Zoned::now().into())?;
             Ok(())
         }
     }
@@ -586,13 +612,8 @@ pub mod validate {
     pub struct UnsignedInteger;
 
     impl Validate for UnsignedInteger {
-        fn validate(&self, value: &BStr) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
-            usize::try_from(
-                gix_config::Integer::try_from(value)?
-                    .to_decimal()
-                    .ok_or_else(|| format!("integer {value} cannot be represented as `usize`"))?,
-            )
-            .map_err(|_| "cannot use sign for unsigned integer")?;
+        fn validate(&self, value: &BStr) -> Result {
+            gix_config::Integer::from_bytes::<usize>(value)?;
             Ok(())
         }
     }
@@ -602,8 +623,35 @@ pub mod validate {
     pub struct Boolean;
 
     impl Validate for Boolean {
-        fn validate(&self, value: &BStr) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+        fn validate(&self, value: &BStr) -> Result {
             gix_config::Boolean::try_from(value)?;
+            Ok(())
+        }
+    }
+
+    /// Values that are full reference names.
+    #[derive(Default, Clone, Copy)]
+    pub struct FullNameRef {
+        allow_empty: bool,
+    }
+
+    impl FullNameRef {
+        /// Create a validator that requires a full reference name.
+        pub const fn new() -> Self {
+            FullNameRef { allow_empty: false }
+        }
+
+        /// Create a validator that also accepts an empty value.
+        pub const fn or_empty() -> Self {
+            FullNameRef { allow_empty: true }
+        }
+    }
+
+    impl Validate for FullNameRef {
+        fn validate(&self, value: &BStr) -> Result {
+            if !self.allow_empty || !value.is_empty() {
+                gix_ref::FullName::try_from(value.to_owned()).or_error()?;
+            }
             Ok(())
         }
     }
@@ -612,9 +660,8 @@ pub mod validate {
     #[derive(Default, Clone, Copy)]
     pub struct RemoteName;
     impl Validate for RemoteName {
-        fn validate(&self, value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-            remote::Name::try_from(Cow::Borrowed(value))
-                .map_err(|_| format!("Illformed UTF-8 in remote name: \"{}\"", value.to_str_lossy()))?;
+        fn validate(&self, value: &BStr) -> Result {
+            remote::Name::try_from(Cow::Borrowed(value))?;
             Ok(())
         }
     }
@@ -623,7 +670,7 @@ pub mod validate {
     #[derive(Default, Clone, Copy)]
     pub struct Program;
     impl Validate for Program {
-        fn validate(&self, _value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+        fn validate(&self, _value: &BStr) -> Result {
             Ok(())
         }
     }
@@ -632,7 +679,7 @@ pub mod validate {
     #[derive(Default, Clone, Copy)]
     pub struct Executable;
     impl Validate for Executable {
-        fn validate(&self, _value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+        fn validate(&self, _value: &BStr) -> Result {
             Ok(())
         }
     }
@@ -641,7 +688,7 @@ pub mod validate {
     #[derive(Default, Clone, Copy)]
     pub struct Url;
     impl Validate for Url {
-        fn validate(&self, value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+        fn validate(&self, value: &BStr) -> Result {
             gix_url::parse(value)?;
             Ok(())
         }
@@ -651,7 +698,7 @@ pub mod validate {
     #[derive(Default, Clone, Copy)]
     pub struct PushRefSpec;
     impl Validate for PushRefSpec {
-        fn validate(&self, value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+        fn validate(&self, value: &BStr) -> Result {
             gix_refspec::parse(value, gix_refspec::parse::Operation::Push)?;
             Ok(())
         }
@@ -661,7 +708,7 @@ pub mod validate {
     #[derive(Default, Clone, Copy)]
     pub struct FetchRefSpec;
     impl Validate for FetchRefSpec {
-        fn validate(&self, value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+        fn validate(&self, value: &BStr) -> Result {
             gix_refspec::parse(value, gix_refspec::parse::Operation::Fetch)?;
             Ok(())
         }
@@ -671,11 +718,9 @@ pub mod validate {
     #[derive(Clone, Copy)]
     pub struct LockTimeout;
     impl Validate for LockTimeout {
-        fn validate(&self, value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-            let value = gix_config::Integer::try_from(value)?
-                .to_decimal()
-                .ok_or_else(|| format!("integer {value} cannot be represented as integer"));
-            super::super::Core::FILES_REF_LOCK_TIMEOUT.try_into_lock_timeout(Ok(Some(value?)))?;
+        fn validate(&self, value: &BStr) -> Result {
+            let value = gix_config::Integer::from_bytes::<i64>(value)?;
+            super::super::Core::FILES_REF_LOCK_TIMEOUT.try_into_lock_timeout(Ok(Some(value)))?;
             Ok(())
         }
     }
@@ -684,11 +729,9 @@ pub mod validate {
     #[derive(Clone, Copy)]
     pub struct Compression;
     impl Validate for Compression {
-        fn validate(&self, value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-            let value = gix_config::Integer::try_from(value)?
-                .to_decimal()
-                .ok_or_else(|| format!("integer {value} cannot be represented as integer"));
-            super::super::Core::COMPRESSION.try_into_compression(Ok(Some(value?)))?;
+        fn validate(&self, value: &BStr) -> Result {
+            let value = gix_config::Integer::from_bytes::<i64>(value)?;
+            super::super::Core::COMPRESSION.try_into_compression(Ok(Some(value)))?;
             Ok(())
         }
     }
@@ -697,11 +740,9 @@ pub mod validate {
     #[derive(Clone, Copy)]
     pub struct DurationInMilliseconds;
     impl Validate for DurationInMilliseconds {
-        fn validate(&self, value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-            let value = gix_config::Integer::try_from(value)?
-                .to_decimal()
-                .ok_or_else(|| format!("integer {value} cannot be represented as integer"));
-            super::super::gitoxide::Http::CONNECT_TIMEOUT.try_into_duration(Ok(Some(value?)))?;
+        fn validate(&self, value: &BStr) -> Result {
+            let value = gix_config::Integer::from_bytes::<i64>(value)?;
+            super::super::gitoxide::Http::CONNECT_TIMEOUT.try_into_duration(Ok(Some(value)))?;
             Ok(())
         }
     }
@@ -710,8 +751,8 @@ pub mod validate {
     #[derive(Clone, Copy)]
     pub struct String;
     impl Validate for String {
-        fn validate(&self, value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-            value.to_str()?;
+        fn validate(&self, value: &BStr) -> Result {
+            value.to_str().or_raise(|| validation("String must be valid UTF-8"))?;
             Ok(())
         }
     }
@@ -720,7 +761,7 @@ pub mod validate {
     #[derive(Clone, Copy)]
     pub struct Path;
     impl Validate for Path {
-        fn validate(&self, _value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+        fn validate(&self, _value: &BStr) -> Result {
             Ok(())
         }
     }

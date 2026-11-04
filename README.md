@@ -71,16 +71,15 @@ Follow linked crate name for detailed status. Please note that all crates follow
 
 ### Production Grade
 
-* **Stability Tier 1**
-  - [gix-lock](https://github.com/GitoxideLabs/gitoxide/blob/main/gix-lock/README.md)
-
-* **Stability Tier 2**
-  - [gix-tempfile](https://github.com/GitoxideLabs/gitoxide/blob/main/gix-tempfile/README.md)
+* [gix-lock](https://github.com/GitoxideLabs/gitoxide/blob/main/gix-lock/README.md)
+* [gix-tempfile](https://github.com/GitoxideLabs/gitoxide/blob/main/gix-tempfile/README.md)
+* [gix-fs](https://github.com/GitoxideLabs/gitoxide/blob/main/crate-status.md#gix-fs)
 
 ### Stabilization Candidates
 
-Crates that seem feature complete and need to see some more use before they can be released as 1.0.
-Documentation is complete and was reviewed at least once.
+Crates whose chosen supported public API is nearly ready for a 1.0 compatibility commitment.
+Remaining experimental public APIs can stay behind a non-default `unstable` feature.
+Documentation for the supported API is complete and was reviewed at least once.
 
 * [gix-mailmap](https://github.com/GitoxideLabs/gitoxide/blob/main/crate-status.md#gix-mailmap)
 * [gix-chunk](https://github.com/GitoxideLabs/gitoxide/blob/main/crate-status.md#gix-chunk)
@@ -91,10 +90,11 @@ Documentation is complete and was reviewed at least once.
 * [gix-actor](https://github.com/GitoxideLabs/gitoxide/blob/main/crate-status.md#gix-actor)
 * [gix-hash](https://github.com/GitoxideLabs/gitoxide/blob/main/crate-status.md#gix-hash)
 
-### Initial Development
+### Major-Zero Crates
 
-These crates may be missing some features and thus are somewhat incomplete, but what's there
-is usable to some extent.
+A _major-zero crate_ (`0.x`) may introduce breaking API changes in minor releases. This says nothing about its
+quality, completeness, or suitability for production use. Crates used only as implementation details, without
+exposing their APIs through public crates, may remain _major-zero crates_ indefinitely.
 
 * **usable** _(with rough but complete docs, possibly incomplete functionality)_
   * [gix](https://github.com/GitoxideLabs/gitoxide/blob/main/crate-status.md#gix) (**⬅ entrypoint**)
@@ -110,7 +110,7 @@ is usable to some extent.
   * [gix-commitgraph](https://github.com/GitoxideLabs/gitoxide/blob/main/crate-status.md#gix-commitgraph)
   * [gix-diff](https://github.com/GitoxideLabs/gitoxide/blob/main/crate-status.md#gix-diff)
   * [gix-traverse](https://github.com/GitoxideLabs/gitoxide/blob/main/crate-status.md#gix-traverse)
-  * [gix-features](https://github.com/GitoxideLabs/gitoxide/blob/main/crate-status.md#gix-features)
+  * [gix-parallel](https://github.com/GitoxideLabs/gitoxide/blob/main/crate-status.md#gix-parallel)
   * [gix-credentials](https://github.com/GitoxideLabs/gitoxide/blob/main/crate-status.md#gix-credentials)
   * [gix-sec](https://github.com/GitoxideLabs/gitoxide/blob/main/crate-status.md#gix-sec)
   * [gix-quote](https://github.com/GitoxideLabs/gitoxide/blob/main/crate-status.md#gix-quote)
@@ -125,7 +125,6 @@ is usable to some extent.
   * [gix-command](https://github.com/GitoxideLabs/gitoxide/blob/main/crate-status.md#gix-command)
   * [gix-prompt](https://github.com/GitoxideLabs/gitoxide/blob/main/crate-status.md#gix-prompt)
   * [gix-refspec](https://github.com/GitoxideLabs/gitoxide/blob/main/crate-status.md#gix-refspec)
-  * [gix-fs](https://github.com/GitoxideLabs/gitoxide/blob/main/crate-status.md#gix-fs)
   * [gix-utils](https://github.com/GitoxideLabs/gitoxide/blob/main/crate-status.md#gix-utils)
   * [gix-hashtable](https://github.com/GitoxideLabs/gitoxide/blob/main/crate-status.md#gix-hashtable)
   * [gix-worktree](https://github.com/GitoxideLabs/gitoxide/blob/main/crate-status.md#gix-worktree)
@@ -321,7 +320,7 @@ Project goals can change over time as we learn more, and they can be challenged.
    * assure reads never interfere with concurrent writes
    * assure multiple concurrent writes don't cause trouble
  * **take shortcuts, but not in quality**
-   * binaries may use `anyhow::Error` exhaustively, knowing these errors are solely user-facing.
+   * binaries use `gix::Result` and `gix::Error` to preserve error context and source locations, with helpers available through `gix::error` instead of a separate `gix-error` dependency.
    * libraries use light-weight custom errors implemented using `quick-error` or `thiserror`.
    * internationalization is nothing we are concerned with right now.
    * IO errors due to insufficient amount of open file handles don't always lead to operation failure
@@ -342,28 +341,19 @@ Project non-goals can change over time as we learn more, and they can be challen
  * **use async IO everywhere**
    * for the most part, git operations are heavily reliant on memory mapped IO as well as CPU to decompress data,
      which doesn't lend itself well to async IO out of the box.
-   * Use `blocking` as well as `gix-features::interrupt` to bring operations into the async world and to control
+   * Use `blocking` as well as `gix_utils::interrupt` to bring operations into the async world and to control
      long running operations.
    * When connecting or streaming over TCP connections, especially when receiving on the server, async seems like a must
      though, but behind a feature flag.
 
 ## Contributions
 
-If what you have seen so far sparked your interest to contribute, then let us say: We are happy to have you and help you to get started.
+If what you have seen so far sparked your interest to contribute, then let us say: We are happy to have you and help you to get started. What's paricularly welcome is the discovery of deviations from Git, or the prodding 
+and probing to find bugs and other forms of undesirable behaviour.
 
-We recommend running `just test` during the development process to assure CI is green before pushing.
+Please read the [contribution guide] before starting. It covers when prior discussion is required and how to prepare a submission.
 
-A backlog for work ready to be picked up is [available in the Project's Kanban board][project-board], which contains instructions on how
-to pick a task. If it's empty or you have other questions, feel free to [start a discussion][discussions] or reach out to @Byron [privately][keybase].
-
-For additional details, also take a look at the [collaboration guide]. If an AI agent communicates through your account,
-please follow the [agent impersonation policy].
-
-[agent impersonation policy]: https://github.com/GitoxideLabs/gitoxide/blob/main/CONTRIBUTING.md#prevent-agent-impersonation
-[collaboration guide]: https://github.com/GitoxideLabs/gitoxide/blob/main/COLLABORATING.md
-[project-board]: https://github.com/GitoxideLabs/gitoxide/projects
-[discussions]: https://github.com/GitoxideLabs/gitoxide/discussions
-[keybase]: https://keybase.io/byronbates
+[contribution guide]: https://github.com/GitoxideLabs/gitoxide/blob/main/CONTRIBUTING.md
 [cargo-diet]: https://crates.io/crates/cargo-diet
 
 ### Getting started with Video Tutorials

@@ -16,30 +16,22 @@ pub fn hex_to_id_for_hash(sha1: &str, sha256: &str) -> ObjectId {
 
 pub type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-/// [`init::Options`](gix_odb::store::init::Options) respecting [`gix_testtools::object_hash()`]
-/// that regenerate under `GIX_TEST_FIXTURE_HASH` are opened with a matching object hash.
-pub fn fixture_options() -> gix_odb::store::init::Options {
-    gix_odb::store::init::Options {
-        object_hash: gix_testtools::object_hash(),
-        ..Default::default()
-    }
-}
-
 /// Open an object store at `objects_dir`.
 /// The static SHA-1 fixtures keep using [`db()`]/[`db_small_packs()`] instead.
 pub fn odb_at(objects_dir: impl Into<std::path::PathBuf>) -> std::io::Result<gix_odb::Handle> {
-    gix_odb::at_opts(objects_dir, Vec::new(), fixture_options())
+    gix_odb::at(objects_dir, gix_testtools::object_hash())
 }
 
 fn db() -> gix_odb::Handle {
-    gix_odb::at(fixture_path("objects")).expect("valid object path")
+    gix_odb::at(fixture_path("objects"), gix_hash::Kind::Sha1).expect("valid object path")
 }
 
 fn db_small_packs() -> gix_odb::Handle {
-    gix_odb::at(fixture_path("repos/small-packs.git/objects")).unwrap()
+    gix_odb::at(fixture_path("repos/small-packs.git/objects"), gix_hash::Kind::Sha1).unwrap()
 }
 
 pub mod alternate;
+mod error;
 pub mod find;
 pub mod header;
 pub mod memory;

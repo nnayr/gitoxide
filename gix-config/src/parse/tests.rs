@@ -67,7 +67,7 @@ mod span {
         assert!(Span::range(0, u32::MAX as usize + 1).is_err());
 
         let mut span = Span::range(u32::MAX as usize, 0).expect("the maximum offset is representable");
-        assert_eq!(span.rebase(1), Err(crate::parse::span::Error));
+        insta::assert_debug_snapshot!(span.rebase(1).expect_err("rebasing beyond u32 must fail"), "reports range and rebase overflow", @"configuration data exceeds the supported span size of 4294967295 bytes");
     }
 }
 
@@ -229,10 +229,7 @@ pub(crate) mod util {
         OwnedHeader {
             name: header.name.to_bstring_in(backing),
             separator: header.separator.map(|separator| separator.to_bstring_in(backing)),
-            subsection_name: header
-                .subsection_name
-                .as_ref()
-                .map(|subsection_name| subsection_name.value_in(backing).to_owned()),
+            subsection_name: header.subsection_name_original(backing).map(ToOwned::to_owned),
         }
     }
 

@@ -1,25 +1,14 @@
-/// The error returned by [`Hasher::try_finalize()`](crate::Hasher::try_finalize()).
-#[derive(Debug, thiserror::Error)]
-#[expect(missing_docs)]
-pub enum Error {
-    #[error("Detected SHA-1 collision attack with digest {digest}")]
-    CollisionAttack { digest: crate::ObjectId },
-}
-
 pub(super) mod _impl {
-    #[cfg(feature = "sha1")]
-    use sha1_checked::{CollisionResult, Digest};
-
-    use crate::hasher::Error;
+    use gix_error::Result;
 
     /// Hash implementations that can be used once.
     #[derive(Clone)]
     pub enum Hasher {
         /// An implementation of the SHA1 hash.
         ///
-        /// We use [`sha1_checked`] to implement the same collision detection algorithm as Git.
+        /// We use [`sha1dc`] to implement the same collision detection algorithm as Git.
         #[cfg(feature = "sha1")]
-        Sha1(sha1_checked::Sha1),
+        Sha1(sha1dc::Hasher),
         /// An implementation of the SHA256 hash.
         #[cfg(feature = "sha256")]
         Sha256(sha2::Sha256),
@@ -33,7 +22,7 @@ pub(super) mod _impl {
             // the collision detection to bail out, rather than computing
             // alternate “safe hashes” for inputs where a collision attack
             // was detected.
-            Self::Sha1(sha1_checked::Builder::default().safe_hash(false).build())
+            Self::Sha1(sha1dc::Hasher::new())
         }
 
         /// Let's not make this public to force people to go through [`hasher()`].
@@ -56,33 +45,21 @@ pub(super) mod _impl {
 
         /// Finalize the hash and produce an object id.
         ///
-        /// Returns [`Error`] if a collision attack is detected.
+        /// Returns an error classified as [`gix_error::Class::Corruption`] if a collision attack is detected.
         // TODO: Since SHA-256 has an infallible `finalize`, it might be worth investigating
         //       turning the return type into `Result<crate::ObjectId, Infallible>` when this crate is
         //       compiled with SHA-256 support only.
         #[inline]
-        pub fn try_finalize(self) -> Result<crate::ObjectId, Error> {
+        pub fn try_finalize(self) -> Result<crate::ObjectId> {
             match self {
                 #[cfg(feature = "sha1")]
-                Hasher::Sha1(sha1) => match sha1.try_finalize() {
-                    CollisionResult::Ok(digest) => Ok(crate::ObjectId::Sha1(digest.into())),
-                    CollisionResult::Mitigated(_) => {
-                        // SAFETY: `CollisionResult::Mitigated` is only
-                        // returned when `safe_hash()` is on. `Hasher`’s field
-                        // is private, and we only construct the SHA-1 variant
-                        // via `Hasher::new_sha1()` (and thus through `hasher()`),
-                        // which configures the builder with `safe_hash(false)`.
-                        //
-                        // As of Rust 1.84.1, the compiler can’t figure out
-                        // this function cannot panic without this.
-                        #[expect(unsafe_code)]
-                        unsafe {
-                            std::hint::unreachable_unchecked()
-                        }
-                    }
-                    CollisionResult::Collision(digest) => Err(Error::CollisionAttack {
-                        digest: crate::ObjectId::Sha1(digest.into()),
-                    }),
+                Hasher::Sha1(sha1) => match sha1.finalize() {
+                    Ok(digest) => Ok(crate::ObjectId::Sha1(digest.into())),
+                    Err(collision) => Err(gix_error::message!(
+                        "Detected SHA-1 collision attack with digest {}",
+                        crate::ObjectId::Sha1(collision.digest().into())
+                    )
+                    .corrupted_error()),
                 },
                 #[cfg(feature = "sha256")]
                 Hasher::Sha256(sha256) => Ok(crate::ObjectId::Sha256(sha2::Digest::finalize(sha256).into())),

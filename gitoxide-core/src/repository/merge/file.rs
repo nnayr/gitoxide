@@ -1,9 +1,9 @@
 use std::path::Path;
 
-use anyhow::{Context, anyhow, bail};
 use gix::{
-    Id,
-    bstr::{BString, ByteSlice},
+    Id, Result,
+    bstr::BString,
+    error::{ErrorExt, OptionExt, ResultExt, bail, message, unsupported},
     merge::blob::{
         Resolution, ResourceKind,
         builtin_driver::{binary, text::Conflict},
@@ -22,28 +22,17 @@ pub fn file(
     base: BString,
     ours: BString,
     theirs: BString,
-) -> anyhow::Result<()> {
+) -> Result<()> {
     if format != OutputFormat::Human {
-        bail!("JSON output isn't implemented yet");
+        bail!(unsupported("JSON output isn't implemented yet"));
     }
-    let index = &repo.index_or_load_from_head()?;
-    let specs = repo.pathspec(
-        false,
-        [base, ours, theirs],
-        true,
-        index,
-        gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping.adjust_for_bare(repo.is_bare()),
-    )?;
-    // TODO: there should be a way to normalize paths without going through patterns, at least in this case maybe?
-    //       `Search` actually sorts patterns by excluding or not, all that can lead to strange results.
-    let mut patterns = specs.search().patterns().map(|p| p.path().to_owned());
-    let base = patterns.next().unwrap();
-    let ours = patterns.next().unwrap();
-    let theirs = patterns.next().unwrap();
+    let base = repo.normalize_path(&base)?;
+    let ours = repo.normalize_path(&ours)?;
+    let theirs = repo.normalize_path(&theirs)?;
 
-    let base_id = repo.rev_parse_single(base.as_bstr()).ok();
-    let ours_id = repo.rev_parse_single(ours.as_bstr()).ok();
-    let theirs_id = repo.rev_parse_single(theirs.as_bstr()).ok();
+    let base_id = repo.rev_parse_single(base.as_ref()).ok();
+    let ours_id = repo.rev_parse_single(ours.as_ref()).ok();
+    let theirs_id = repo.rev_parse_single(theirs.as_ref()).ok();
     let roots = worktree_roots(base_id, ours_id, theirs_id, repo.workdir())?;
 
     let mut cache = repo.merge_resource_cache(roots)?;
@@ -51,21 +40,21 @@ pub fn file(
     cache.set_resource(
         base_id.map_or(null, Id::detach),
         EntryKind::Blob,
-        base.as_bstr(),
+        base.as_ref(),
         ResourceKind::CommonAncestorOrBase,
         &repo.objects,
     )?;
     cache.set_resource(
         ours_id.map_or(null, Id::detach),
         EntryKind::Blob,
-        ours.as_bstr(),
+        ours.as_ref(),
         ResourceKind::CurrentOrOurs,
         &repo.objects,
     )?;
     cache.set_resource(
         theirs_id.map_or(null, Id::detach),
         EntryKind::Blob,
-        theirs.as_bstr(),
+        theirs.as_ref(),
         ResourceKind::OtherOrTheirs,
         &repo.objects,
     )?;
@@ -82,20 +71,20 @@ pub fn file(
     }
     let platform = cache.prepare_merge(&repo.objects, options)?;
     let labels = gix::merge::blob::builtin_driver::text::Labels {
-        ancestor: Some(base.as_bstr()),
-        current: Some(ours.as_bstr()),
-        other: Some(theirs.as_bstr()),
+        ancestor: Some(base.as_ref()),
+        current: Some(ours.as_ref()),
+        other: Some(theirs.as_ref()),
     };
     let mut buf = repo.empty_reusable_buffer();
     let (pick, resolution) = platform.merge(&mut buf, labels, &repo.command_context()?)?;
     let buf = platform
         .buffer_by_pick(pick)
-        .map_err(|_| anyhow!("Participating object was too large"))?
+        .map_err(|()| message("Participating object was too large").raise())?
         .unwrap_or(&buf);
-    out.write_all(buf)?;
+    out.write_all(buf).or_error()?;
 
     if resolution == Resolution::Conflict {
-        bail!("File conflicted")
+        bail!(gix::error::conflict("File conflicted"))
     }
     Ok(())
 }
@@ -105,9 +94,10 @@ fn worktree_roots(
     ours: Option<gix::Id<'_>>,
     theirs: Option<gix::Id<'_>>,
     workdir: Option<&Path>,
-) -> anyhow::Result<gix::merge::blob::pipeline::WorktreeRoots> {
+) -> Result<gix::merge::blob::pipeline::WorktreeRoots> {
     let roots = if base.is_none() || ours.is_none() || theirs.is_none() {
-        let workdir = workdir.context("A workdir is required if one of the bases are provided as path.")?;
+        let workdir =
+            workdir.ok_or_raise(|| unsupported("A workdir is required if one of the bases are provided as path."))?;
         gix::merge::blob::pipeline::WorktreeRoots {
             current_root: ours.is_none().then(|| workdir.to_owned()),
             other_root: theirs.is_none().then(|| workdir.to_owned()),

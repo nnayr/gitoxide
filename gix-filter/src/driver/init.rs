@@ -1,27 +1,12 @@
+use gix_error::Result;
 use std::process::Stdio;
 
 use bstr::{BStr, BString};
 
 use crate::{
     Driver, driver,
-    driver::{Operation, Process, State, process, substitute_f_parameter},
+    driver::{Operation, Process, RunningProcess, State, process, substitute_f_parameter},
 };
-
-/// The error returned by [State::maybe_launch_process()][super::State::maybe_launch_process()].
-#[derive(Debug, thiserror::Error)]
-#[expect(missing_docs)]
-pub enum Error {
-    #[error("Failed to spawn driver: {command:?}")]
-    SpawnCommand {
-        source: std::io::Error,
-        command: std::process::Command,
-    },
-    #[error("Process handshake with command {command:?} failed")]
-    ProcessHandshake {
-        source: process::client::handshake::Error,
-        command: std::process::Command,
-    },
-}
 
 /// Lifecycle
 impl State {
@@ -29,32 +14,35 @@ impl State {
     /// file for use in the invoked `SingleFile` process.
     ///
     /// Note that if a long-running process is defined, the `operation` isn't relevant and capabilities are to be checked by the caller.
+    ///
+    /// Spawn and handshake failures provide [metadata](gix_error::Error::metadata) with `program` (Path), the invoked
+    /// program name or path, and `command` (String), the prepared command's debug representation, while preserving
+    /// the underlying error as a cause.
     pub fn maybe_launch_process(
         &mut self,
         driver: &Driver,
         operation: Operation,
         rela_path: &BStr,
-    ) -> Result<Option<Process<'_>>, Error> {
+    ) -> Result<Option<Process<'_>>> {
         match driver.process.as_ref() {
             Some(process) => {
-                let client = match self.running.remove(process) {
-                    Some(c) => c,
+                let running = match self.running.remove(process) {
+                    Some(running) => running,
                     None => {
-                        let (child, cmd) = spawn_driver(process.clone(), &self.context)?;
-                        process::Client::handshake(child, "git-filter", &[2], &["clean", "smudge", "delay"]).map_err(
-                            |err| Error::ProcessHandshake {
-                                source: err,
-                                command: cmd,
-                            },
-                        )?
+                        let (child, command) = spawn_driver(process.clone(), &self.context)?;
+                        use gix_error::{ResultExt, message};
+                        let client =
+                            process::Client::handshake(child, "git-filter", &[2], &["clean", "smudge", "delay"])
+                                .or_raise(|| message("Process handshake failed").with_command(&command))?;
+                        RunningProcess { client, command }
                     }
                 };
 
                 // TODO: find a way to not have to do this 'borrow-dance'.
                 // this strangeness is to workaround the borrowchecker, who otherwise won't let us return a reader. Quite sad :/.
                 // One would want to `get_mut()` or insert essentially, but it won't work.
-                self.running.insert(process.clone(), client);
-                let client = self.running.get_mut(process).expect("just inserted");
+                self.running.insert(process.clone(), running);
+                let client = &mut self.running.get_mut(process).expect("just inserted").client;
 
                 Ok(Some(Process::MultiFile {
                     client,
@@ -86,26 +74,21 @@ impl State {
     }
 }
 
-fn spawn_driver(
-    cmd: BString,
-    context: &gix_command::Context,
-) -> Result<(std::process::Child, std::process::Command), Error> {
-    let mut cmd: std::process::Command = gix_command::prepare(gix_path::from_bstr(cmd).into_owned())
+fn spawn_driver(cmd: BString, context: &gix_command::Context) -> Result<(std::process::Child, std::process::Command)> {
+    let mut cmd: std::process::Command = gix_command::prepare(gix_path::from_bstr(cmd)?.into_owned())
         .command_may_be_shell_script()
         .with_context(context.clone())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
-        .into();
+        .try_into()?;
+    if let Some(worktree_dir) = &context.worktree_dir {
+        cmd.current_dir(worktree_dir);
+    }
     gix_trace::debug!(cmd = ?cmd, "launching filter driver");
-    let child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(err) => {
-            return Err(Error::SpawnCommand {
-                source: err,
-                command: cmd,
-            });
-        }
-    };
+    use gix_error::{ResultExt, message};
+    let child = cmd
+        .spawn()
+        .or_raise(|| message("Failed to spawn driver").with_command(&cmd))?;
     Ok((child, cmd))
 }

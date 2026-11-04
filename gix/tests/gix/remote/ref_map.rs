@@ -1,8 +1,9 @@
 #[cfg(any(feature = "blocking-network-client", feature = "async-network-client-async-std"))]
 mod blocking_and_async_io {
     use gix::{config::tree::Protocol, remote::Direction::Fetch};
-    use gix_features::progress;
     use gix_protocol::bisync;
+    use gix_testtools::TestResult;
+    use gix_utils::progress;
 
     use crate::{
         remote,
@@ -12,7 +13,13 @@ mod blocking_and_async_io {
     #[bisync::bisync]
     #[cfg_attr(feature = "blocking-network-client", test)]
     #[cfg_attr(feature = "async-network-client-async-std", async_std::test)]
-    async fn all() -> crate::Result {
+    async fn all() -> TestResult {
+        // Blocking local ref discovery spawns `upload-pack`, which inherits ambient Git configuration.
+        // Isolate it in a child to keep ref-map I/O parallel without changing the parent environment.
+        #[cfg(feature = "blocking-network-client")]
+        if gix_testtools::run_in_isolated_process()? {
+            return Ok(());
+        }
         let daemon = spawn_git_daemon_if_async(remote::repo_path("base"))?;
         for (fetch_tags, version, expected_remote_refs, expected_mappings) in [
             (gix::remote::fetch::Tags::None, None, 11, 11),

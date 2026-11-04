@@ -8,9 +8,11 @@
 // TODO: Rewrite this based on what Git actually this, as long as there are test-cases for any 'complication'.
 //       In practice, even this simplified version seems to have worked pretty well.
 
+use gix_error::{Result, message};
 use std::ops::Range;
 
 use bstr::{BStr, ByteSlice};
+use gix_error::ResultExt;
 use gix_object::tree::{EntryKind, EntryMode};
 
 use crate::{
@@ -75,18 +77,19 @@ impl<T: Change> Item<T> {
         use EntryKind::*;
         matches!(
             (other.kind(), self.change.entry_mode().kind()),
-            (Blob | BlobExecutable, Blob | BlobExecutable) | (Link, Link) | (Tree, Tree)
+            (Blob | BlobExecutable, Blob | BlobExecutable) | (Link, Link) | (Tree, Tree) | (Commit, Commit)
         )
     }
 
+    fn is_source_candidate(&self, kind: visit::SourceKind) -> bool {
+        match kind {
+            visit::SourceKind::Rename => !self.emitted && matches!(self.change.kind(), ChangeKind::Deletion),
+            visit::SourceKind::Copy => matches!(self.change.kind(), ChangeKind::Modification),
+        }
+    }
+
     fn is_source_for_destination_of(&self, kind: visit::SourceKind, dest_item_mode: EntryMode) -> bool {
-        self.entry_mode_compatible(dest_item_mode)
-            && match kind {
-                visit::SourceKind::Rename => !self.emitted && matches!(self.change.kind(), ChangeKind::Deletion),
-                visit::SourceKind::Copy => {
-                    matches!(self.change.kind(), ChangeKind::Modification)
-                }
-            }
+        self.entry_mode_compatible(dest_item_mode) && self.is_source_candidate(kind)
     }
 }
 
@@ -133,23 +136,6 @@ pub mod visit {
     }
 }
 
-///
-pub mod emit {
-    /// The error returned by [Tracker::emit()](super::Tracker::emit()).
-    #[derive(Debug, thiserror::Error)]
-    #[expect(missing_docs)]
-    pub enum Error {
-        #[error("Could not find blob for similarity checking")]
-        FindExistingBlob(#[from] gix_object::find::existing_object::Error),
-        #[error("Could not obtain exhaustive item set to use as possible sources for copy detection")]
-        GetItemsForExhaustiveCopyDetection(#[source] Box<dyn std::error::Error + Send + Sync>),
-        #[error(transparent)]
-        SetResource(#[from] crate::blob::platform::set_resource::Error),
-        #[error(transparent)]
-        PrepareDiff(#[from] crate::blob::platform::prepare_diff::Error),
-    }
-}
-
 /// Lifecycle
 impl<T: Change> Tracker<T> {
     /// Create a new instance with `rewrites` configuration.
@@ -173,9 +159,6 @@ impl<T: Change> Tracker<T> {
         }
 
         let entry_kind = change.entry_mode().kind();
-        if entry_kind == EntryKind::Commit {
-            return Some(change);
-        }
         let relation = change
             .relation()
             .filter(|_| matches!(change_kind, ChangeKind::Addition | ChangeKind::Deletion));
@@ -223,14 +206,16 @@ impl<T: Change> Tracker<T> {
         diff_cache: &mut crate::blob::Platform,
         objects: &impl gix_object::FindObjectOrHeader,
         mut push_source_tree: PushSourceTreeFn,
-    ) -> Result<Outcome, emit::Error>
+    ) -> Result<Outcome>
     where
-        PushSourceTreeFn: FnMut(&mut dyn FnMut(T, &BStr)) -> Result<(), E>,
+        PushSourceTreeFn: FnMut(&mut dyn FnMut(T, &BStr)) -> std::result::Result<(), E>,
         E: std::error::Error + Send + Sync + 'static,
     {
         fn is_parent(change: &impl Change) -> bool {
             matches!(change.relation(), Some(Relation::Parent(_)))
         }
+
+        self.child_renames.clear();
         diff_cache.options.skip_internal_diff_if_external_is_configured = false;
 
         // Early abort: if there is no pair, don't do anything.
@@ -310,7 +295,11 @@ impl<T: Change> Tracker<T> {
                                 self.items.last_mut().expect("just pushed").emitted = true;
                             }
                         })
-                        .map_err(|err| emit::Error::GetItemsForExhaustiveCopyDetection(Box::new(err)))?;
+                        .or_raise(|| {
+                            message(
+                                "Could not obtain exhaustive item set to use as possible sources for copy detection",
+                            )
+                        })?;
                         self.sort_items_by_id_and_location();
 
                         self.match_pairs_of_kind(
@@ -376,7 +365,7 @@ impl<T: Change> Tracker<T> {
         diff_cache: &mut crate::blob::Platform,
         objects: &impl gix_object::FindObjectOrHeader,
         filter: Option<fn(&T) -> bool>,
-    ) -> Result<(), emit::Error> {
+    ) -> Result {
         // we try to cheaply reduce the set of possibilities first, before possibly looking more exhaustively.
         let needs_second_pass = !needs_exact_match(percentage);
 
@@ -395,8 +384,8 @@ impl<T: Change> Tracker<T> {
             } else {
                 let (num_src, num_dst) =
                     estimate_involved_items(self.items.iter().map(|item| (item.emitted, item.change.kind())), kind);
-                let permutations = num_src * num_dst;
-                if permutations > self.rewrites.limit {
+                if limit_is_exceeded(num_src, num_dst, self.rewrites.limit) {
+                    let permutations = num_src.saturating_mul(num_dst);
                     match kind {
                         visit::SourceKind::Rename => {
                             out.num_similarity_checks_skipped_for_rename_tracking_due_to_limit = permutations;
@@ -427,7 +416,7 @@ impl<T: Change> Tracker<T> {
         diff_cache: &mut crate::blob::Platform,
         objects: &impl gix_object::FindObjectOrHeader,
         filter: Option<fn(&T) -> bool>,
-    ) -> Result<Action, emit::Error> {
+    ) -> Result<Action> {
         let mut dest_ofs = 0;
         let mut num_checks = 0;
         let max_checks = {
@@ -437,6 +426,18 @@ impl<T: Change> Tracker<T> {
             // can be too slow despite best attempts. So play it save and detect such cases 'roughly' by amount of items.
             if self.items.len() < 100_000 { 0 } else { limit }
         };
+        // Items only stop being possible sources while matching, so this is a superset of the sources for all
+        // destinations. Destinations then only need to be compared to these instead of to all items, which matters
+        // when there are many more destinations than sources.
+        let source_candidates: Vec<usize> = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, item)| item.is_source_candidate(kind).then_some(idx))
+            .collect();
+        if source_candidates.is_empty() {
+            return Ok(std::ops::ControlFlow::Continue(()));
+        }
 
         while let Some((mut dest_idx, dest)) = self.items[dest_ofs..].iter().enumerate().find_map(|(idx, item)| {
             (!item.emitted
@@ -461,6 +462,7 @@ impl<T: Change> Tracker<T> {
             self.items[dest_idx].location(&self.path_backing);
             let src = find_match(
                 &self.items,
+                &source_candidates,
                 dest,
                 dest_idx,
                 percentage,
@@ -521,7 +523,10 @@ impl<T: Change> Tracker<T> {
                     }
                 }
                 Some((Relation::ChildOfParent(src), Relation::ChildOfParent(dst))) => {
-                    self.child_renames.insert((src, dst));
+                    self.child_renames
+                        .entry((src, dst))
+                        .or_default()
+                        .push((src_idx, dest_idx));
                 }
                 _ => {}
             }
@@ -538,7 +543,7 @@ impl<T: Change> Tracker<T> {
         kind: visit::SourceKind,
         src_parent_id: ChangeId,
         dst_parent_id: ChangeId,
-    ) -> Result<Action, emit::Error> {
+    ) -> Result<Action> {
         debug_assert_ne!(
             src_parent_id, dst_parent_id,
             "src and destination directories must be distinct"
@@ -597,17 +602,17 @@ impl<T: Change> Tracker<T> {
     /// Then use the previously stored emitted renames with relation id to learn which directories they 'link'
     /// and emit them, too.
     /// Note that this works whenever top-level directories are renamed because they are always added and deleted,
-    /// and we only match those. Thus, one rewrite inside the directory is enough.
+    /// and we only match those. One rewrite preserving the relative directory path is enough.
     fn match_renamed_directories(
         &mut self,
         cb: &mut impl FnMut(visit::Destination<'_, T>, Option<visit::Source<'_, T>>) -> Action,
-    ) -> Result<(), emit::Error> {
+    ) -> Result {
         fn unemitted_directory_matching_relation_id<T: Change>(items: &[Item<T>], child_id: ChangeId) -> Option<usize> {
             items.iter().position(|i| {
                 !i.emitted && matches!(i.change.relation(), Some(Relation::Parent(pid)) if pid == child_id)
             })
         }
-        for (deleted_child_id, added_child_id) in &self.child_renames {
+        for ((deleted_child_id, added_child_id), children) in &self.child_renames {
             let Some(src_idx) = unemitted_directory_matching_relation_id(&self.items, *deleted_child_id) else {
                 continue;
             };
@@ -618,6 +623,28 @@ impl<T: Change> Tracker<T> {
             };
 
             let (src_item, dst_item) = (&self.items[src_idx], &self.items[dst_idx]);
+            if !children.iter().any(|&(src_child_idx, dst_child_idx)| {
+                let relative_directory = |child_idx: usize, parent: &Item<T>| {
+                    let child = &self.items[child_idx];
+                    child
+                        .location(&self.path_backing)
+                        .strip_prefix(parent.location(&self.path_backing).as_bytes())
+                        .and_then(|path| path.strip_prefix(b"/"))
+                        .map(|path| {
+                            if child.change.entry_mode().is_tree() {
+                                path
+                            } else {
+                                // File names may change without renaming their containing directory.
+                                &path[..path.rfind_byte(b'/').unwrap_or(0)]
+                            }
+                        })
+                };
+                let src_relative = relative_directory(src_child_idx, src_item);
+                let dst_relative = relative_directory(dst_child_idx, dst_item);
+                src_relative.is_some() && src_relative == dst_relative
+            }) {
+                continue;
+            }
             let entry_mode = src_item.change.entry_mode();
             let location = src_item.location(&self.path_backing);
             let src = visit::Source {
@@ -681,6 +708,12 @@ fn estimate_involved_items(
         })
 }
 
+fn limit_is_exceeded(num_src: usize, num_dst: usize, limit: usize) -> bool {
+    // Saturating both products can hide an exceeded limit; u128 holds them exactly on supported targets.
+    let limit = limit as u128;
+    (num_src as u128) * (num_dst as u128) > limit * limit
+}
+
 fn needs_exact_match(percentage: Option<f32>) -> bool {
     percentage.is_none_or(|p| p >= 1.0)
 }
@@ -698,6 +731,7 @@ type SourceTuple<'a, T> = (usize, &'a Item<T>, Option<DiffLineStats>);
 #[expect(clippy::too_many_arguments)]
 fn find_match<'a, T: Change>(
     items: &'a [Item<T>],
+    source_candidates: &[usize],
     item: &Item<T>,
     item_idx: usize,
     percentage: Option<f32>,
@@ -707,28 +741,20 @@ fn find_match<'a, T: Change>(
     diff_cache: &mut crate::blob::Platform,
     path_backing: &[u8],
     num_checks: &mut usize,
-) -> Result<Option<SourceTuple<'a, T>>, emit::Error> {
+) -> Result<Option<SourceTuple<'a, T>>> {
     let (item_id, item_mode) = item.change.id_and_entry_mode();
-    if needs_exact_match(percentage) || item_mode.is_link() {
-        let first_idx = items.partition_point(|a| a.change.id() < item_id);
-        let range = items.get(first_idx..).map(|slice| {
-            let end = slice
-                .iter()
-                .position(|a| a.change.id() != item_id)
-                .map_or(items.len(), |idx| first_idx + idx);
-            first_idx..end
-        });
-        let range = match range {
-            Some(range) => range,
-            None => return Ok(None),
-        };
-        if range.is_empty() {
+    // Symlinks and gitlinks only participate in exact-ID matching; neither has meaningful blob similarity here.
+    if needs_exact_match(percentage) || item_mode.is_link() || item_mode.is_commit() {
+        // Items are sorted by id, so the candidates with the same id are a contiguous range of `source_candidates`.
+        let start = source_candidates.partition_point(|&idx| items[idx].change.id() < item_id);
+        let end = source_candidates.partition_point(|&idx| items[idx].change.id() <= item_id);
+        if start == end {
             return Ok(None);
         }
         let item_name = filename(item.location(path_backing));
         let mut fallback = None;
-        for (mut src_idx, src) in items[range.clone()].iter().enumerate() {
-            src_idx += range.start;
+        for &src_idx in &source_candidates[start..end] {
+            let src = &items[src_idx];
             *num_checks += 1;
             if src_idx == item_idx || !src.is_source_for_destination_of(kind, item_mode) {
                 continue;
@@ -751,30 +777,36 @@ fn find_match<'a, T: Change>(
         // Like Git's inexact rename matrix, choose by similarity score first and use basename as
         // a tie-breaker only.
         let mut best: Option<(usize, &Item<T>, DiffLineStats, bool)> = None;
-        for (can_idx, src) in items
+        for (can_idx, src) in source_candidates
             .iter()
-            .enumerate()
+            .map(|&src_idx| (src_idx, &items[src_idx]))
             .filter(|(src_idx, src)| *src_idx != item_idx && src.is_source_for_destination_of(kind, item_mode))
         {
             if !has_new {
-                diff_cache.set_resource(
-                    item_id.to_owned(),
-                    item_mode.kind(),
-                    item.location(path_backing),
-                    ResourceKind::NewOrDestination,
-                    objects,
-                )?;
+                diff_cache
+                    .set_resource(
+                        item_id.to_owned(),
+                        item_mode.kind(),
+                        item.location(path_backing),
+                        ResourceKind::NewOrDestination,
+                        objects,
+                    )
+                    .or_raise(|| message("Could not set destination for similarity checking"))?;
                 has_new = true;
             }
             let (src_id, src_mode) = src.change.id_and_entry_mode();
-            diff_cache.set_resource(
-                src_id.to_owned(),
-                src_mode.kind(),
-                src.location(path_backing),
-                ResourceKind::OldOrSource,
-                objects,
-            )?;
-            let prep = diff_cache.prepare_diff()?;
+            diff_cache
+                .set_resource(
+                    src_id.to_owned(),
+                    src_mode.kind(),
+                    src.location(path_backing),
+                    ResourceKind::OldOrSource,
+                    objects,
+                )
+                .or_raise(|| message("Could not set source for similarity checking"))?;
+            let prep = diff_cache
+                .prepare_diff()
+                .or_raise(|| message("Could not prepare resources for similarity checking"))?;
             stats.num_similarity_checks += 1;
             *num_checks += 1;
             match prep.operation {
@@ -831,6 +863,45 @@ mod diff {
                     .sum::<usize>()
             })
             .sum()
+    }
+}
+
+#[cfg(test)]
+mod limit_is_exceeded {
+    use super::limit_is_exceeded;
+
+    #[test]
+    fn overflowing_products_are_compared_without_saturation() {
+        for limit in [70_000, usize::MAX / 2] {
+            assert!(
+                limit_is_exceeded(limit + 1, limit + 1, limit),
+                "candidate counts just above the limit must be rejected even when both products overflow usize"
+            );
+            assert!(
+                !limit_is_exceeded(limit, limit, limit),
+                "a product equal to the squared limit is allowed"
+            );
+            assert!(
+                !limit_is_exceeded(limit - 1, limit, limit),
+                "a product below the squared limit is allowed even when both products overflow usize"
+            );
+        }
+    }
+
+    #[test]
+    fn maximum_counts_and_unbalanced_candidates() {
+        assert!(
+            !limit_is_exceeded(usize::MAX, usize::MAX, usize::MAX),
+            "squaring the largest supported count must not overflow the comparison"
+        );
+        assert!(
+            !limit_is_exceeded(0, usize::MAX, 1),
+            "without sources there are no comparisons to limit"
+        );
+        assert!(
+            limit_is_exceeded(usize::MAX, 1, 1),
+            "the product, not the smaller candidate count, determines whether the limit is exceeded"
+        );
     }
 }
 

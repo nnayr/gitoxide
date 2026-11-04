@@ -17,11 +17,15 @@
 #![cfg_attr(all(doc, feature = "document-features"), feature(doc_cfg))]
 #![deny(missing_docs, unsafe_code)]
 
+#[cfg(feature = "handshake")]
+use gix_error::Result;
+
 /// A function that performs a given credential action, trying to obtain credentials for an operation that needs it.
 ///
 /// Useful for both `fetch` and `push`.
 #[cfg(feature = "handshake")]
-pub type AuthenticateFn<'a> = Box<dyn FnMut(gix_credentials::helper::Action) -> gix_credentials::protocol::Result + 'a>;
+pub type AuthenticateFn<'a> =
+    Box<dyn FnMut(gix_credentials::helper::Action) -> Result<Option<gix_credentials::protocol::Outcome>> + 'a>;
 
 /// A selector for V2 commands to invoke on the server for purpose of pre-invocation validation.
 #[derive(PartialEq, Eq, Debug, Hash, Ord, PartialOrd, Clone, Copy)]
@@ -33,10 +37,19 @@ pub enum Command {
 }
 pub mod command;
 
-#[cfg(all(feature = "async-client", not(feature = "blocking-client")))]
-pub use ::bisync::asynchronous as bisync;
-#[cfg(feature = "blocking-client")]
-pub use ::bisync::synchronous as bisync;
+/// Attribute macros and mode flags for sharing async-shaped implementations between client modes.
+#[cfg(any(feature = "blocking-client", feature = "async-client"))]
+pub mod bisync {
+    #[cfg(all(feature = "async-client", not(feature = "blocking-client")))]
+    pub use gix_macros::{discard as only_sync, keep as bisync, keep as only_async};
+    #[cfg(feature = "blocking-client")]
+    pub use gix_macros::{discard as only_async, keep as only_sync, sync as bisync};
+
+    /// Whether the blocking implementation is selected.
+    pub const SYNC: bool = cfg!(feature = "blocking-client");
+    /// Whether the async implementation is selected.
+    pub const ASYNC: bool = !SYNC;
+}
 #[cfg(feature = "async-client")]
 pub use async_trait;
 #[cfg(feature = "async-client")]

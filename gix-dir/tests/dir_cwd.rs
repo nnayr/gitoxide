@@ -11,9 +11,9 @@ use crate::walk_utils::{collect, entryps, fixture, options};
 pub mod walk_utils;
 
 #[test]
-fn prefixes_work_as_expected() -> gix_testtools::Result {
+fn prefixes_work_as_expected() -> gix_testtools::TestResult {
     let root = fixture("only-untracked");
-    std::env::set_current_dir(root.join("d"))?;
+    let _cwd = gix_testtools::set_current_dir(root.join("d"))?;
     let troot = Path::new("..").join("d");
     let ((out, _root), entries) = collect(Path::new(".."), Some(&troot), |keep, ctx| {
         walk(Path::new(".."), ctx, options(), keep)

@@ -50,6 +50,8 @@ pub struct Stack {
     stack: gix_fs::Stack,
     /// tells us what to do as we change paths.
     state: stack::State,
+    /// Whether to reject terminal non-directory symlinks on Windows.
+    reject_terminal_symlinks: bool,
     /// A buffer used when reading attribute or ignore files or their respective objects from the object database.
     buf: Vec<u8>,
     /// If case folding should happen when looking up attributes or exclusions.
@@ -60,6 +62,22 @@ pub struct Stack {
 }
 
 pub(crate) type PathIdMapping = (BString, gix_hash::ObjectId);
+
+mod lock;
+pub use lock::set_lock;
+
+/// Add linked worktrees by preparing their administrative files.
+#[cfg(feature = "add")]
+pub mod add;
+
+/// Remove linked worktrees and their administrative files.
+#[cfg(feature = "remove")]
+pub mod remove;
+#[cfg(feature = "remove")]
+pub use remove::_impl::remove;
+
+/// Read sparse-checkout patterns and apply them to a full index.
+pub mod sparse;
 
 ///
 pub mod stack;

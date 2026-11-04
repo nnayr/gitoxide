@@ -47,10 +47,10 @@ fn offset_to_next_entry() {
 }
 
 #[test]
-fn everything() -> crate::Result {
+fn everything() -> gix_testtools::TestResult {
     assert_eq!(
         TreeRefIter::from_bytes(&tree_fixture("everything.tree")?, fixture_hash_kind())
-            .collect::<Result<Vec<_>, _>>()?,
+            .collect::<std::result::Result<Vec<_>, _>>()?,
         vec![
             EntryRef {
                 mode: tree::EntryKind::BlobExecutable.into(),
@@ -83,13 +83,13 @@ fn everything() -> crate::Result {
 }
 
 #[test]
-fn leading_space_in_tree_name() -> crate::Result {
+fn leading_space_in_tree_name() -> gix_testtools::TestResult {
     let oid = fixture_oid("4d5fcadc293a348e88f777dc0920f11e7d71441c");
     let mut buf = b"40000  leading space\0".to_vec();
     buf.extend_from_slice(oid.as_bytes());
 
     assert_eq!(
-        TreeRefIter::from_bytes(&buf, fixture_hash_kind()).collect::<Result<Vec<_>, _>>()?,
+        TreeRefIter::from_bytes(&buf, fixture_hash_kind()).collect::<std::result::Result<Vec<_>, _>>()?,
         vec![EntryRef {
             mode: tree::EntryKind::Tree.into(),
             filename: b" leading space".as_bstr(),
@@ -100,13 +100,14 @@ fn leading_space_in_tree_name() -> crate::Result {
 }
 
 mod lookup_entry {
+
     use gix_object::tree::EntryKind;
     use utils::entry;
 
     use crate::fixture_hash_kind;
 
     #[test]
-    fn top_level_directory() -> crate::Result {
+    fn top_level_directory() -> gix_testtools::TestResult {
         assert_eq!(
             utils::lookup_entry_by_path("bin")?,
             entry("bin", EntryKind::Blob, fixture_hash_kind().empty_blob())
@@ -115,7 +116,7 @@ mod lookup_entry {
     }
 
     #[test]
-    fn nested_file() -> crate::Result {
+    fn nested_file() -> gix_testtools::TestResult {
         assert_eq!(
             utils::lookup_entry_by_path("file/a")?,
             entry("a", EntryKind::Blob, fixture_hash_kind().empty_blob())
@@ -124,7 +125,7 @@ mod lookup_entry {
     }
 
     #[test]
-    fn non_existing_nested_file() -> crate::Result {
+    fn non_existing_nested_file() -> gix_testtools::TestResult {
         for path in ["file/does-not-exist", "non-existing", "file/a/through-file"] {
             let actual = utils::lookup_entry_by_path(path)?;
             assert_eq!(actual, None);
@@ -147,14 +148,7 @@ mod lookup_entry {
 
         pub(super) fn tree_odb() -> gix_testtools::Result<gix_odb::Handle> {
             let root = gix_testtools::scripted_fixture_read_only("make_trees.sh")?;
-            Ok(gix_odb::at_opts(
-                root.join(".git/objects"),
-                Vec::new(),
-                gix_odb::store::init::Options {
-                    object_hash: crate::fixture_hash_kind(),
-                    ..Default::default()
-                },
-            )?)
+            Ok(gix_odb::at(root.join(".git/objects"), crate::fixture_hash_kind())?)
         }
 
         pub(super) fn lookup_entry_by_path(path: &str) -> gix_testtools::Result<Option<gix_object::tree::Entry>> {
@@ -165,7 +159,7 @@ mod lookup_entry {
             let root_tree = odb.find_tree_iter(&root_tree_id, &mut buf)?;
 
             let mut buf = Vec::new();
-            root_tree.lookup_entry_by_path(&odb, &mut buf, path)
+            Ok(root_tree.lookup_entry_by_path(&odb, &mut buf, path)?)
         }
     }
 }

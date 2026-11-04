@@ -1,9 +1,11 @@
-pub use ::bisync::asynchronous as bisync;
+pub mod bisync {
+    pub use gix_macros::{discard as only_sync, keep as bisync, keep as only_async};
+}
 
 use std::path::PathBuf;
 
-pub type Error = Box<dyn std::error::Error>;
-pub type Result<T = ()> = std::result::Result<T, Error>;
+pub type Error = Box<dyn std::error::Error + Send + Sync>;
+pub use gix_testtools::TestResult;
 
 pub fn fixture_bytes(path: &str) -> Vec<u8> {
     fn fixture_path(path: &str) -> PathBuf {

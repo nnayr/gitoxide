@@ -2,6 +2,7 @@
 use std::path::Path;
 
 /// The amount of retries to do during various aspects of the directory creation.
+/// A zero budget allows the initial attempt but no retries for that failure.
 #[derive(Debug, Clone, Copy, Ord, PartialOrd, Eq, PartialEq)]
 pub struct Retries {
     /// How many times the whole directory can be created in the light of racy interference.
@@ -30,8 +31,8 @@ mod error {
 
     use crate::dir::create::Retries;
 
-    /// The error returned by [all()][super::all()].
-    #[expect(missing_docs)]
+    /// The error yielded by [`Iter`][super::Iter].
+    #[cfg_attr(feature = "unstable", expect(missing_docs))]
     #[derive(Debug)]
     pub enum Error<'a> {
         /// A failure we will probably recover from by trying again.
@@ -63,7 +64,7 @@ mod error {
                     retries,
                 } => write!(
                     f,
-                    "Permanently failing to create directory '{dir}' ({retries_left:?} of {retries:?})",
+                    "Permanently failing to create directory \"{dir}\" ({retries_left:?} of {retries:?})",
                     dir = dir.display(),
                 ),
             }
@@ -79,6 +80,7 @@ mod error {
         }
     }
 }
+#[gix_macros::unstable(since = "2021-06-17")]
 pub use error::Error;
 
 enum State {
@@ -91,28 +93,38 @@ enum State {
 /// * `Some(Ok(created_directory))` is yielded once or more success, followed by `None`
 /// * `Some(Err(Error::Intermediate))` is yielded zero or more times while trying to create the directory.
 /// * `Some(Err(Error::Permanent))` is yielded exactly once on failure.
+#[gix_macros::unstable(since = "2021-06-17")]
 pub struct Iter<'a> {
     cursors: Vec<&'a Path>,
     retries: Retries,
     original_retries: Retries,
     state: State,
+    shared_repository_permissions: i32,
 }
 
 /// Construction
 impl<'a> Iter<'a> {
     /// Create a new instance that creates `target` when iterated with the default amount of [`Retries`].
-    pub fn new(target: &'a Path) -> Self {
-        Self::new_with_retries(target, Default::default())
-    }
-
-    /// Create a new instance that creates `target` when iterated with the specified amount of `retries`.
-    pub fn new_with_retries(target: &'a Path, retries: Retries) -> Self {
+    /// Apply Git's parsed sharing policy to newly created directories; `0` keeps the umask permissions.
+    /// See [`crate::set_shared_repository_permissions()`] for the encoding.
+    pub fn new(target: &'a Path, shared_repository_permissions: i32) -> Self {
         Iter {
             cursors: vec![target],
-            original_retries: retries,
-            retries,
+            original_retries: Retries::default(),
+            retries: Retries::default(),
             state: State::SearchingUpwardsForExistingDirectory,
+            shared_repository_permissions,
         }
+    }
+}
+
+/// Builder
+impl Iter<'_> {
+    /// Set how often directory creation retries after interruptions, missing parents, or concurrent directory removal.
+    pub fn retries(mut self, retries: Retries) -> Self {
+        self.retries = retries;
+        self.original_retries = retries;
+        self
     }
 }
 
@@ -144,6 +156,10 @@ impl<'a> Iterator for Iter<'a> {
         match self.cursors.pop() {
             Some(dir) => match std::fs::create_dir(dir) {
                 Ok(()) => {
+                    if let Err(err) = crate::set_shared_repository_permissions(dir, self.shared_repository_permissions)
+                    {
+                        return self.permanent_failure(dir, err);
+                    }
                     self.state = State::CurrentlyCreatingDirectories;
                     Some(Ok(dir))
                 }
@@ -157,10 +173,12 @@ impl<'a> Iterator for Iter<'a> {
                     // collision apart from a directory that already exists.
                     AlreadyExists => self.permanent_failure(dir, std::io::Error::new(NotADirectory, err)),
                     NotFound => {
-                        self.retries.on_create_directory_failure -= 1;
+                        self.retries.on_create_directory_failure =
+                            self.retries.on_create_directory_failure.saturating_sub(1);
                         if let State::CurrentlyCreatingDirectories = self.state {
                             self.state = State::SearchingUpwardsForExistingDirectory;
-                            self.retries.to_create_entire_directory -= 1;
+                            self.retries.to_create_entire_directory =
+                                self.retries.to_create_entire_directory.saturating_sub(1);
                             if self.retries.to_create_entire_directory < 1 {
                                 return self.permanent_failure(dir, NotFound);
                             }
@@ -178,7 +196,7 @@ impl<'a> Iterator for Iter<'a> {
                         self.intermediate_failure(dir, err)
                     }
                     Interrupted => {
-                        self.retries.on_interrupt -= 1;
+                        self.retries.on_interrupt = self.retries.on_interrupt.saturating_sub(1);
                         if self.retries.on_interrupt <= 1 {
                             return self.permanent_failure(dir, Interrupted);
                         }
@@ -194,9 +212,15 @@ impl<'a> Iterator for Iter<'a> {
 }
 
 /// Create all directories leading to `dir` including `dir` itself with the specified amount of `retries`.
-/// Returns the input `dir` on success that make it useful in expressions.
-pub fn all(dir: &Path, retries: Retries) -> std::io::Result<&Path> {
-    for res in Iter::new_with_retries(dir, retries) {
+///
+/// Apply Git's parsed sharing policy to each newly created directory, or pass `0` to keep the umask permissions.
+/// Existing directories, including ancestors, retain their permissions.
+/// See [`crate::set_shared_repository_permissions()`] for the policy encoding.
+///
+/// Returns the input `dir` on success to make it useful in expressions.
+pub fn all(dir: &Path, retries: Retries, shared_repository_permissions: i32) -> std::io::Result<&Path> {
+    let iter = Iter::new(dir, shared_repository_permissions).retries(retries);
+    for res in iter {
         match res {
             Err(Error::Permanent { err, .. }) => return Err(err),
             Err(Error::Intermediate { .. }) | Ok(_) => continue,

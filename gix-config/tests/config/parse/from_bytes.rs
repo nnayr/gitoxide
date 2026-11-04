@@ -16,12 +16,11 @@ fn fuzz() {
 }
 
 #[test]
-fn filters_receive_event_refs_for_content_access() {
+fn filters_receive_event_refs_for_content_access() -> gix_testtools::TestResult {
     fn reject_drop_values(event: EventRef<'_>) -> bool {
         !matches!(event, EventRef::Value(value) if value == b"drop".as_slice())
     }
-    let events = Events::from_bytes(b"[core]\nkeep = keep\ndrop = drop\n", Some(reject_drop_values))
-        .expect("content-based filters can inspect event bytes through views");
+    let events = Events::from_bytes(b"[core]\nkeep = keep\ndrop = drop\n", Some(reject_drop_values))?;
 
     assert!(
         !events
@@ -29,6 +28,41 @@ fn filters_receive_event_refs_for_content_access() {
             .any(|event| matches!(event, EventRef::Value(value) if value == b"drop".as_slice())),
         "the filter can reject events by inspecting their value bytes"
     );
+    Ok(())
+}
+
+#[test]
+fn legacy_header_spelling_is_preserved() -> gix_testtools::TestResult {
+    let input = r#"[Remote.Origin]
+	url = location
+"#;
+    let events = Events::from_str(input)?;
+    let expected_header = EventRef::SectionHeader {
+        name: "Remote".into(),
+        separator: Some(".".into()),
+        subsection_name: Some("Origin".into()),
+    };
+    assert_eq!(
+        events.iter().next(),
+        Some(expected_header),
+        "syntactic event views retain the original legacy spelling"
+    );
+    assert_eq!(
+        events.sections().next().expect("one section").header(),
+        expected_header,
+        "section header views and the full event stream expose the same spelling"
+    );
+    let mut out = Vec::new();
+    for event in events.iter() {
+        event.write_to(&mut out)?;
+    }
+    assert_eq!(out, input.as_bytes(), "writing event views preserves legacy headers");
+    assert_eq!(
+        gix_config::format::normalize(input.as_bytes(), Default::default())?,
+        input,
+        "whitespace formatting leaves legacy header spelling untouched"
+    );
+    Ok(())
 }
 
 #[test]

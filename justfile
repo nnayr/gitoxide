@@ -5,34 +5,46 @@
 j := quote(just_executable())
 
 # List available recipes
+[private]
 default:
-    {{ j }} --list
+    @{{ j }} --list --unsorted
 
 alias t := test
 alias c := check
 alias nt := nextest
+alias ci := qa
+alias ci-plan := qa-plan
+alias ci-test := qa-test
+alias ci-journey-tests := qa-journey-tests
 
-# Run all tests, clippy, including journey tests, try building docs
-test: clippy check doc unit-tests doc-tests journey-tests-pure journey-tests-small journey-tests-async journey-tests check-mode
+# Show affected packages and why; use --base for a stacked PR or --mode exhaustive
+[group('QA')]
+[positional-arguments]
+qa-plan *args:
+    cargo run --profile qa --quiet --locked -p internal-tools --no-default-features --bin qa -- plan "$@"
 
-# Run all tests, without clippy, and try building docs
-ci-test: check doc unit-tests check-mode
+# Run QA on this host; --dry-run prints commands, --stage selects checks
+[group('QA')]
+[positional-arguments]
+qa *args:
+    cargo run --profile qa --quiet --locked -p internal-tools --no-default-features --bin qa -- run "$@"
 
-# Run all journey tests - should be run in a fresh clone or after `cargo clean`
-ci-journey-tests: journey-tests-pure journey-tests-small journey-tests-async journey-tests
-
-# Clean the `target` directory
-clear-target:
-    cargo clean
+# Run the full check and test suite, including docs and journey tests
+[group('Development')]
+[positional-arguments]
+test *args:
+    cargo run --profile qa --locked -p internal-tools --no-default-features --bin qa -- run --mode exhaustive "$@"
 
 # Run `cargo clippy` on all crates
+[group('Development')]
 clippy *clippy-args:
     cargo clippy --workspace --all-targets -- {{ clippy-args }}
     cargo clippy --workspace --no-default-features --features small -- {{ clippy-args }}
     cargo clippy --workspace --no-default-features --features max-pure -- {{ clippy-args }}
     cargo clippy --workspace --no-default-features --features lean-async --tests -- {{ clippy-args }}
 
-# Run `cargo clippy` on all crates, fixing what can be fixed, and format all code
+# Apply Clippy fixes to all crates, then format
+[group('Development')]
 clippy-fix:
     cargo clippy --fix --workspace --all-targets
     cargo clippy --fix --allow-dirty --workspace --no-default-features --features small
@@ -41,202 +53,36 @@ clippy-fix:
     cargo fmt --all
 
 # Build all code in suitable configurations
+[group('Development')]
 check:
-    cargo check --workspace
-    cargo check --no-default-features --features small
-    etc/scripts/check-gix-crates-without-hash-features.sh
-    etc/scripts/check-gix-crates-require-hash-features.sh
-    etc/scripts/check-gix-crates-do-not-default-hash-features.sh
-    etc/scripts/check-gix-crate-hash-feature-combinations.sh
-    cargo check -p gix-packetline --all-features 2>/dev/null
-    cargo check -p gix-transport --all-features 2>/dev/null
-    # Assure incompatible top-level feature combinations still fail, while gix-protocol supports both I/O modes together.
-    ! cargo check --features lean-async 2>/dev/null
-    ! cargo check -p gitoxide-core --all-features --features gix/sha1 2>/dev/null
-    cargo check -p gix-protocol --all-features
-    tree="$(cargo --color=never tree -p gix --no-default-features -e normal --prefix none --format '{p}')"; \
-        ! printf '%s\n' "$tree" | rg -q '^gix-imara-diff(-01)? v'
-    cargo --color=never tree -p gix --no-default-features -e normal -i gix-submodule \
-        2>&1 >/dev/null | grep '^warning: nothing to print\>'
-    cargo --color=never tree -p gix --no-default-features -e normal -i gix-pathspec \
-        2>&1 >/dev/null | grep '^warning: nothing to print\>'
-    cargo --color=never tree -p gix --no-default-features -e normal -i gix-filter \
-        2>&1 >/dev/null | grep '^warning: nothing to print\>'
-    ! cargo tree -p gix --no-default-features -i gix-credentials 2>/dev/null
-    cargo check --no-default-features --features lean
-    cargo check --no-default-features --features lean-async
-    cargo check --no-default-features --features max
-    cargo check -p gitoxide-core --features gix/sha1,blocking-client
-    cargo check -p gitoxide-core --features gix/sha1,async-client
-    cargo check -p gix-pack --no-default-features --features sha1
-    cargo check -p gix-pack --no-default-features --features sha1,generate
-    cargo check -p gix-pack --no-default-features --features sha1,streaming-input
-    cargo check -p gix-hash --all-features
-    cargo check -p gix-object --all-features
-    cargo check -p gix-attributes --features serde
-    cargo check -p gix-glob --features serde
-    cargo check -p gix-worktree --features serde 2>&1 >/dev/null | grep 'Please set either the `sha1` or the `sha256` feature flag'
-    cargo check -p gix-worktree --features sha1,serde
-    cargo check -p gix-worktree --no-default-features --features sha1
-    cargo check -p gix-actor --features serde
-    cargo check -p gix-date --features serde
-    cargo check -p gix-tempfile --features signals
-    cargo check -p gix-tempfile --features hp-hashmap
-    cargo check -p gix-pack --features serde 2>&1 >/dev/null | grep 'Please set either the `sha1` or the `sha256` feature flag'
-    cargo check -p gix-pack --features sha1,serde
-    cargo check -p gix-pack --features sha1,pack-cache-lru-static
-    cargo check -p gix-pack --features sha1,pack-cache-lru-dynamic
-    cargo check -p gix-pack --features sha1,object-cache-dynamic
-    cargo check -p gix-packetline --features blocking-io
-    cargo check -p gix-packetline --features async-io
-    cargo check -p gix-index --features serde 2>&1 >/dev/null | grep 'Please set either the `sha1` or the `sha256` feature flag'
-    cargo check -p gix-index --features sha1,serde
-    cargo check -p gix-credentials --features serde
-    cargo check -p gix-sec --features serde
-    cargo check -p gix-revision --features serde 2>&1 >/dev/null | grep 'Please set either the `sha1` or the `sha256` feature flag'
-    cargo check -p gix-revision --features sha1,serde
-    cargo check -p gix-revision --no-default-features --features sha1,describe
-    cargo check -p gix-mailmap --features serde
-    cargo check -p gix-url --all-features
-    cargo check -p gix-status --all-features
-    cargo check -p gix-features --all-features
-    cargo check -p gix-features --features parallel
-    cargo check -p gix-features --features fs-read-dir
-    cargo check -p gix-features --features progress
-    cargo check -p gix-features --features io-pipe
-    cargo check -p gix-features --features crc32
-    cargo check -p gix-features --features cache-efficiency-debug
-    cargo check -p gix-commitgraph --all-features
-    cargo check -p gix-config-value --all-features
-    cargo check -p gix-config --all-features
-    cargo check -p gix-diff --no-default-features 2>&1 >/dev/null | grep 'Please set either the `sha1` or the `sha256` feature flag'
-    cargo check -p gix-diff --no-default-features --features sha1
-    cargo check -p gix-transport --features blocking-client
-    cargo check -p gix-transport --features async-client
-    cargo check -p gix-transport --features async-client,async-std
-    cargo check -p gix-transport --features http-client
-    cargo check -p gix-transport --features http-client-curl
-    cargo check -p gix-transport --features http-client-reqwest
-    cargo check -p gix-protocol --features blocking-client 2>&1 >/dev/null | grep 'Please set either the `sha1` or the `sha256` feature flag'
-    cargo check -p gix-protocol --features sha1,blocking-client
-    cargo check -p gix-protocol --features sha1,async-client
-    cargo check -p gix --no-default-features --features sha1,async-network-client
-    cargo check -p gix --no-default-features --features sha1,async-network-client-async-std
-    cargo check -p gix --no-default-features --features sha1,blocking-network-client
-    cargo check -p gix --no-default-features --features sha1,blocking-http-transport-curl
-    cargo check -p gix --no-default-features --features sha1,blocking-http-transport-reqwest
-    cargo check -p gix --no-default-features --features max-performance --tests
-    cargo check -p gix --no-default-features --features max-performance-safe --tests
-    cargo check -p gix --no-default-features --features progress-tree --tests
-    cargo check -p gix --no-default-features --features blob-diff --tests
-    cargo check -p gix --no-default-features --features revision --tests
-    cargo check -p gix --no-default-features --features revparse-regex --tests
-    cargo check -p gix --no-default-features --features mailmap --tests
-    cargo check -p gix --no-default-features --features excludes --tests
-    cargo check -p gix --no-default-features --features attributes --tests
-    cargo check -p gix --no-default-features --features worktree-mutation --tests
-    cargo check -p gix --no-default-features --features credentials --tests
-    cargo check -p gix --no-default-features --features index --tests
-    cargo check -p gix --no-default-features --features interrupt --tests
-    cargo check -p gix --no-default-features --features blame --tests
-    cargo check -p gix --no-default-features --features sha1
-    cargo check -p gix --no-default-features --features sha1,sha256
-    cargo check -p gix --no-default-features --features sha256
-    cargo check -p gix --no-default-features 2>&1 >/dev/null | grep 'Please set either the `sha1` or the `sha256` feature flag'
-    cargo check -p gix-odb --features serde 2>&1 >/dev/null | grep 'Please set either the `sha1` or the `sha256` feature flag'
-    cargo check -p gix-odb --features sha1,serde
-    cargo check --no-default-features --features max-control,sha1
+    etc/scripts/cargo-check-all.sh
+
+# Check cargo-auditable compatibility (install with `cargo install cargo-auditable --locked`)
+[group('Development')]
+check-auditable:
+    # Keep this independent of compatibility aliases so they can be removed after upstream fixes.
+    cargo auditable build --locked --no-default-features --features small
 
 # Run `cargo doc` on all crates
+[group('Development')]
 doc $RUSTDOCFLAGS='-D warnings':
-    cargo doc --workspace --no-deps --features need-more-recent-msrv
-    cargo doc --features=max,lean,small --workspace --no-deps --features need-more-recent-msrv
+    # Default max already enables the lean/small dependency features.
+    cargo doc --locked --workspace --no-deps
 
 # Run all unit tests
+[group('Tests')]
 unit-tests:
-    cargo nextest run --no-fail-fast
-    cargo nextest run -p gix-testtools --no-fail-fast
-    cargo nextest run -p gix-testtools --features xz --no-fail-fast
-    cargo nextest run -p gix-archive --no-default-features --features sha1 --no-fail-fast
-    cargo nextest run -p gix-archive --no-default-features --features sha1,tar --no-fail-fast
-    cargo nextest run -p gix-archive --no-default-features --features sha1,tar_gz --no-fail-fast
-    cargo nextest run -p gix-archive --no-default-features --features sha1,zip --no-fail-fast
-    env GIX_TEST_FIXTURE_HASH=sha1 cargo nextest run -p gix-diff --no-fail-fast
-    env GIX_TEST_FIXTURE_HASH=sha256 cargo nextest run -p gix-diff --no-fail-fast
-    env GIX_TEST_FIXTURE_HASH=sha1 cargo nextest run -p gix-status --no-fail-fast
-    env GIX_TEST_FIXTURE_HASH=sha256 cargo nextest run -p gix-status --no-fail-fast
-    cargo nextest run -p gix-worktree-state --features parallel --no-fail-fast
-    cargo nextest run -p gix-worktree --features parallel --no-fail-fast
-    cargo nextest run -p gix-error --no-fail-fast --test auto-chain-error --features auto-chain-error
-    cargo nextest run -p gix-error --no-fail-fast
-    env GIX_TEST_FIXTURE_HASH=sha1 cargo nextest run -p gix-filter --no-fail-fast
-    env GIX_TEST_FIXTURE_HASH=sha256 cargo nextest run -p gix-filter --no-fail-fast
-    cargo nextest run -p gix-hash --features sha1 --no-fail-fast
-    cargo nextest run -p gix-hash --features sha1,sha256 --no-fail-fast
-    cargo nextest run -p gix-hash --features sha256 --no-fail-fast
-    env GIX_TEST_FIXTURE_HASH=sha1 cargo nextest run -p gix-commitgraph --no-fail-fast
-    env GIX_TEST_FIXTURE_HASH=sha256 cargo nextest run -p gix-commitgraph --no-fail-fast
-    env GIX_TEST_FIXTURE_HASH=sha1 cargo nextest run -p gix-object --no-fail-fast
-    env GIX_TEST_FIXTURE_HASH=sha256 cargo nextest run -p gix-object --no-fail-fast
-    env GIX_TEST_FIXTURE_HASH=sha1 cargo nextest run -p gix-object --no-fail-fast
-    env GIX_TEST_FIXTURE_HASH=sha256 cargo nextest run -p gix-object --no-fail-fast
-    cargo nextest run -p gix-tempfile --features signals --no-fail-fast
-    cargo nextest run -p gix-features --all-features --no-fail-fast
-    env GIX_TEST_FIXTURE_HASH=sha1 cargo nextest run -p gix-ref --all-features --no-fail-fast
-    env GIX_TEST_FIXTURE_HASH=sha256 cargo nextest run -p gix-ref --all-features --no-fail-fast
-    cargo nextest run -p gix-odb --all-features --no-fail-fast
-    cargo nextest run -p gix-odb --features parallel --no-fail-fast
-    env GIX_TEST_FIXTURE_HASH=sha1 cargo nextest run -p gix-odb --no-fail-fast
-    env GIX_TEST_FIXTURE_HASH=sha256 cargo nextest run -p gix-odb --no-fail-fast
-    # cover the parallel regression test under SHA-256, SHA-1 is covered by --features parallel above
-    env GIX_TEST_FIXTURE_HASH=sha256 cargo nextest run -p gix-odb --features parallel --no-fail-fast
-    env GIX_TEST_FIXTURE_HASH=sha1 cargo nextest run -p gix-pack --no-fail-fast
-    env GIX_TEST_FIXTURE_HASH=sha256 cargo nextest run -p gix-pack --no-fail-fast
-    env GIX_TEST_FIXTURE_HASH=sha1 cargo nextest run -p gix-diff --no-fail-fast
-    env GIX_TEST_FIXTURE_HASH=sha256 cargo nextest run -p gix-diff --no-fail-fast
-    cargo nextest run -p gix-pack --features parallel --no-fail-fast
-    env GIX_TEST_FIXTURE_HASH=sha1 cargo nextest run -p gix-index --features parallel --no-fail-fast
-    env GIX_TEST_FIXTURE_HASH=sha256 cargo nextest run -p gix-index --features parallel --no-fail-fast
-    cargo nextest run -p gix-packetline --features blocking-io --test blocking-packetline --no-fail-fast
-    cargo nextest run -p gix-packetline --features async-io --test async-packetline --no-fail-fast
-    cargo nextest run -p gix-transport --features http-client-curl --no-fail-fast
-    cargo nextest run -p gix-transport --features http-client-curl,http-client-insecure-credentials --test blocking-transport-http-only --no-fail-fast
-    cargo nextest run -p gix-transport --features http-client-reqwest --no-fail-fast
-    cargo nextest run -p gix-transport --no-default-features --features blocking-client,http-client-reqwest,http-client-insecure-credentials --test blocking-transport --no-fail-fast
-    cargo nextest run -p gix-transport --features async-client --no-fail-fast
-    env GIX_TEST_FIXTURE_HASH=sha1 cargo nextest run -p gix-traverse --no-fail-fast
-    env GIX_TEST_FIXTURE_HASH=sha256 cargo nextest run -p gix-traverse --no-fail-fast
-    env GIX_TEST_FIXTURE_HASH=sha1 cargo nextest run -p gix-merge --no-fail-fast
-    env GIX_TEST_FIXTURE_HASH=sha256 cargo nextest run -p gix-merge --no-fail-fast
-    cargo nextest run -p gix-protocol --features blocking-client --no-fail-fast
-    cargo nextest run -p gix-protocol --features blocking-client,sha256 --no-fail-fast
-    cargo nextest run -p gix-protocol --features async-client --no-fail-fast
-    cargo nextest run -p gix-protocol --features async-client,sha256 --no-fail-fast
-    env GIX_TEST_FIXTURE_HASH=sha1 cargo nextest run -p gix-blame --no-fail-fast
-    env GIX_TEST_FIXTURE_HASH=sha256 cargo nextest run -p gix-blame --no-fail-fast
-    env GIX_TEST_FIXTURE_HASH=sha1 cargo nextest run -p gix-refspec --no-fail-fast
-    env GIX_TEST_FIXTURE_HASH=sha256 cargo nextest run -p gix-refspec --no-fail-fast
-    env GIX_TEST_FIXTURE_HASH=sha1 cargo nextest run -p gix-worktree-stream --no-fail-fast
-    env GIX_TEST_FIXTURE_HASH=sha256 cargo nextest run -p gix-worktree-stream --features sha256 --no-fail-fast
-    cargo nextest run -p gix --no-default-features --features basic,comfort,max-performance-safe --no-fail-fast
-    cargo nextest run -p gix --no-default-features --features basic,extras,comfort,need-more-recent-msrv --no-fail-fast
-    cargo nextest run -p gix --features async-network-client --no-fail-fast
-    env GIX_TEST_FIXTURE_HASH=sha256 cargo nextest run -p gix --features async-network-client --no-fail-fast
-    cargo nextest run -p gix --features blocking-network-client --no-fail-fast
-    env GIX_TEST_FIXTURE_HASH=sha256 cargo nextest run -p gix --features blocking-network-client --no-fail-fast
-    env GIX_TEST_FIXTURE_HASH=sha256 cargo nextest run -p gix --no-fail-fast
-    cargo nextest run -p gix --no-default-features --features sha256 --lib --no-fail-fast
-    cargo nextest run -p gitoxide-core --lib --no-tests=warn --no-fail-fast
+    cargo run --profile qa --locked -p internal-tools --no-default-features --bin qa -- run --mode exhaustive --stage tests
 
 # Run all doctests
+[group('Tests')]
 doc-tests:
-    cargo test --workspace --doc --no-fail-fast
-    # `cargo nextest` doesn't run doctests, so cover feature-gated examples explicitly here.
-    cargo test -p gix-packetline --doc --features blocking-io --no-fail-fast
+    cargo run --profile qa --locked -p internal-tools --no-default-features --bin qa -- run --mode exhaustive --stage doctests
 
-# These tests aren't run by default as they are flaky (even locally)
+# Run optional flaky async tests
+[group('Tests')]
 unit-tests-flaky:
-    cargo test -p gix --features async-network-client-async-std
+    cargo test -p gix --features async-network-client-async-std,sha256
 
 # Extract cargo metadata, excluding dependencies, and query it
 [private]
@@ -249,65 +95,74 @@ query-meta jq-query:
 dbg: (query-meta '.target_directory + "/debug"')
 
 # Run journey tests (`max`)
+[group('Tests')]
 journey-tests:
-    cargo build --features http-client-curl-rustls
-    cargo build -p gix-testtools --bin jtt
+    # Keep tree-shaped error reports in journey snapshots.
+    cargo build --no-default-features --features max,http-client-curl-rustls
+    cargo build -p gix-testtools --bin jtt --features sha1
     dbg="$({{ j }} dbg)" && tests/journey.sh "$dbg/ein" "$dbg/gix" "$dbg/jtt" max
 
 # Run journey tests (`max-pure`)
+[group('Tests')]
 journey-tests-pure:
     cargo build --no-default-features --features max-pure
-    cargo build -p gix-testtools --bin jtt
+    cargo build -p gix-testtools --bin jtt --features sha1
     dbg="$({{ j }} dbg)" && tests/journey.sh "$dbg/ein" "$dbg/gix" "$dbg/jtt" max-pure
 
 # Run journey tests (`small`)
+[group('Tests')]
 journey-tests-small:
     cargo build --no-default-features --features small
-    cargo build -p gix-testtools
+    cargo build -p gix-testtools --features sha1
     dbg="$({{ j }} dbg)" && tests/journey.sh "$dbg/ein" "$dbg/gix" "$dbg/jtt" small
 
 # Run journey tests (`lean-async`)
+[group('Tests')]
 journey-tests-async:
     cargo build --no-default-features --features lean-async
-    cargo build -p gix-testtools
+    cargo build -p gix-testtools --features sha1
     dbg="$({{ j }} dbg)" && tests/journey.sh "$dbg/ein" "$dbg/gix" "$dbg/jtt" async
 
 # Build a customized `cross` container image for testing
+[group('Cross compilation')]
 cross-image target:
     docker build --build-arg "TARGET={{ target }}" \
         -t "cross-rs-gitoxide:{{ target }}" \
         -f etc/docker/Dockerfile.test-cross etc/docker/test-cross-context
 
 # Test another platform with `cross`
+[group('Cross compilation')]
 cross-test target options test-options: (cross-image target)
     CROSS_CONFIG=etc/docker/test-cross.toml NO_PRELOAD_CXX=1 \
         cross test --workspace --no-fail-fast --target {{ target }} \
         {{ options }} -- --skip realpath::fuzzed_timeout {{ test-options }}
 
 # Test s390x with `cross`
+[group('Cross compilation')]
 cross-test-s390x: (cross-test 's390x-unknown-linux-gnu' '' '')
 
 # Test Android with `cross` (max-pure)
+[group('Cross compilation')]
 cross-test-android: (cross-test 'armv7-linux-androideabi' '--no-default-features --features max-pure' '')
 
-# Run `cargo diet` on all crates to see that they are still in bounds
+# Check crate package sizes with `cargo diet`
+[group('Dependencies and SBOMs')]
 check-size:
     etc/scripts/check-package-size.sh
 
-# Report the Minimum Supported Rust Version (the `rust-version` of `gix`) in X.Y.Z form
-msrv: (query-meta '''
-    .packages[]
-    | select(.name == "gix")
-    | .rust_version
-    | sub("(?<xy>^[0-9]+[.][0-9]+$)"; "\(.xy).0")
-''')
+# Print the Rust version declared by the MSRV QA policy (X.Y.Z)
+[group('Maintenance')]
+msrv:
+    @cargo run --profile qa --quiet --locked -p internal-tools --no-default-features --bin qa -- exec msrv-version
 
 # Regenerate the MSRV badge SVG
+[group('Maintenance')]
 msrv-badge:
     msrv="$({{ j }} msrv)" && \
         sed "s/{MSRV}/$msrv/g" etc/msrv-badge.template.svg >etc/msrv-badge.svg
 
-# Check if `gix` and its dependencies, as currently locked, build with `rust-version`
+# Build `gix` and its locked dependencies with this Rust version
+[group('Maintenance')]
 check-rust-version rust-version:
     rustc +{{ rust-version }} --version
     cargo +{{ rust-version }} build --locked -p gix
@@ -315,42 +170,83 @@ check-rust-version rust-version:
         --no-default-features --features async-network-client,max-performance,sha1
 
 # Enter a nix-shell able to build on macOS
+[group('Maintenance')]
 nix-shell-macos:
     nix-shell -p pkg-config openssl libiconv darwin.apple_sdk.frameworks.Security darwin.apple_sdk.frameworks.SystemConfiguration
 
-# Run various auditing tools to help us stay legal and safe
+# Audit dependency advisories, bans, licenses, and sources
+[group('Dependencies and SBOMs')]
 audit:
-    cargo deny --workspace --all-features check advisories bans licenses sources
+    cargo deny --workspace --all-features --locked check advisories bans licenses sources
 
-# Run tests with `cargo nextest` (all unit-tests, no doc-tests, faster)
+# Install the pinned Rust tools for CycloneDX and SPDX SBOMs
+[group('Dependencies and SBOMs')]
+sbom-install:
+    cargo install --locked --version 0.5.9 cargo-cyclonedx
+    cargo install --locked --no-default-features --features cli --version 0.2.0 sbom-tools
+
+# Generate CycloneDX and SPDX SBOMs (--help for crate and feature options)
+[group('Dependencies and SBOMs')]
+[positional-arguments]
+sbom *args:
+    cargo run --locked -p gix-testtools --bin jtt --features sha1,sbom -- sbom "$@"
+
+# Test SBOM generation with the tools installed by sbom-install
+[group('Dependencies and SBOMs')]
+sbom-test:
+    cargo test --locked -p gix-testtools --features sha1,sbom --test sbom -- --include-ignored
+
+# Run API-check regressions, including release comparisons (requires Rust 1.99 and cargo-semver-checks 0.51+)
+[group('Tests')]
+check-api:
+    cargo test --locked -p internal-tools --test check_api -- --include-ignored
+
+# Run unit tests with `cargo nextest` (no doctests)
+[group('Development')]
 nextest *FLAGS='--workspace':
     cargo nextest run {{ FLAGS }}
 
-# Run tests with `cargo nextest`, skipping none except as filtered, omitting status reports
+# Run nextest tests, including ignored tests, without status reports
+[group('Tests')]
 summarize EXPRESSION='all()':
     cargo nextest run --workspace --run-ignored all --no-fail-fast \
         --status-level none --final-status-level none -E {{ quote(EXPRESSION) }}
 
-# Run nightly `rustfmt` for its extra features, but check that it won't upset stable `rustfmt`
+# Format with nightly Rust, check stable formatting, and format the justfile
+[group('Development')]
 fmt:
     cargo +nightly fmt --all -- --config-path rustfmt-nightly.toml
     cargo +stable fmt --all -- --check
     {{ j }} --fmt --unstable
 
-# Cancel this after the first few seconds, as yanked crates will appear in warnings
+# Look for yanked crates (cancel after the initial warnings)
+[group('Dependencies and SBOMs')]
 find-yanked:
     cargo install --debug --locked --no-default-features --features max-pure --path .
 
-# Find shell scripts whose +x/-x bits and magic bytes (e.g. `#!`) disagree
+# Check shell scripts' executable bits and shebangs
+[group('Maintenance')]
 check-mode:
-    cargo build -p internal-tools
-    cargo run -p internal-tools -- check-mode
+    cargo run --profile qa --locked -p internal-tools --no-default-features --bin qa -- exec mode
+
+# Clean the `target` directory
+[group('Maintenance')]
+clear-target:
+    cargo clean
+
+# Publish crates, allowing empty release messages and fully generated changelogs
+[group('Releases')]
+[positional-arguments]
+release *args:
+    cargo smart-release --publish-uses-docs-rs-metadata --allow-empty-release-message --allow-fully-generated-changelogs --auto-publish-of-stable-crates "$@"
 
 # Get the unique `v*` tag at `HEAD`, or fail with an error
+[group('Releases')]
 unique-v-tag:
     etc/scripts/unique-v-tag.sh
 
 # Trigger the `release.yml` workflow on the current `v*` tag
+[group('Releases')]
 run-release-workflow repo='':
     optional_repo_arg={{ quote(repo) }} && \
         export GH_REPO="${optional_repo_arg:-"${GH_REPO:-GitoxideLabs/gitoxide}"}" && \
@@ -359,6 +255,16 @@ run-release-workflow repo='':
         gh workflow run release.yml --ref "refs/tags/$tag_name"
 
 # Run `cargo smart-release` and then trigger `release.yml` for the `v*` tag
+[group('Releases')]
 roll-release *csr-args:
     cargo smart-release {{ csr-args }}
     {{ j }} run-release-workflow
+
+# Run checks, docs, and unit tests
+[group('QA')]
+qa-test:
+    cargo run --profile qa --locked -p internal-tools --no-default-features --bin qa -- run --mode exhaustive --stage check,docs,doctests,tests,api,housekeeping
+
+# Run all journey configurations; each build stays adjacent to its tests
+[group('QA')]
+qa-journey-tests: journey-tests-pure journey-tests-small journey-tests-async journey-tests

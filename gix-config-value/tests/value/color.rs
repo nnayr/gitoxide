@@ -1,7 +1,8 @@
 use gix_config_value::Color;
+use gix_testtools::TestResult;
 
 #[test]
-fn from_utf8_str() -> crate::Result {
+fn from_utf8_str() -> TestResult {
     assert_eq!(
         Color::try_from("red bold")?.to_string(),
         "red bold",
@@ -15,44 +16,103 @@ mod name {
 
     use gix_config_value::color::Name;
 
+    fn name(input: &str) -> Name {
+        Name::from_str(input).expect("valid color name")
+    }
+
     #[test]
     fn non_bright() {
-        assert_eq!(Name::from_str("normal"), Ok(Name::Normal));
-        assert_eq!(Name::from_str("-1"), Ok(Name::Normal));
-        assert_eq!(Name::from_str("default"), Ok(Name::Default));
-        assert_eq!(Name::from_str("black"), Ok(Name::Black));
-        assert_eq!(Name::from_str("red"), Ok(Name::Red));
-        assert_eq!(Name::from_str("green"), Ok(Name::Green));
-        assert_eq!(Name::from_str("yellow"), Ok(Name::Yellow));
-        assert_eq!(Name::from_str("blue"), Ok(Name::Blue));
-        assert_eq!(Name::from_str("magenta"), Ok(Name::Magenta));
-        assert_eq!(Name::from_str("cyan"), Ok(Name::Cyan));
-        assert_eq!(Name::from_str("white"), Ok(Name::White));
+        assert_eq!(name("normal"), Name::Normal);
+        assert_eq!(name("-1"), Name::Normal);
+        assert_eq!(name("default"), Name::Default);
+        assert_eq!(name("black"), Name::Black);
+        assert_eq!(name("red"), Name::Red);
+        assert_eq!(name("green"), Name::Green);
+        assert_eq!(name("yellow"), Name::Yellow);
+        assert_eq!(name("blue"), Name::Blue);
+        assert_eq!(name("magenta"), Name::Magenta);
+        assert_eq!(name("cyan"), Name::Cyan);
+        assert_eq!(name("white"), Name::White);
     }
 
     #[test]
     fn bright() {
-        assert_eq!(Name::from_str("brightblack"), Ok(Name::BrightBlack));
-        assert_eq!(Name::from_str("brightred"), Ok(Name::BrightRed));
-        assert_eq!(Name::from_str("brightgreen"), Ok(Name::BrightGreen));
-        assert_eq!(Name::from_str("brightyellow"), Ok(Name::BrightYellow));
-        assert_eq!(Name::from_str("brightblue"), Ok(Name::BrightBlue));
-        assert_eq!(Name::from_str("brightmagenta"), Ok(Name::BrightMagenta));
-        assert_eq!(Name::from_str("brightcyan"), Ok(Name::BrightCyan));
-        assert_eq!(Name::from_str("brightwhite"), Ok(Name::BrightWhite));
+        assert_eq!(name("brightblack"), Name::BrightBlack);
+        assert_eq!(name("brightred"), Name::BrightRed);
+        assert_eq!(name("brightgreen"), Name::BrightGreen);
+        assert_eq!(name("brightyellow"), Name::BrightYellow);
+        assert_eq!(name("brightblue"), Name::BrightBlue);
+        assert_eq!(name("brightmagenta"), Name::BrightMagenta);
+        assert_eq!(name("brightcyan"), Name::BrightCyan);
+        assert_eq!(name("brightwhite"), Name::BrightWhite);
+    }
+
+    #[test]
+    fn any_case() {
+        for (input, expected) in [
+            ("RED", Name::Red),
+            ("Normal", Name::Normal),
+            ("DEFAULT", Name::Default),
+            ("BrightRed", Name::BrightRed),
+            ("brightBLUE", Name::BrightBlue),
+            ("BRIGHTWHITE", Name::BrightWhite),
+        ] {
+            assert_eq!(
+                name(input),
+                expected,
+                "{input:?}: color names and the 'bright' prefix are case-insensitive, like in Git"
+            );
+        }
+    }
+
+    #[test]
+    fn bright_only_applies_to_standard_colors() {
+        for input in ["bright0", "bright1", "bright255", "bright-1", "bright#ff0010"] {
+            assert!(
+                Name::from_str(input).is_err(),
+                "{input:?}: 'bright' may only precede one of the eight standard colors, like in Git"
+            );
+        }
     }
 
     #[test]
     fn ansi() {
-        assert_eq!(Name::from_str("255"), Ok(Name::Ansi(255)));
-        assert_eq!(Name::from_str("0"), Ok(Name::Ansi(0)));
+        assert_eq!(name("255"), Name::Ansi(255));
+        assert_eq!(name("0"), Name::Ansi(0));
     }
 
     #[test]
     fn hex() {
-        assert_eq!(Name::from_str("#ff0010"), Ok(Name::Rgb(255, 0, 16)));
-        assert_eq!(Name::from_str("#ffffff"), Ok(Name::Rgb(255, 255, 255)));
-        assert_eq!(Name::from_str("#000000"), Ok(Name::Rgb(0, 0, 0)));
+        assert_eq!(name("#ff0010"), Name::Rgb(255, 0, 16));
+        assert_eq!(name("#ffffff"), Name::Rgb(255, 255, 255));
+        assert_eq!(name("#000000"), Name::Rgb(0, 0, 0));
+        assert_eq!(name("#FF0010"), Name::Rgb(255, 0, 16));
+    }
+
+    #[test]
+    fn hex_shorthand_doubles_each_digit() {
+        // Values recorded from `git -c foo.bar=<input> config --type=color foo.bar` on
+        // git 2.50.1, which emits `\x1b[38;2;<r>;<g>;<b>m`.
+        for (input, expected, long_form) in [
+            ("#f1b", Name::Rgb(0xff, 0x11, 0xbb), "#ff11bb"),
+            ("#abc", Name::Rgb(0xaa, 0xbb, 0xcc), "#aabbcc"),
+            ("#000", Name::Rgb(0x00, 0x00, 0x00), "#000000"),
+            ("#fff", Name::Rgb(0xff, 0xff, 0xff), "#ffffff"),
+            ("#aBc", Name::Rgb(0xaa, 0xbb, 0xcc), "#aabbcc"),
+        ] {
+            let actual = name(input);
+            assert_eq!(actual, expected, "{input:?}");
+            assert_eq!(
+                actual,
+                name(long_form),
+                "{input:?}: the shorthand and the long form it stands for are the same color"
+            );
+            assert_eq!(
+                actual.to_string(),
+                long_form,
+                "{input:?}: a shorthand renders back as the long form, since `Name::Rgb` keeps no record of which spelling it came from"
+            );
+        }
     }
 
     #[test]
@@ -64,9 +124,23 @@ mod name {
         assert!(Name::from_str("bright").is_err());
         assert!(Name::from_str("256").is_err());
         assert!(Name::from_str("#").is_err());
-        assert!(Name::from_str("#fff").is_err());
         assert!(Name::from_str("#gggggg").is_err());
         assert!(Name::from_str("#=»©=").is_err());
+
+        for input in ["#ab", "#abcd", "#abcde", "#abcdefa", "#aabbccddeeff"] {
+            assert!(
+                Name::from_str(input).is_err(),
+                "{input} has neither three nor six digits, and `git` rejects it too"
+            );
+        }
+        assert!(
+            Name::from_str("#ggg").is_err(),
+            "a three-digit value still has to be hexadecimal"
+        );
+        assert!(
+            Name::from_str("#-12").is_err(),
+            "a sign is not a hex digit, so it cannot fill one of the three slots"
+        );
     }
 }
 
@@ -75,38 +149,42 @@ mod attribute {
 
     use gix_config_value::color::Attribute;
 
+    fn attribute(input: &str) -> Attribute {
+        Attribute::from_str(input).expect("valid color attribute")
+    }
+
     #[test]
     fn non_inverted() {
-        assert_eq!(Attribute::from_str("reset"), Ok(Attribute::RESET));
-        assert_eq!(Attribute::from_str("bold"), Ok(Attribute::BOLD));
-        assert_eq!(Attribute::from_str("dim"), Ok(Attribute::DIM));
-        assert_eq!(Attribute::from_str("ul"), Ok(Attribute::UL));
-        assert_eq!(Attribute::from_str("blink"), Ok(Attribute::BLINK));
-        assert_eq!(Attribute::from_str("reverse"), Ok(Attribute::REVERSE));
-        assert_eq!(Attribute::from_str("italic"), Ok(Attribute::ITALIC));
-        assert_eq!(Attribute::from_str("strike"), Ok(Attribute::STRIKE));
+        assert_eq!(attribute("reset"), Attribute::RESET);
+        assert_eq!(attribute("bold"), Attribute::BOLD);
+        assert_eq!(attribute("dim"), Attribute::DIM);
+        assert_eq!(attribute("ul"), Attribute::UL);
+        assert_eq!(attribute("blink"), Attribute::BLINK);
+        assert_eq!(attribute("reverse"), Attribute::REVERSE);
+        assert_eq!(attribute("italic"), Attribute::ITALIC);
+        assert_eq!(attribute("strike"), Attribute::STRIKE);
     }
 
     #[test]
     fn inverted_no_dash() {
-        assert_eq!(Attribute::from_str("nobold"), Ok(Attribute::NO_BOLD));
-        assert_eq!(Attribute::from_str("nodim"), Ok(Attribute::NO_DIM));
-        assert_eq!(Attribute::from_str("noul"), Ok(Attribute::NO_UL));
-        assert_eq!(Attribute::from_str("noblink"), Ok(Attribute::NO_BLINK));
-        assert_eq!(Attribute::from_str("noreverse"), Ok(Attribute::NO_REVERSE));
-        assert_eq!(Attribute::from_str("noitalic"), Ok(Attribute::NO_ITALIC));
-        assert_eq!(Attribute::from_str("nostrike"), Ok(Attribute::NO_STRIKE));
+        assert_eq!(attribute("nobold"), Attribute::NO_BOLD);
+        assert_eq!(attribute("nodim"), Attribute::NO_DIM);
+        assert_eq!(attribute("noul"), Attribute::NO_UL);
+        assert_eq!(attribute("noblink"), Attribute::NO_BLINK);
+        assert_eq!(attribute("noreverse"), Attribute::NO_REVERSE);
+        assert_eq!(attribute("noitalic"), Attribute::NO_ITALIC);
+        assert_eq!(attribute("nostrike"), Attribute::NO_STRIKE);
     }
 
     #[test]
     fn inverted_dashed() {
-        assert_eq!(Attribute::from_str("no-bold"), Ok(Attribute::NO_BOLD));
-        assert_eq!(Attribute::from_str("no-dim"), Ok(Attribute::NO_DIM));
-        assert_eq!(Attribute::from_str("no-ul"), Ok(Attribute::NO_UL));
-        assert_eq!(Attribute::from_str("no-blink"), Ok(Attribute::NO_BLINK));
-        assert_eq!(Attribute::from_str("no-reverse"), Ok(Attribute::NO_REVERSE));
-        assert_eq!(Attribute::from_str("no-italic"), Ok(Attribute::NO_ITALIC));
-        assert_eq!(Attribute::from_str("no-strike"), Ok(Attribute::NO_STRIKE));
+        assert_eq!(attribute("no-bold"), Attribute::NO_BOLD);
+        assert_eq!(attribute("no-dim"), Attribute::NO_DIM);
+        assert_eq!(attribute("no-ul"), Attribute::NO_UL);
+        assert_eq!(attribute("no-blink"), Attribute::NO_BLINK);
+        assert_eq!(attribute("no-reverse"), Attribute::NO_REVERSE);
+        assert_eq!(attribute("no-italic"), Attribute::NO_ITALIC);
+        assert_eq!(attribute("no-strike"), Attribute::NO_STRIKE);
     }
 
     #[test]
@@ -124,10 +202,13 @@ mod attribute {
 mod from_git {
     use bstr::BStr;
     use gix_config_value::Color;
+    use gix_error::Result;
 
     #[test]
     fn reset() {
         assert_eq!(color("reset"), "reset");
+        assert_eq!(color("RESET"), "reset");
+        assert_eq!(color("red Reset"), "red reset");
     }
 
     #[test]
@@ -193,6 +274,11 @@ mod from_git {
     }
 
     #[test]
+    fn color_names_ignore_case() {
+        assert_eq!(color("RED brightBLUE bold"), "red brightblue bold");
+    }
+
+    #[test]
     fn default_can_combine_with_attributes() {
         assert_eq!(
             color("default default no-reverse bold"),
@@ -204,7 +290,7 @@ mod from_git {
         try_color(name).expect("input color is expected to be valid")
     }
 
-    fn try_color<'a>(name: impl Into<&'a BStr>) -> crate::Result<String> {
+    fn try_color<'a>(name: impl Into<&'a BStr>) -> Result<String> {
         Ok(Color::try_from(name.into())?.to_string())
     }
 }

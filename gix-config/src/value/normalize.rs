@@ -2,9 +2,11 @@ use std::borrow::Cow;
 
 use bstr::{BStr, BString, ByteSlice};
 
-/// Removes quotes, if any, from the provided inputs, and transforms
-/// the 3 escape sequences `\n`, `\t` and `\b` into newline and tab
-/// respectively, while `\b` will remove the previous character.
+use gix_utils::git_is_space;
+
+/// Removes quotes, if any, from the provided inputs, and transforms the
+/// escape sequences `\n`, `\t` and `\b` into newline, tab and backspace
+/// (byte `0x08`) respectively, matching how `git` interprets them.
 ///
 /// It assumes the input contains a even number of unescaped quotes,
 /// and will unescape escaped quotes and everything else (even though the latter
@@ -41,16 +43,14 @@ pub fn normalize(input: &(impl crate::AsBStr + ?Sized)) -> Cow<'_, BStr> {
     normalize_inner(input.as_bstr())
 }
 
-fn normalize_inner(mut input: &BStr) -> Cow<'_, BStr> {
-    if input == "\"\"" {
-        return Cow::Borrowed(BStr::new(&input[..0]));
-    }
+fn normalize_inner(input: &BStr) -> Cow<'_, BStr> {
     // An optimization to strip enclosing quotes without producing a new value/copy it.
-    while input.len() >= 3 && input[0] == b'"' && input[input.len() - 1] == b'"' && input[input.len() - 2] != b'\\' {
-        input = input[1..input.len() - 1].as_ref();
-        if input == "\"\"" {
-            return Cow::Borrowed(BStr::new(&input[..0]));
-        }
+    if input.len() >= 2
+        && input[0] == b'"'
+        && input[input.len() - 1] == b'"'
+        && input[1..input.len() - 1].find_byteset(br#"\""#).is_none()
+    {
+        return Cow::Borrowed(input[1..input.len() - 1].as_ref());
     }
 
     if input.find_byteset(br#"\""#).is_none() {
@@ -58,20 +58,21 @@ fn normalize_inner(mut input: &BStr) -> Cow<'_, BStr> {
     }
     let mut out: BString = Vec::with_capacity(input.len()).into();
     let mut bytes = input.iter().copied();
+    let mut is_in_quotes = false;
     while let Some(c) = bytes.next() {
         match c {
             b'\\' => match bytes.next() {
                 Some(b'n') => out.push(b'\n'),
                 Some(b't') => out.push(b'\t'),
-                Some(b'b') => {
-                    out.pop();
-                }
+                Some(b'b') => out.push(b'\x08'),
                 Some(c) => {
                     out.push(c);
                 }
                 None => break,
             },
-            b'"' => {}
+            b'"' => is_in_quotes = !is_in_quotes,
+            // Empty quotes contribute no bytes, so Git keeps ignoring unquoted whitespace after them.
+            c if !is_in_quotes && out.is_empty() && git_is_space(c) => {}
             _ => out.push(c),
         }
     }

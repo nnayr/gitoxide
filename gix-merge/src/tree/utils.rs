@@ -5,10 +5,12 @@
 //!
 //! Once such a case becomes a bug and is reproduced in testing, the debug-assertion will kick in and hopefully
 //! contribute to finding a fix faster.
+use gix_error::Result;
 use std::collections::HashMap;
 
 use bstr::{BStr, BString, ByteSlice, ByteVec};
 use gix_diff::tree_with_rewrites::{Change, ChangeRef};
+use gix_error::{OptionExt, ResultExt, message};
 use gix_hash::ObjectId;
 use gix_object::{
     tree,
@@ -18,7 +20,7 @@ use gix_object::{
 use crate::{
     blob::{ResourceKind, builtin_driver::binary::Pick},
     tree::{
-        Conflict, ConflictIndexEntry, ConflictIndexEntryPathHint, ConflictMapping, Error, Options, Resolution,
+        Conflict, ConflictIndexEntry, ConflictIndexEntryPathHint, ConflictMapping, Options, Resolution,
         ResolutionFailure,
     },
 };
@@ -26,6 +28,9 @@ use crate::{
 /// Assuming that `their_location` is the destination of *their* rewrite, check if *it* passes
 /// over a directory rewrite in *our* tree. If so, rewrite it so that we get the path
 /// it would have had if it had been renamed along with *our* directory.
+///
+/// For example, if ours renames directory `old` to `new` and theirs renames a file to `old/file`, return
+/// `new/file` so their destination follows our directory rename.
 pub fn possibly_rewritten_location(
     check_tree: &TreeNodes,
     their_location: &BStr,
@@ -40,6 +45,11 @@ pub fn possibly_rewritten_location(
     })
 }
 
+/// Translate `their_location` through the directory rewrite in `passed_change`.
+///
+/// For example, a rewrite from `a` to `b` maps `a/file` to `b/file`. Returns `None` unless `passed_change` is a
+/// [`Change::Rewrite`] whose destination is a tree and `their_location` starts with its source location. The caller must
+/// establish that the prefix ends at a path-component boundary, as [`TreeNodes::check_conflict()`] does.
 pub fn rewrite_location_with_renamed_directory(their_location: &BStr, passed_change: &Change) -> Option<BString> {
     match passed_change {
         Change::Rewrite {
@@ -58,18 +68,19 @@ pub fn rewrite_location_with_renamed_directory(their_location: &BStr, passed_cha
     }
 }
 
-/// Produce a unique path within the directory that contains the file at `file_path` like `a/b`, using `editor`
-/// and `tree` to assure unique names, to obtain the tree at `a/` and `side_name` to more clearly signal
-/// where the file is coming from.
+/// Produce a side-qualified path for `file_path` like `a/b`, using `editor` and `trees` to assure uniqueness.
+///
+/// This normally keeps the file in its directory, as in `a/b~side`. If a non-tree component blocks that directory,
+/// the blocker itself is qualified instead, as in `a~side/b`, because changing only the child name could never make
+/// the path available.
 pub fn unique_path_in_tree(
     file_path: &BStr,
     editor: &tree::Editor<'_>,
-    tree: &TreeNodes,
+    trees: &[&TreeNodes],
     side_name: &BStr,
-) -> Result<BString, Error> {
-    let mut buf = file_path.to_owned();
-    buf.push(b'~');
-    buf.extend(
+) -> Result<BString> {
+    let mut qualifier = BString::from("~");
+    qualifier.extend(
         side_name
             .as_bytes()
             .iter()
@@ -77,40 +88,56 @@ pub fn unique_path_in_tree(
             .map(|b| if b == b'/' { b'_' } else { b }),
     );
 
-    // We could use a cursor here, but clashes are so unlikely that this wouldn't be meaningful for performance.
-    let base_len = buf.len();
-    let mut suffix = 0;
-    while editor.get(to_components_bstring_ref(&buf)).is_some() || tree.check_conflict(buf.as_bstr()).is_some() {
-        buf.truncate(base_len);
-        buf.push_str(format!("_{suffix}"));
-        suffix += 1;
+    let mut component_end = file_path.len();
+    loop {
+        let at_root = !file_path[..component_end].contains(&b'/');
+        let mut suffix = None;
+        loop {
+            let mut buf = file_path[..component_end].to_owned();
+            buf.extend_from_slice(&qualifier);
+            if let Some(suffix) = suffix {
+                buf.push_str(format!("_{suffix}"));
+            }
+            buf.extend_from_slice(&file_path[component_end..]);
+
+            let mut conflicts = trees.iter().filter_map(|tree| tree.check_conflict(buf.as_bstr()));
+            if !at_root
+                && conflicts
+                    .clone()
+                    .any(|conflict| matches!(conflict, PossibleConflict::NonTreeToTree { .. }))
+            {
+                break;
+            }
+            if editor.get(to_components_bstring_ref(&buf)).is_none()
+                && conflicts.all(|conflict| matches!(conflict, PossibleConflict::PassedRewrittenDirectory { .. }))
+            {
+                return Ok(buf);
+            }
+            suffix = Some(suffix.map_or(0, |suffix| suffix + 1));
+        }
+
+        component_end = file_path[..component_end]
+            .iter()
+            .rposition(|byte| *byte == b'/')
+            .expect("a non-root component always has a preceding slash");
     }
-    Ok(buf)
 }
 
 /// Perform a merge between two blobs and return the result of its object id.
 #[expect(clippy::too_many_arguments)]
-pub fn perform_blob_merge<E>(
+pub fn perform_blob_merge(
     mut labels: crate::blob::builtin_driver::text::Labels<'_>,
     objects: &impl gix_object::FindObjectOrHeader,
     blob_merge: &mut crate::blob::Platform,
     buf: &mut Vec<u8>,
-    write_blob_to_odb: &mut impl FnMut(&[u8]) -> Result<ObjectId, E>,
+    write_blob_to_odb: &mut impl FnMut(&[u8]) -> Result<ObjectId>,
     (our_location, our_id, our_mode): (&BString, ObjectId, EntryMode),
     (their_location, their_id, their_mode): (&BString, ObjectId, EntryMode),
     (previous_location, previous_id, previous_mode): (&BString, ObjectId, EntryMode),
     (extra_markers, outer_side): (u8, ConflictMapping),
     options: &Options,
-) -> Result<(ObjectId, crate::blob::Resolution), Error>
-where
-    E: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
-{
+) -> Result<(ObjectId, crate::blob::Resolution)> {
     if our_id == their_id {
-        // This can happen if the merge modes are different.
-        debug_assert_ne!(
-            our_mode, their_mode,
-            "BUG: we must think anything has to be merged if the modes and the ids are the same"
-        );
         return Ok((their_id, crate::blob::Resolution::Complete));
     }
     if matches!(our_mode.kind(), EntryKind::Link) && matches!(their_mode.kind(), EntryKind::Link) {
@@ -153,49 +180,51 @@ where
         buf
     }
 
-    if outer_side.is_swapped() {
+    let (current_location, other_location) = if outer_side.is_swapped() {
         (labels.current, labels.other) = (labels.other, labels.current);
-    }
+        (their_location, our_location)
+    } else {
+        (our_location, their_location)
+    };
 
     let (ancestor, current, other);
     let labels = if our_location == their_location {
         labels
     } else {
         ancestor = labels.ancestor.map(|side| combined(side, previous_location));
-        current = labels.current.map(|side| combined(side, our_location));
-        other = labels.other.map(|side| combined(side, their_location));
+        current = labels.current.map(|side| combined(side, current_location));
+        other = labels.other.map(|side| combined(side, other_location));
         crate::blob::builtin_driver::text::Labels {
             ancestor: ancestor.as_ref().map(|n| n.as_bstr()),
             current: current.as_ref().map(|n| n.as_bstr()),
             other: other.as_ref().map(|n| n.as_bstr()),
         }
     };
-    let prep = blob_merge.prepare_merge(objects, with_extra_markers(options, extra_markers))?;
+    let mut prep = blob_merge.prepare_merge(objects, options.blob_merge)?;
+    if let crate::blob::builtin_driver::text::Conflict::Keep { marker_size, .. } = &mut prep.options.text.conflict {
+        *marker_size =
+            marker_size.saturating_add(extra_markers.saturating_add(options.marker_size_multiplier.saturating_mul(2)));
+    }
     let (pick, resolution) = prep.merge(buf, labels, &options.blob_merge_command_ctx)?;
 
     let merged_blob_id = prep
         .id_by_pick(pick, buf, write_blob_to_odb)
-        .map_err(|err| Error::WriteBlobToOdb(err.into()))?
-        .ok_or(Error::MergeResourceNotFound)?;
+        .or_raise(|| message("Failed to write merged blob content as blob to the object database"))?
+        .ok_or_raise(|| crate::tree::Error::MissingBinaryMergeResult)?;
     Ok((merged_blob_id, resolution))
 }
 
-fn with_extra_markers(opts: &Options, extra_makers: u8) -> crate::blob::platform::merge::Options {
-    let mut out = opts.blob_merge;
-    if let crate::blob::builtin_driver::text::Conflict::Keep { marker_size, .. } = &mut out.text.conflict {
-        *marker_size =
-            marker_size.saturating_add(extra_makers.saturating_add(opts.marker_size_multiplier.saturating_mul(2)));
-    }
-    out
-}
-
-/// A way to attach metadata to each change.
+/// A change from one side's base-to-side diff, together with its merge scheduling metadata.
+///
+/// Tree merge keeps each side's changes in a flat [`ChangeList`] and builds a path-based
+/// [`TreeNodes`] index whose entries point back into that list. The [`ChangeState`] remains
+/// on the list entry so a change can be found structurally even after it no longer needs to
+/// be scheduled.
 #[derive(Debug)]
 pub struct TrackedChange {
     /// The actual change
     pub inner: Change,
-    /// If `true`, this change counts as written to the tree using a [`tree::Editor`].
-    pub was_written: bool,
+    state: ChangeState,
     /// If `Some(ours_idx_to_ignore)`, this change must be placed into the tree before handling it.
     /// This makes sure that new changes aren't visible too early, which would mean the algorithm
     /// knows things too early which can be misleading.
@@ -207,6 +236,100 @@ pub struct TrackedChange {
     /// the changed path.
     /// The second tuple entry `change_idx` is the change-idx we passed over, which refers to the other side that interfered.
     pub rewritten_location: Option<(BString, usize)>,
+}
+
+/// The lifecycle of a [`TrackedChange`] while reconciling the two side-diffs.
+///
+/// The merge starts with an editor for the ancestor tree. It repeatedly takes a pending
+/// change from one side, looks for a path or rename interaction in the other side's
+/// [`TreeNodes`], and either applies the result to the editor or only records/resolves a
+/// conflict. These outcomes must remain distinguishable:
+///
+/// | State | Process again? | Change effect represented in the editor? |
+/// |-------|----------------|------------------------------------------|
+/// | [`Pending`](ChangeState::Pending) | yes | no |
+/// | [`Processed`](ChangeState::Processed) | no | no |
+/// | [`Applied`](ChangeState::Applied) | no | yes |
+///
+/// Valid transitions are `Pending -> Processed`, `Pending -> Applied`, and
+/// `Processed -> Applied`. In particular, [`TrackedChange::mark_processed()`] never
+/// downgrades an already-applied change, while [`TrackedChange::mark_applied()`] may
+/// upgrade a processed one.
+///
+/// This distinction matters for forced tree-conflict resolution. For example, resolving
+/// with the ancestor can process a deletion without removing the ancestor entry. A later
+/// addition below that path must still see the retained entry; treating "processed" as
+/// "applied" would incorrectly suppress that tree/non-tree conflict.
+#[derive(Debug, Clone, Copy)]
+enum ChangeState {
+    /// The change still has to be compared with the other side and handled.
+    Pending,
+    /// The change was handled, but its side-effect was not applied to the editor.
+    Processed,
+    /// The change was handled and its effect is represented in the editor.
+    ///
+    /// Tree changes begin in this state: they are structural matching nodes, while their
+    /// effective contents are represented by the leaf changes that the algorithm schedules.
+    Applied,
+}
+
+/// How handling a change affected the output editor.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum ChangeDisposition {
+    /// The change was consumed without applying its effect.
+    Processed,
+    /// The change's effect is represented in the editor.
+    Applied,
+}
+
+impl TrackedChange {
+    pub(super) fn new(
+        inner: Change,
+        needs_tree_insertion: Option<Option<usize>>,
+        rewritten_location: Option<(BString, usize)>,
+    ) -> Self {
+        TrackedChange {
+            inner,
+            state: ChangeState::Pending,
+            needs_tree_insertion,
+            rewritten_location,
+        }
+    }
+
+    /// Return whether this change still needs to be scheduled by the merge loop.
+    pub(super) fn is_pending(&self) -> bool {
+        matches!(self.state, ChangeState::Pending)
+    }
+
+    /// Return whether this change's effect is represented in the output editor.
+    pub(super) fn was_applied(&self) -> bool {
+        matches!(self.state, ChangeState::Applied)
+    }
+
+    /// Return whether this change was consumed without affecting the output editor.
+    pub(super) fn was_processed_without_application(&self) -> bool {
+        matches!(self.state, ChangeState::Processed)
+    }
+
+    /// Stop scheduling this change without downgrading it if it was already applied.
+    pub(super) fn mark_processed(&mut self) {
+        if matches!(self.state, ChangeState::Pending) {
+            self.state = ChangeState::Processed;
+        }
+    }
+
+    /// Record that this change's effect is represented in the output editor.
+    pub(super) fn mark_applied(&mut self) {
+        self.state = ChangeState::Applied;
+    }
+
+    /// Record the final disposition chosen while resolving this change.
+    pub(super) fn mark(&mut self, disposition: ChangeDisposition) {
+        match disposition {
+            ChangeDisposition::Processed => self.mark_processed(),
+            ChangeDisposition::Applied => self.mark_applied(),
+        }
+    }
 }
 
 pub type ChangeList = Vec<TrackedChange>;
@@ -222,35 +345,35 @@ pub fn track(change: ChangeRef<'_>, changes: &mut ChangeList) {
         return;
     }
     let is_tree = change.entry_mode().is_tree();
-    changes.push(TrackedChange {
-        inner: match change.into_owned() {
-            Change::Rewrite {
-                id,
-                entry_mode,
-                location,
-                relation,
-                copy,
-                ..
-            } if copy => Change::Addition {
-                location,
-                relation,
-                entry_mode,
-                id,
-            },
-            other => other,
+    let inner = match change.into_owned() {
+        Change::Rewrite {
+            id,
+            entry_mode,
+            location,
+            relation,
+            copy,
+            ..
+        } if copy => Change::Addition {
+            location,
+            relation,
+            entry_mode,
+            id,
         },
-        was_written: is_tree,
-        needs_tree_insertion: None,
-        rewritten_location: None,
-    });
+        other => other,
+    };
+    let mut tracked = TrackedChange::new(inner, None, None);
+    if is_tree {
+        // Tree changes are structural nodes used to detect directory renames and tree/non-tree
+        // conflicts, not work items of their own. Git has no empty directories, so descendant
+        // leaf changes carry every observable editor update (`apply_change()` is a no-op for
+        // trees). Mark the tree applied to keep it available for matching without scheduling it.
+        tracked.mark_applied();
+    }
+    changes.push(tracked);
 }
 
 /// Unconditionally apply `change` to `editor`.
-pub fn apply_change(
-    editor: &mut tree::Editor<'_>,
-    change: &Change,
-    alternative_location: Option<&BString>,
-) -> Result<(), tree::editor::Error> {
+pub fn apply_change(editor: &mut tree::Editor<'_>, change: &Change, alternative_location: Option<&BString>) -> Result {
     use to_components_bstring_ref as to_components;
     if change.entry_mode().is_tree() {
         return Ok(());
@@ -270,7 +393,7 @@ pub fn apply_change(
             ..
         } => (location, entry_mode, id),
         Change::Deletion { location, .. } => {
-            editor.remove(to_components(alternative_location.unwrap_or(location)))?;
+            editor.remove_if_leaf(to_components(alternative_location.unwrap_or(location)))?;
             return Ok(());
         }
         Change::Rewrite {
@@ -282,7 +405,7 @@ pub fn apply_change(
             ..
         } => {
             if !*copy {
-                editor.remove(to_components(source_location))?;
+                editor.remove_if_leaf(to_components(source_location))?;
             }
             (location, entry_mode, id)
         }
@@ -322,6 +445,10 @@ pub enum PossibleConflict {
 }
 
 impl PossibleConflict {
+    /// Return the index into the [`ChangeList`] from which this conflict tree was built.
+    ///
+    /// This is `None` for structural tree/non-tree conflicts if there is no change at the
+    /// conflicting path itself, only one or more changes below it.
     pub(super) fn change_idx(&self) -> Option<usize> {
         match self {
             PossibleConflict::TreeToNonTree { change_idx, .. } | PossibleConflict::NonTreeToTree { change_idx, .. } => {
@@ -346,6 +473,8 @@ struct TreeNode {
     /// The index to a change, which is always set if this is a leaf node (with no children), and if there are children and this
     /// is a rewritten tree.
     change_idx: Option<usize>,
+    /// Prefer non-tree changes if multiple changes occupy the same path.
+    change_is_tree: bool,
     /// Keep track of where the location of this node is derived from.
     location: ChangeLocation,
 }
@@ -394,6 +523,7 @@ impl TreeNodes {
                         let new_node = TreeNode {
                             children: Default::default(),
                             change_idx: is_last.then_some(change_idx),
+                            change_is_tree: is_last && change.entry_mode().is_tree(),
                             location: location_hint,
                         };
                         cursor.children.insert(component.to_owned(), next_index);
@@ -403,11 +533,15 @@ impl TreeNodes {
                     }
                     Some(index) => {
                         cursor = &mut self.0[index];
-                        if is_last && !cursor.is_leaf_node() {
+                        if is_last {
                             // NOTE: we might encounter the same path multiple times in rare conditions.
-                            //       At least we avoid overwriting existing intermediate changes, for good measure.
-                            if cursor.change_idx.is_none() {
+                            //       Prefer a non-tree change as it describes the actual leaf collision.
+                            if (cursor.change_idx.is_none() && !cursor.is_leaf_node())
+                                || (cursor.change_is_tree && !change.entry_mode().is_tree())
+                            {
                                 cursor.change_idx = Some(change_idx);
+                                cursor.change_is_tree = change.entry_mode().is_tree();
+                                cursor.location = location_hint;
                             }
                         }
                     }
@@ -416,10 +550,12 @@ impl TreeNodes {
         }
     }
 
-    /// Search the tree with `our` changes for `theirs` by [`source_location()`](Change::source_location())).
-    /// If there is an entry but both are the same, or if there is no entry, return `None`.
+    /// Search our indexed change paths for a structural overlap with `theirs_location`.
+    ///
+    /// Return the kind of exact-path or tree/non-tree overlap found, including passage through
+    /// a rewritten directory, or `None` if the path does not interact with our indexed changes.
     pub fn check_conflict(&self, theirs_location: &BStr) -> Option<PossibleConflict> {
-        if self.0.len() == 1 {
+        if self.0[0].children.is_empty() {
             return None;
         }
         let components = to_components(theirs_location);
@@ -433,7 +569,7 @@ impl TreeNodes {
             match cursor.children.get(component).copied() {
                 // *their* change is outside *our* tree
                 None => {
-                    let res = if cursor.is_leaf_node() {
+                    let res = if cursor.is_leaf_node() && !cursor.change_is_tree {
                         Some(PossibleConflict::NonTreeToTree {
                             change_idx: cursor.change_idx,
                         })
@@ -471,56 +607,73 @@ impl TreeNodes {
         .into()
     }
 
-    /// Compare both changes and return `true` if they are *not* exactly the same.
-    /// One two changes are the same, they will have the same effect.
-    /// Since this is called after [`Self::check_conflict`], *our* change will not be applied,
-    /// only theirs, which naturally avoids double-application
-    /// (which shouldn't have side effects, but let's not risk it)
-    pub fn is_not_same_change_in_possible_conflict(
-        &self,
-        theirs: &Change,
-        conflict: &PossibleConflict,
-        our_changes: &ChangeListRef,
-    ) -> bool {
-        conflict
-            .change_idx()
-            .is_none_or(|idx| our_changes[idx].inner != *theirs)
+    pub fn remove_existing_change(&mut self, location: &BStr) {
+        self.remove_change_inner(location, true);
     }
 
-    pub fn remove_existing_leaf(&mut self, location: &BStr) {
-        self.remove_leaf_inner(location, true);
+    /// Check indexed changes in this subtree without visiting unrelated paths.
+    pub fn all_changes_at_or_below(&self, location: &BStr, mut predicate: impl FnMut(usize) -> bool) -> bool {
+        let mut cursor = &self.0[0];
+        for component in to_components(location) {
+            let Some(&idx) = cursor.children.get(component) else {
+                return true;
+            };
+            cursor = &self.0[idx];
+        }
+        let mut pending = vec![cursor];
+        while let Some(node) = pending.pop() {
+            if node.change_idx.is_some_and(|idx| !predicate(idx)) {
+                return false;
+            }
+            pending.extend(node.children.values().map(|&idx| &self.0[idx]));
+        }
+        true
     }
 
-    pub fn remove_leaf(&mut self, location: &BStr) {
-        self.remove_leaf_inner(location, false);
+    pub fn remove_change(&mut self, location: &BStr) {
+        self.remove_change_inner(location, false);
     }
 
-    fn remove_leaf_inner(&mut self, location: &BStr, must_exist: bool) {
+    fn remove_change_inner(&mut self, location: &BStr, must_exist: bool) {
         let mut components = to_components(location).peekable();
-        let mut cursor = &mut self.0[0];
+        let mut cursor_idx = 0;
+        let mut ancestry = Vec::new();
         while let Some(component) = components.next() {
-            match cursor.children.get(component).copied() {
-                None => debug_assert!(!must_exist, "didn't find '{location}' for removal"),
+            match self.0[cursor_idx].children.get(component).copied() {
+                None => {
+                    debug_assert!(!must_exist, "didn't find '{location}' for removal");
+                    // The remaining components cannot belong to this path once a prefix is absent.
+                    return;
+                }
                 Some(existing_idx) => {
+                    ancestry.push((cursor_idx, component.to_owned(), existing_idx));
                     let is_last = components.peek().is_none();
                     if is_last {
-                        cursor.children.remove(component);
-                        cursor = &mut self.0[existing_idx];
-                        debug_assert!(
-                            cursor.is_leaf_node(),
-                            "BUG: we should really only try to remove leaf nodes: {cursor:?}"
-                        );
-                        cursor.change_idx = None;
+                        let node = &mut self.0[existing_idx];
+                        debug_assert!(!must_exist || node.change_idx.is_some(), "no change at '{location}'");
+                        node.change_idx = None;
+                        node.change_is_tree = false;
                     } else {
-                        cursor = &mut self.0[existing_idx];
+                        cursor_idx = existing_idx;
                     }
                 }
             }
         }
+
+        while let Some((parent_idx, component, child_idx)) = ancestry.pop() {
+            let child = &self.0[child_idx];
+            if child.change_idx.is_some() || !child.children.is_empty() {
+                break;
+            }
+            self.0[parent_idx].children.remove(component.as_bstr());
+        }
     }
 
-    /// Insert `new_change` which affects this tree into it and put it into `storage` to obtain the index.
-    /// Panic if that change already exists as it must be made so that it definitely doesn't overlap with this tree.
+    /// Insert the current location of a newly deferred change into this tree.
+    ///
+    /// A rewrite may arrive here after directory-rename handling deferred it to a relocated
+    /// destination. Its source is already represented by the original change tree; only the
+    /// rescheduled destination must become visible now.
     pub fn insert(&mut self, new_change: &Change, new_change_idx: usize) {
         let mut next_index = self.0.len();
         let mut cursor = &mut self.0[0];
@@ -538,11 +691,8 @@ impl TreeNodes {
             }
         }
 
-        debug_assert!(
-            !matches!(new_change, Change::Rewrite { .. }),
-            "BUG: we thought we wouldn't do that current.location is related?"
-        );
         cursor.change_idx = Some(new_change_idx);
+        cursor.change_is_tree = new_change.entry_mode().is_tree();
         cursor.location = ChangeLocation::CurrentLocation;
     }
 }
@@ -573,7 +723,7 @@ impl Conflict {
     }
 
     fn maybe_resolved(
-        resolution: Result<Resolution, ResolutionFailure>,
+        resolution: std::result::Result<Resolution, ResolutionFailure>,
         (ours, theirs, map, outer_map): (&Change, &Change, ConflictMapping, ConflictMapping),
         entries: [Option<ConflictIndexEntry>; 3],
     ) -> Self {
@@ -608,5 +758,163 @@ impl Conflict {
             }),
         ];
         Conflict::maybe_resolved(Err(ResolutionFailure::Unknown), changes, entries)
+    }
+}
+
+#[cfg(test)]
+mod tree_nodes_tests {
+    use super::*;
+    use gix_error::Result;
+
+    #[test]
+    fn subtree_queries_only_visit_the_requested_prefix() {
+        let mut tree = TreeNodes::new();
+        for (idx, location) in ["d/a", "d/b", "d-prefix/c", "elsewhere/c"].into_iter().enumerate() {
+            tree.track_change(
+                &Change::Deletion {
+                    location: location.into(),
+                    relation: None,
+                    entry_mode: EntryKind::Blob.into(),
+                    id: gix_hash::Kind::Sha1.null(),
+                },
+                idx,
+            );
+        }
+        let mut visited = Vec::new();
+        assert!(tree.all_changes_at_or_below("d".into(), |idx| {
+            visited.push(idx);
+            true
+        }));
+        visited.sort_unstable();
+        assert_eq!(visited, [0, 1], "only changes in the indexed subtree are examined");
+        assert!(
+            !tree.all_changes_at_or_below("d".into(), |idx| idx != 1),
+            "a rejected descendant stops the query"
+        );
+    }
+
+    #[test]
+    fn removing_an_absent_nested_change_does_not_remove_a_matching_root_suffix() {
+        let mut tree = TreeNodes::new();
+        tree.0[0].children.insert("b".into(), 1);
+        tree.0.push(TreeNode {
+            change_idx: Some(42),
+            ..Default::default()
+        });
+
+        tree.remove_change("a/b".into());
+        assert!(
+            matches!(
+                tree.check_conflict("b".into()),
+                Some(PossibleConflict::Match { change_idx: 42 })
+            ),
+            "a missing `a` prefix must stop removal before an unrelated root-level `b`"
+        );
+    }
+
+    #[test]
+    fn removing_a_change_prunes_empty_parent_nodes() {
+        let mut tree = TreeNodes::new();
+        tree.track_change(
+            &Change::Addition {
+                location: "e/e".into(),
+                relation: None,
+                entry_mode: EntryKind::Blob.into(),
+                id: gix_hash::Kind::Sha1.null(),
+            },
+            0,
+        );
+
+        tree.remove_existing_change("e/e".into());
+        assert!(
+            tree.check_conflict("e".into()).is_none(),
+            "an empty former parent isn't a leaf change or a path conflict"
+        );
+    }
+
+    #[test]
+    fn passing_a_rewritten_directory_does_not_occupy_every_path_below_it() {
+        let mut tree = TreeNodes::new();
+        tree.track_change(
+            &Change::Rewrite {
+                source_location: "old".into(),
+                source_entry_mode: EntryKind::Tree.into(),
+                source_relation: None,
+                source_id: gix_hash::Kind::Sha1.null(),
+                diff: None,
+                entry_mode: EntryKind::Tree.into(),
+                id: gix_hash::Kind::Sha1.null(),
+                location: "new".into(),
+                relation: None,
+                copy: false,
+            },
+            0,
+        );
+        tree.track_change(
+            &Change::Modification {
+                location: "old/existing".into(),
+                previous_entry_mode: EntryKind::Blob.into(),
+                previous_id: gix_hash::Kind::Sha1.null(),
+                entry_mode: EntryKind::Blob.into(),
+                id: gix_hash::Kind::Sha1.null(),
+            },
+            1,
+        );
+
+        assert!(
+            matches!(
+                tree.check_conflict("old/file~side".into()),
+                Some(PossibleConflict::PassedRewrittenDirectory { change_idx: 0 })
+            ),
+            "the path still has to follow the directory rename"
+        );
+    }
+
+    #[test]
+    fn a_tracked_tree_without_tracked_children_does_not_occupy_paths_below_it() {
+        let mut tree = TreeNodes::new();
+        tree.track_change(
+            &Change::Addition {
+                location: "dir".into(),
+                relation: None,
+                entry_mode: EntryKind::Tree.into(),
+                id: gix_hash::Kind::Sha1.null(),
+            },
+            0,
+        );
+
+        assert!(
+            !matches!(
+                tree.check_conflict("dir/file~side".into()),
+                Some(PossibleConflict::NonTreeToTree { .. })
+            ),
+            "a tracked tree permits children even if no child change is currently tracked"
+        );
+    }
+
+    #[test]
+    fn unique_path_qualifies_a_non_tree_parent_instead_of_looping_over_child_names() -> Result {
+        let mut tree = TreeNodes::new();
+        tree.track_change(
+            &Change::Addition {
+                location: "dir".into(),
+                relation: None,
+                entry_mode: EntryKind::Blob.into(),
+                id: gix_hash::Kind::Sha1.null(),
+            },
+            0,
+        );
+        let editor = tree::Editor::new(
+            gix_object::Tree::default(),
+            &gix_object::find::Never,
+            gix_hash::Kind::Sha1,
+        );
+
+        assert_eq!(
+            unique_path_in_tree("dir/file".into(), &editor, &[&tree], "OURS".into())?,
+            "dir~OURS/file",
+            "the blocking path component itself must be moved aside"
+        );
+        Ok(())
     }
 }

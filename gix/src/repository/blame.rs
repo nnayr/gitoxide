@@ -1,7 +1,8 @@
+use gix_blame::Start;
 use gix_hash::ObjectId;
 use gix_ref::bstr::BStr;
 
-use crate::{Repository, repository::blame_file};
+use crate::{Repository, Result, repository::blame_file};
 
 impl Repository {
     /// Produce a list of consecutive [`gix_blame::BlameEntry`] instances. Each `BlameEntry`
@@ -14,7 +15,7 @@ impl Repository {
         file_path: &BStr,
         suspect: impl Into<ObjectId>,
         options: blame_file::Options,
-    ) -> Result<gix_blame::Outcome, blame_file::Error> {
+    ) -> Result<gix_blame::Outcome> {
         let cache = self.commit_graph_if_enabled()?;
         let mut resource_cache = self.diff_resource_cache_for_tree_diff()?;
 
@@ -39,7 +40,7 @@ impl Repository {
 
         let outcome = gix_blame::file(
             &self.objects,
-            suspect.into(),
+            Start::Commit(suspect.into()),
             cache,
             &mut resource_cache,
             file_path,

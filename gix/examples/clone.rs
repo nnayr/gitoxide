@@ -1,27 +1,33 @@
 // Clone a repository from any URL or Path to a given target directory
 
-use anyhow::Context;
+use gix::{
+    Result,
+    error::{OptionExt, ResultExt, message},
+};
 
-fn main() -> anyhow::Result<()> {
+fn main() -> Result<()> {
     let repo_url = std::env::args_os()
         .nth(1)
-        .context("The first argument is the repository URL")?;
+        .ok_or_raise(|| message("The first argument is the repository URL"))?;
 
     let dst = std::env::args_os()
         .nth(2)
-        .context("The second argument is the directory to clone the repository into")?;
+        .ok_or_raise(|| message("The second argument is the directory to clone the repository into"))?;
 
     // SAFETY: The closure doesn't use mutexes or memory allocation, so it should be safe to call from a signal handler.
     unsafe {
         gix::interrupt::init_handler(1, || {})?;
     }
-    std::fs::create_dir_all(&dst)?;
-    let url = gix::url::parse(repo_url.to_str().unwrap().into())?;
+    std::fs::create_dir_all(&dst).or_error()?;
+    let repo_url = repo_url
+        .to_str()
+        .ok_or_raise(|| message("The repository URL must be valid UTF-8"))?;
+    let url = gix::url::parse(repo_url)?;
 
     println!("Url: {:?}", url.to_bstring());
     let mut prepare_clone = gix::prepare_clone(url, &dst)?;
 
-    println!("Cloning {repo_url:?} into {dst:?}...");
+    println!("Cloning {} into {}...", repo_url, dst.display());
     let (mut prepare_checkout, _) =
         prepare_clone.fetch_then_checkout(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)?;
 

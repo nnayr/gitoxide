@@ -5,16 +5,16 @@ use std::{
 };
 
 use crate::{OutputFormat, net};
-use anyhow::bail;
 use gix::protocol::transport::client::blocking_io::connect;
 use gix::{
-    NestedProgress,
+    NestedProgress, Result,
     config::tree::Key,
+    error::{ResultExt, bail},
     objs::bstr::ByteSlice,
     protocol::{self, handshake::Ref, transport},
     refs::{
         Target,
-        transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog},
+        transaction::{PreviousValue, RefEdit},
     },
 };
 
@@ -39,14 +39,14 @@ pub fn refs<P, W>(
     refs_directory: Option<PathBuf>,
     mut progress: P,
     ctx: Context<W>,
-) -> anyhow::Result<()>
+) -> Result<()>
 where
     W: io::Write,
     P: NestedProgress + 'static,
     P::SubProgress: 'static,
 {
     if ctx.format != OutputFormat::Human {
-        bail!("JSON output isn't supported");
+        bail!(gix::error::unsupported("JSON output isn't supported"));
     }
 
     let mut transport = net::connect(
@@ -87,7 +87,7 @@ where
     let refs_write = refs_directory
         .map(|directory| write_refs(&refs, directory, ctx.object_hash, ctx.write_reflog))
         .transpose()?;
-    print_refs(ctx.out, &refs, refs_write)?;
+    print_refs(ctx.out, &refs, refs_write).or_error()?;
 
     Ok(())
 }
@@ -106,21 +106,21 @@ fn write_refs(
     directory: PathBuf,
     object_hash: gix::hash::Kind,
     write_reflog: bool,
-) -> anyhow::Result<RefsWriteOutcome> {
+) -> Result<RefsWriteOutcome> {
     let _span = gix::trace::coarse!("write remote refs", refs = refs.len(), directory = ?directory);
-    std::fs::create_dir_all(&directory)?;
+    std::fs::create_dir_all(&directory).or_error()?;
 
     let start = Instant::now();
     let precompose_unicode = gix::fs::Capabilities::probe(&directory).precompose_unicode;
-    let store = gix::RefStore::at(
+    let store = gix::RefStore::at_opts(
         directory,
+        object_hash,
         gix::refs::store::init::Options {
             write_reflog: if write_reflog {
                 gix::refs::store::WriteReflog::Always
             } else {
                 gix::refs::store::WriteReflog::Disable
             },
-            object_hash,
             precompose_unicode,
             prohibit_windows_device_names: cfg!(windows),
         },
@@ -128,7 +128,8 @@ fn write_refs(
     let edits = refs
         .iter()
         .map(ref_to_edit)
-        .collect::<Result<Vec<_>, gix::refs::name::Error>>()?;
+        .collect::<std::result::Result<Vec<_>, gix::refs::name::Error>>()
+        .or_error()?;
 
     store
         .transaction()
@@ -158,7 +159,7 @@ fn reflog_committer() -> gix::actor::SignatureRef<'static> {
     }
 }
 
-fn ref_to_edit(ref_: &Ref) -> Result<RefEdit, gix::refs::name::Error> {
+fn ref_to_edit(ref_: &Ref) -> std::result::Result<RefEdit, gix::refs::name::Error> {
     let (name, target) = match ref_ {
         Ref::Unborn { full_ref_name, target } => (full_ref_name, Target::Symbolic(target.as_bstr().try_into()?)),
         Ref::Symbolic {
@@ -167,17 +168,10 @@ fn ref_to_edit(ref_: &Ref) -> Result<RefEdit, gix::refs::name::Error> {
         Ref::Peeled { full_ref_name, tag, .. } => (full_ref_name, Target::Object(*tag)),
         Ref::Direct { full_ref_name, object } => (full_ref_name, Target::Object(*object)),
     };
-    Ok(RefEdit {
-        change: Change::Update {
-            log: LogChange {
-                mode: RefLog::AndReference,
-                force_create_reflog: false,
-                message: "remote refs".into(),
-            },
-            expected: PreviousValue::Any,
-            new: target,
-        },
-        name: name.as_bstr().try_into()?,
-        deref: false,
-    })
+    Ok(RefEdit::update(
+        name.as_bstr().try_into()?,
+        target,
+        PreviousValue::Any,
+        "remote refs",
+    ))
 }

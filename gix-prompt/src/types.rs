@@ -1,23 +1,5 @@
 use std::path::PathBuf;
 
-/// The error returned by [ask()][crate::ask()].
-#[derive(Debug, thiserror::Error)]
-#[expect(missing_docs)]
-pub enum Error {
-    #[error("Terminal prompts are disabled")]
-    Disabled,
-    #[error("The current platform has no implementation for prompting in the terminal")]
-    UnsupportedPlatform,
-    #[error(
-        "Failed to open terminal at {:?} for writing prompt, or to write it",
-        crate::unix::TTY_PATH
-    )]
-    TtyIo(#[from] std::io::Error),
-    #[cfg(unix)]
-    #[error("Failed to obtain or set terminal configuration")]
-    TerminalConfiguration(#[from] rustix::io::Errno),
-}
-
 /// The way the user is prompted.
 #[derive(Default, Debug, Copy, Clone, Eq, PartialEq)]
 pub enum Mode {
@@ -61,10 +43,10 @@ impl Options {
         if let Some(askpass) = use_git_askpass.then(|| std::env::var_os("GIT_ASKPASS")).flatten() {
             self.askpass = Some(askpass.into());
         }
-        if self.askpass.is_none() {
-            if let Some(askpass) = use_ssh_askpass.then(|| std::env::var_os("SSH_ASKPASS")).flatten() {
-                self.askpass = Some(askpass.into());
-            }
+        if self.askpass.is_none()
+            && let Some(askpass) = use_ssh_askpass.then(|| std::env::var_os("SSH_ASKPASS")).flatten()
+        {
+            self.askpass = Some(askpass.into());
         }
         self.mode = use_git_terminal_prompt
             .then(|| {

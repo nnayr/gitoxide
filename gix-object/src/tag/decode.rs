@@ -1,6 +1,7 @@
 use bstr::ByteSlice;
+use gix_error::{OptionExt, Result, ResultExt, bail, ensure, validation};
 
-use crate::{BStr, Kind, TagRef, parse, parse::ParseResult};
+use crate::{BStr, Kind, TagRef, parse};
 
 /// Parse a complete annotated tag object body.
 ///
@@ -14,16 +15,14 @@ use crate::{BStr, Kind, TagRef, parse, parse::ParseResult};
 /// This parser is not transactional as a whole: if a later field fails, `i` may
 /// already have been advanced past earlier successfully parsed fields. Individual
 /// field parsers document their own cursor behaviour.
-pub fn git_tag<'a>(i: &mut &'a [u8], hash_kind: gix_hash::Kind) -> ParseResult<TagRef<'a>> {
+pub fn git_tag<'a>(i: &mut &'a [u8], hash_kind: gix_hash::Kind) -> Result<TagRef<'a>> {
     let target = target(i, hash_kind)?;
     let kind = kind(i)?;
     let tag_version = name(i)?;
     let tagger = tagger_raw(i)?;
 
-    let (message, pgp_signature) = message(i)?;
-    if !i.is_empty() {
-        return Err(crate::decode::Error);
-    }
+    let (message, signature) = message(i)?;
+    ensure!(i.is_empty(), crate::decode::empty_error());
 
     Ok(TagRef {
         target,
@@ -31,7 +30,7 @@ pub fn git_tag<'a>(i: &mut &'a [u8], hash_kind: gix_hash::Kind) -> ParseResult<T
         target_kind: kind,
         message,
         tagger,
-        pgp_signature,
+        signature,
     })
 }
 
@@ -40,7 +39,7 @@ pub fn git_tag<'a>(i: &mut &'a [u8], hash_kind: gix_hash::Kind) -> ParseResult<T
 /// Typical input is `object 0123456789012345678901234567890123456789\n`.
 /// The hash must match `object_hash`. Uppercase ASCII hex is also valid.
 /// On success, `i` is advanced past the entire header line.
-pub(crate) fn target<'a>(i: &mut &'a [u8], hash_kind: gix_hash::Kind) -> ParseResult<&'a BStr> {
+pub(crate) fn target<'a>(i: &mut &'a [u8], hash_kind: gix_hash::Kind) -> Result<&'a BStr> {
     parse::header_field(i, b"object", |value| parse::hex_hash(value, hash_kind))
 }
 
@@ -48,9 +47,9 @@ pub(crate) fn target<'a>(i: &mut &'a [u8], hash_kind: gix_hash::Kind) -> ParseRe
 ///
 /// Typical inputs are `type commit\n`, `type tree\n`, `type blob\n`, and
 /// `type tag\n`. On success, `i` is advanced past the entire header line.
-pub(crate) fn kind(i: &mut &[u8]) -> ParseResult<Kind> {
+pub(crate) fn kind(i: &mut &[u8]) -> Result<Kind> {
     parse::header_field(i, b"type", |value| {
-        Kind::from_bytes(value).map_err(|_| crate::decode::Error)
+        Kind::from_bytes(value).or_raise(|| validation("Invalid tag object kind"))
     })
 }
 
@@ -59,9 +58,11 @@ pub(crate) fn kind(i: &mut &[u8]) -> ParseResult<Kind> {
 /// A typical input is `tag v1.0.0\n`. The returned name excludes both the
 /// `tag ` prefix and the trailing newline, and must be non-empty. On success,
 /// `i` is advanced past the entire header line.
-pub(crate) fn name<'a>(i: &mut &'a [u8]) -> ParseResult<&'a BStr> {
+pub(crate) fn name<'a>(i: &mut &'a [u8]) -> Result<&'a BStr> {
     parse::header_field(i, b"tag", |value| {
-        (!value.is_empty()).then(|| value.as_bstr()).ok_or(crate::decode::Error)
+        (!value.is_empty())
+            .then(|| value.as_bstr())
+            .ok_or_raise(crate::decode::empty_error)
     })
 }
 
@@ -71,13 +72,13 @@ pub(crate) fn name<'a>(i: &mut &'a [u8]) -> ParseResult<&'a BStr> {
 /// the `tagger ` prefix is absent, this returns `Ok(None)`. On success, it
 /// returns the signature bytes without the prefix or newline and advances `i`
 /// past the entire header line.
-pub(crate) fn tagger_raw<'a>(i: &mut &'a [u8]) -> ParseResult<Option<&'a BStr>> {
+pub(crate) fn tagger_raw<'a>(i: &mut &'a [u8]) -> Result<Option<&'a BStr>> {
     if !i.starts_with(b"tagger ") {
         return Ok(None);
     }
     parse::header_field(i, b"tagger", |raw| {
         let mut sig = raw;
-        gix_actor::SignatureRef::from_bytes_consuming(&mut sig).map_err(|_| crate::decode::Error)?;
+        gix_actor::SignatureRef::from_bytes_consuming(&mut sig).or_raise(|| validation("Invalid tagger signature"))?;
         Ok(raw.as_bstr())
     })
     .map(Some)
@@ -89,35 +90,31 @@ pub(crate) fn tagger_raw<'a>(i: &mut &'a [u8]) -> ParseResult<Option<&'a BStr>> 
 /// the `tagger ` prefix is absent, this returns `Ok(None)`. On success, it
 /// returns the parsed [`gix_actor::SignatureRef`] and advances `i` past the
 /// entire header line.
-pub(crate) fn tagger<'a>(i: &mut &'a [u8]) -> ParseResult<Option<gix_actor::SignatureRef<'a>>> {
+pub(crate) fn tagger<'a>(i: &mut &'a [u8]) -> Result<Option<gix_actor::SignatureRef<'a>>> {
     if !i.starts_with(b"tagger ") {
         return Ok(None);
     }
     parse::header_field(i, b"tagger", |i| {
         let mut sig = i;
-        let signature = gix_actor::SignatureRef::from_bytes_consuming(&mut sig).map_err(|_| crate::decode::Error)?;
+        let signature = gix_actor::SignatureRef::from_bytes_consuming(&mut sig)
+            .or_raise(|| validation("Invalid tagger signature"))?;
         Ok(signature)
     })
     .map(Some)
 }
 
-/// Parse the tag message and its optional PGP signature block.
+/// Parse the tag message and its optional cryptographic signature block.
 ///
-/// Typical input starts with the blank-line separator before the message, for
-/// example `\nrelease notes`. A signed input looks like
-/// `\nrelease notes\n-----BEGIN PGP SIGNATURE-----\n...\n-----END PGP SIGNATURE-----`.
 /// On success, `i` is always advanced to the empty suffix. The returned tuple
-/// contains the message and, if a PGP signature marker is found at the
-/// beginning of a line, all bytes from that marker to the end of the input,
-/// and notably the end-of-signature marker isn't required.
+/// contains the message and, if a Git-supported armor marker is found at the
+/// beginning of a line, all bytes from the last such marker through end of input.
+/// An end-of-signature marker isn't required.
 ///
 /// An input consisting only of newlines is accepted as an empty-header message
 /// and consumed entirely. In that case, the newlines are returned as part of
 /// the message to preserve roundtrips for tags whose body is only the
 /// header/message separator.
-pub fn message<'a>(i: &mut &'a [u8]) -> ParseResult<(&'a BStr, Option<&'a BStr>)> {
-    const PGP_SIGNATURE_BEGIN: &[u8] = b"-----BEGIN PGP SIGNATURE-----";
-
+pub fn message<'a>(i: &mut &'a [u8]) -> Result<(&'a BStr, Option<&'a BStr>)> {
     if i.iter().all(|b| *b == b'\n') {
         let message = i.as_bstr();
         *i = &[];
@@ -125,11 +122,11 @@ pub fn message<'a>(i: &mut &'a [u8]) -> ParseResult<(&'a BStr, Option<&'a BStr>)
     }
 
     let Some(rest) = i.strip_prefix(parse::NL) else {
-        return Err(crate::decode::Error);
+        bail!(crate::decode::empty_error());
     };
 
     *i = &[];
-    if let Some(sig_start) = find_pgp_signature(rest, PGP_SIGNATURE_BEGIN) {
+    if let Some((sig_start, _format)) = crate::signature::find(rest) {
         // Truncate newline off the message end.
         let message_end = if sig_start > 0 && rest[sig_start - 1] == b'\n' {
             sig_start - 1
@@ -142,24 +139,4 @@ pub fn message<'a>(i: &mut &'a [u8]) -> ParseResult<(&'a BStr, Option<&'a BStr>)
     }
 
     Ok((rest.as_bstr(), None))
-}
-
-/// Find a PGP signature marker that starts at a line boundary.
-///
-/// `haystack` is usually the tag message body and `needle` is the marker to
-/// search for. On success, the returned index is the marker itself.
-fn find_pgp_signature(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if haystack.starts_with(needle) {
-        return Some(0);
-    }
-
-    let mut offset = 0;
-    while let Some(pos) = haystack.get(offset..)?.find_byte(b'\n') {
-        let found = offset + pos + 1;
-        if haystack[found..].starts_with(needle) {
-            return Some(found);
-        }
-        offset = found;
-    }
-    None
 }

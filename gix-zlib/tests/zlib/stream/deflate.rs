@@ -8,8 +8,8 @@ use bstr::ByteSlice;
 use gix_zlib::stream::deflate::{self, Compress, FlushCompress};
 use gix_zlib::{Compression, Decompress};
 
-pub(crate) fn compressed(data: &[u8]) -> Vec<u8> {
-    let mut writer = deflate::Write::new(Vec::new(), Compression::BEST_SPEED);
+pub(crate) fn compressed(data: &[u8], level: Compression) -> Vec<u8> {
+    let mut writer = deflate::Write::new(Vec::new(), level);
     writer.write_all(data).expect("in-memory writes never fail");
     writer.flush().expect("in-memory flushes never fail");
     writer.into_inner()
@@ -44,7 +44,7 @@ where
 }
 
 #[test]
-fn small_file_decompress() -> Result<(), Box<dyn std::error::Error>> {
+fn small_file_decompress() -> gix_error::TestResult {
     fn fixture_path(path: &str) -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../gix-odb/tests/fixtures")
@@ -62,7 +62,7 @@ fn small_file_decompress() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn all_at_once() -> Result<(), Box<dyn std::error::Error>> {
+fn all_at_once() -> gix_error::TestResult {
     let mut w = deflate::Write::new(Vec::new(), Compression::BEST_SPEED);
     assert_eq!(w.write(b"hello")?, 5);
     w.flush()?;
@@ -70,10 +70,11 @@ fn all_at_once() -> Result<(), Box<dyn std::error::Error>> {
     let out = w.into_inner();
     assert!(out.len() == 12 || out.len() == 13);
 
-    assert_deflate_buffer(out, b"hello")
+    assert_deflate_buffer(out, b"hello")?;
+    Ok(())
 }
 
-fn assert_deflate_buffer(out: Vec<u8>, expected: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+fn assert_deflate_buffer(out: Vec<u8>, expected: &[u8]) -> io::Result<()> {
     let mut actual = Vec::new();
     InflateReader::from_read(out.as_slice()).read_to_end(&mut actual)?;
     assert_eq!(actual, expected);
@@ -81,7 +82,7 @@ fn assert_deflate_buffer(out: Vec<u8>, expected: &[u8]) -> Result<(), Box<dyn st
 }
 
 #[test]
-fn higher_levels_compress_better() -> Result<(), Box<dyn std::error::Error>> {
+fn higher_levels_compress_better() -> gix_error::TestResult {
     let data: Vec<u8> = (0..128 * 1024).map(|i| (i % 100) as u8).collect();
     let mut sizes = Vec::new();
     for level in [Compression::NONE, Compression::BEST_SPEED, Compression::DEFAULT] {
@@ -100,7 +101,7 @@ fn higher_levels_compress_better() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn big_file_small_writes() -> Result<(), Box<dyn std::error::Error>> {
+fn big_file_small_writes() -> gix_error::TestResult {
     let mut w = deflate::Write::new(Vec::new(), Compression::BEST_SPEED);
     let bytes = include_bytes!(
         "../../../../gix-odb/tests/fixtures/objects/pack/pack-11fdfa9e156ab73caae3b6da867192221f2089c2.pack"
@@ -110,11 +111,12 @@ fn big_file_small_writes() -> Result<(), Box<dyn std::error::Error>> {
     }
     w.flush()?;
 
-    assert_deflate_buffer(w.into_inner(), bytes)
+    assert_deflate_buffer(w.into_inner(), bytes)?;
+    Ok(())
 }
 
 #[test]
-fn big_file_a_few_big_writes() -> Result<(), Box<dyn std::error::Error>> {
+fn big_file_a_few_big_writes() -> gix_error::TestResult {
     let mut w = deflate::Write::new(Vec::new(), Compression::BEST_SPEED);
     let bytes = include_bytes!(
         "../../../../gix-odb/tests/fixtures/objects/pack/pack-11fdfa9e156ab73caae3b6da867192221f2089c2.pack"
@@ -124,11 +126,12 @@ fn big_file_a_few_big_writes() -> Result<(), Box<dyn std::error::Error>> {
     }
     w.flush()?;
 
-    assert_deflate_buffer(w.into_inner(), bytes)
+    assert_deflate_buffer(w.into_inner(), bytes)?;
+    Ok(())
 }
 
 #[test]
-fn compressor_lifecycle_counters_and_flush_modes() -> Result<(), Box<dyn std::error::Error>> {
+fn compressor_lifecycle_counters_and_flush_modes() -> gix_error::TestResult {
     for flush in [
         FlushCompress::None,
         FlushCompress::Partial,
@@ -164,7 +167,7 @@ fn compressor_lifecycle_counters_and_flush_modes() -> Result<(), Box<dyn std::er
 }
 
 #[test]
-fn writer_clone_and_reset() -> Result<(), Box<dyn std::error::Error>> {
+fn writer_clone_and_reset() -> gix_error::TestResult {
     let original = deflate::Write::new(Vec::new(), Compression::BEST_SPEED);
     let mut cloned = original.clone();
     cloned.write_all(b"clone owns a fresh compressor")?;
@@ -201,5 +204,93 @@ fn writer_clone_and_reset() -> Result<(), Box<dyn std::error::Error>> {
         streams.len(),
         "decoding both members should consume the complete concatenated stream"
     );
+    Ok(())
+}
+
+#[test]
+fn writes_after_finishing_fail_until_reset() -> gix_error::TestResult {
+    let mut writer = deflate::Write::new(Vec::new(), Compression::BEST_SPEED);
+    writer.write_all(b"first")?;
+    writer.flush()?;
+    writer.flush()?;
+    assert!(
+        writer.write(b"second").is_err(),
+        "a finished stream takes no more input"
+    );
+    writer.reset();
+    writer.write_all(b"second")?;
+    writer.flush()?;
+
+    let streams = writer.into_inner();
+    let mut inflate = gix_zlib::Inflate::default();
+    let mut output = [0; 16];
+    let (_, consumed, written) = inflate.once(&streams, &mut output)?;
+    assert_eq!(
+        &output[..written],
+        b"first",
+        "repeated flushes and a rejected write should preserve the finished stream"
+    );
+    inflate.reset();
+    let (_, _, written) = inflate.once(&streams[consumed..], &mut output)?;
+    assert_eq!(
+        &output[..written],
+        b"second",
+        "resetting the writer should allow writing a new independently decodable stream"
+    );
+    Ok(())
+}
+
+#[test]
+fn inputs_larger_than_any_buffer() -> gix_error::TestResult {
+    // Several MiB of data that compresses somewhat, as a large blob would.
+    let mut x = 1u32;
+    let data: Vec<u8> = (0..5 << 20)
+        .map(|i| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            if i % 4 == 0 { x as u8 } else { b"blob "[i % 5] }
+        })
+        .collect();
+    for level in [Compression::NONE, Compression::BEST_SPEED, Compression::DEFAULT] {
+        let mut writer = deflate::Write::new(Vec::new(), level);
+        for chunk in data.chunks(1000) {
+            writer.write_all(chunk)?;
+        }
+        writer.flush()?;
+        assert_deflate_buffer(writer.into_inner(), &data)?;
+
+        let mut writer = deflate::Write::new(Vec::new(), level);
+        writer.write_all(&data)?;
+        writer.flush()?;
+        assert_deflate_buffer(writer.into_inner(), &data)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn writers_of_different_levels_one_after_another() -> gix_error::TestResult {
+    let data = b"some object content, some object content".repeat(10);
+    for level in [1, 9, 6, 1, 0, 9, 9, 6] {
+        let level = Compression::new(level).expect("all test levels are within the supported range of 0..=9");
+        let mut writer = deflate::Write::new(Vec::new(), level);
+        writer.write_all(&data)?;
+        writer.flush()?;
+        let out = writer.into_inner();
+        // The zlib header records the level, as zlib does.
+        let flevel = match level.level() {
+            0 | 1 => 0,
+            2..=5 => 1,
+            6 => 2,
+            _ => 3,
+        };
+        assert_eq!(
+            out[1] >> 6,
+            flevel,
+            "the zlib header should record compression level {} even when levels change between writers",
+            level.level()
+        );
+        assert_deflate_buffer(out, &data)?;
+    }
     Ok(())
 }

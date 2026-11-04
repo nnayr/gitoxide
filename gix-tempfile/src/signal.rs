@@ -23,6 +23,7 @@ pub mod handler {
 
     /// Define how our signal handlers act
     #[derive(Debug, Clone, Copy, Ord, PartialOrd, Eq, PartialEq)]
+    #[non_exhaustive]
     pub enum Mode {
         /// Do not install a signal handler at all, but have somebody else call our handler directly.
         None = 0,
@@ -78,7 +79,7 @@ pub mod handler {
         }
 
         #[test]
-        fn various_termination_signals_remove_tempfiles_unconditionally() -> Result<(), Box<dyn std::error::Error>> {
+        fn various_termination_signals_remove_tempfiles_unconditionally() -> gix_testtools::TestResult {
             crate::signal::setup(Default::default());
             let dir = tempfile::tempdir()?;
             for sig in signal_hook::consts::TERM_SIGNALS {

@@ -420,9 +420,8 @@ pub fn take_intersecting(
     intersecting.clear();
 
     fn left_overlaps_right(left: &Hunk, right: &Hunk) -> bool {
-        left.side != right.side
-            && (right.before.contains(&left.before.start)
-                || (right.before.is_empty() && right.before.start == left.before.start))
+        // Like Git, consider changes disjoint only if there is a gap between their base ranges.
+        left.side != right.side && left.before.start <= right.before.end
     }
 
     loop {
@@ -476,7 +475,8 @@ pub fn collect_hunks(
     mut hunks: Vec<Hunk>,
 ) -> Vec<Hunk> {
     let mut diff = imara_diff::Diff::compute(algorithm, input);
-    diff.postprocess_lines(input);
+    // Indentation-based placement can move overlapping edits apart and hide conflicts.
+    diff.postprocess_no_heuristic(input);
     hunks.extend(diff.hunks().map(|hunk| Hunk {
         before: hunk.before,
         after: hunk.after,

@@ -82,7 +82,7 @@ impl Handle<Closed> {
     ///
     /// ### Warning of potential leaks
     ///
-    /// Without [signal handlers](crate::signal) installed, tempfiles will remain once a termination
+    /// Without signal handlers installed through the `signals` feature, tempfiles will remain once a termination
     /// signal is encountered as destructors won't run. See [the top-level documentation](crate) for more.
     pub fn at(path: impl AsRef<Path>, directory: ContainingDirectory, cleanup: AutoRemove) -> io::Result<Self> {
         Ok(Handle {
@@ -123,7 +123,7 @@ impl Handle<Writable> {
     ///
     /// ### Warning of potential leaks
     ///
-    /// Without [signal handlers](crate::signal) installed, tempfiles will remain once a termination
+    /// Without signal handlers installed through the `signals` feature, tempfiles will remain once a termination
     /// signal is encountered as destructors won't run. See [the top-level documentation](crate) for more.
     pub fn at(path: impl AsRef<Path>, directory: ContainingDirectory, cleanup: AutoRemove) -> io::Result<Self> {
         Ok(Handle {
@@ -151,7 +151,7 @@ impl Handle<Writable> {
     ///
     /// ### Warning of potential leaks
     ///
-    /// Without [signal handlers](crate::signal) installed, tempfiles will remain once a termination
+    /// Without signal handlers installed through the `signals` feature, tempfiles will remain once a termination
     /// signal is encountered as destructors won't run. See [the top-level documentation](crate) for more.
     pub fn new(
         containing_directory: impl AsRef<Path>,
@@ -265,6 +265,7 @@ pub mod persist {
 
         /// The error returned by various [`persist(…)`][Handle<crate::handle::Writable>::persist()] methods
         #[derive(Debug)]
+        #[non_exhaustive]
         pub struct Error<T: Debug> {
             /// The io error that prevented the attempt to succeed
             pub error: std::io::Error,
@@ -280,7 +281,7 @@ pub mod persist {
 
         impl<T: Debug> std::error::Error for Error<T> {
             fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-                self.error.source()
+                Some(&self.error)
             }
         }
     }
@@ -343,7 +344,10 @@ impl ContainingDirectory {
     fn resolve(self, dir: &Path) -> std::io::Result<&Path> {
         match self {
             ContainingDirectory::Exists => Ok(dir),
-            ContainingDirectory::CreateAllRaceProof(retries) => crate::create_dir::all(dir, retries),
+            ContainingDirectory::CreateAllRaceProof {
+                retries,
+                shared_repository_permissions,
+            } => gix_fs::dir::create::all(dir, retries, shared_repository_permissions),
         }
     }
 }

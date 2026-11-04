@@ -20,6 +20,8 @@
 
 use std::{borrow::Cow, ops::Deref, path::Path};
 
+use gix_error::Result;
+
 /// The default memory-backed storage for pack data and index files.
 pub use memmap2::Mmap as MMap;
 
@@ -57,6 +59,10 @@ pub mod multi_index;
 ///
 pub mod verify;
 
+///
+#[cfg(feature = "testing")]
+pub mod testing;
+
 mod mmap {
     use std::path::Path;
 
@@ -65,7 +71,19 @@ mod mmap {
         // SAFETY: we have to take the risk of somebody changing the file underneath. Git never writes into the same file.
         #[expect(unsafe_code)]
         unsafe {
-            memmap2::MmapOptions::new().map_copy_read_only(&file)
+            // On Windows, a copy-on-write view is charged against the system commit limit in full when it is
+            // created, so mapping a pack larger than the available commit fails with `ERROR_COMMITMENT_LIMIT`
+            // (os error 1455) even though no page is ever written. A plain read-only view costs no commit.
+            #[cfg(windows)]
+            {
+                memmap2::MmapOptions::new().map(&file)
+            }
+            // Everywhere else, `MAP_PRIVATE` is free and works under more circumstances. And in fact, it's
+            // needed for best compatibilty and won't cause troble on *nix systems.
+            #[cfg(not(windows))]
+            {
+                memmap2::MmapOptions::new().map_copy_read_only(&file)
+            }
         }
     }
 }
@@ -95,11 +113,54 @@ fn read_u64(b: &[u8]) -> u64 {
 
 fn exact_vec<T>(capacity: usize) -> Vec<T> {
     let mut v = Vec::new();
-    v.reserve_exact(capacity);
+    _ = v.try_reserve_exact(capacity);
     v
+}
+
+fn try_exact_vec<T>(capacity: usize, alloc_limit_bytes: Option<usize>) -> Result<Vec<T>> {
+    use gix_error::{OptionExt, ResourceExhaustionKind, ResultExt, bail, resource_exhaustion};
+
+    let allocation_error = |kind| resource_exhaustion(kind, "Pack traversal metadata is too large to fit in memory");
+    let allocation_bytes = capacity
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or_raise(|| allocation_error(ResourceExhaustionKind::AllocationFailure))?;
+    if alloc_limit_bytes.is_some_and(|limit| allocation_bytes > limit) {
+        bail!(allocation_error(ResourceExhaustionKind::AllocationLimit));
+    }
+    let mut v = Vec::new();
+    v.try_reserve_exact(capacity)
+        .or_raise(|| allocation_error(ResourceExhaustionKind::AllocationFailure))?;
+    Ok(v)
 }
 
 #[inline]
 fn fan_is_monotonically_increasing(fan: &[u32]) -> bool {
     !fan.windows(2).any(|window| window[0] > window[1])
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn traversal_metadata_allocation_failure_is_reported() {
+        let err =
+            super::try_exact_vec::<u64>(usize::MAX, None).expect_err("metadata capacity multiplication overflows");
+        assert!(
+            err.classify().any(|classification| {
+                classification.class()
+                    == gix_error::Class::ResourceExhaustion(gix_error::ResourceExhaustionKind::AllocationFailure)
+            }),
+            "impossible metadata allocations return a recoverable allocation error"
+        );
+    }
+
+    #[test]
+    fn exact_capacity_is_only_an_optimization() {
+        let result = std::panic::catch_unwind(|| super::exact_vec::<u8>(usize::MAX));
+        assert!(result.is_ok(), "failure to preallocate an optimization must not panic");
+        assert_eq!(
+            result.expect("preallocation does not panic").capacity(),
+            0,
+            "a failed preallocation leaves the vector empty"
+        );
+    }
 }

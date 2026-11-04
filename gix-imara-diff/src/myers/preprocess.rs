@@ -4,64 +4,83 @@
 use crate::intern::Token;
 use crate::myers::sqrt;
 
+/// How often each token occurs in the two complete inputs of a diff, and the limits at which a token
+/// is considered [common](Occurrences::Common).
+///
+/// These are taken from the inputs *before* their common prefix and postfix are trimmed, as git does:
+/// `xdl_classify_record()` counts every line of both files while preparing them, and
+/// `xdl_cleanup_records()` derives its limits from their full line counts, even though it only
+/// classifies the lines between the trimmed ends. Counting only the trimmed lines would see fewer
+/// occurrences of frequent lines like blank lines or braces and keep lines git prunes.
+pub struct TokenCounts {
+    /// How often each token occurs in the first file, indexed by token.
+    in_before: Vec<u32>,
+    /// How often each token occurs in the second file, indexed by token.
+    in_after: Vec<u32>,
+    /// The number of occurrences in the second file at which a token of the first file is common.
+    eqlimit_before: u32,
+    /// The number of occurrences in the first file at which a token of the second file is common.
+    eqlimit_after: u32,
+}
+
+impl TokenCounts {
+    /// Count the tokens of the complete `before` and `after` inputs.
+    ///
+    /// If `minimal` is set, no token is ever common, just like git's `XDF_NEED_MINIMAL` sets its
+    /// limits to infinity.
+    pub fn new(before: &[Token], after: &[Token], minimal: bool) -> TokenCounts {
+        const MAX_EQLIMIT: u32 = 1024;
+
+        let eqlimit = |len: usize| {
+            if minimal { u32::MAX } else { sqrt(len).min(MAX_EQLIMIT) }
+        };
+        TokenCounts {
+            in_before: count_tokens(before),
+            in_after: count_tokens(after),
+            eqlimit_before: eqlimit(before.len()),
+            eqlimit_after: eqlimit(after.len()),
+        }
+    }
+}
+
+fn count_tokens(file: &[Token]) -> Vec<u32> {
+    let mut occurrences = Vec::new();
+    for token in file {
+        let bucket = token.0 as usize;
+        if bucket >= occurrences.len() {
+            occurrences.resize(bucket + 1, 0u32);
+        }
+        occurrences[bucket] += 1;
+    }
+    occurrences
+}
+
 /// Preprocesses token sequences by removing tokens that don't appear in the other sequence.
 ///
 /// This optimization reduces the problem size for the Myers algorithm, improving performance
 /// for files with many unique tokens.
 pub fn preprocess<'a>(
+    counts: &TokenCounts,
     before: &[Token],
     after: &[Token],
     removed: &'a mut [bool],
     added: &'a mut [bool],
 ) -> (PreprocessedFile, PreprocessedFile) {
-    let (occurrences_before, occurrences_after) = token_occurrences(before, after);
+    let occurrences_before = token_occurrences(before, &counts.in_after, counts.eqlimit_before);
+    let occurrences_after = token_occurrences(after, &counts.in_before, counts.eqlimit_after);
     let file1 = PreprocessedFile::new(&occurrences_before, before, removed);
     let file2 = PreprocessedFile::new(&occurrences_after, after, added);
     (file1, file2)
 }
 
-fn token_occurrences(file1: &[Token], file2: &[Token]) -> (Vec<Occurrences>, Vec<Occurrences>) {
-    const MAX_EQLIMIT: u32 = 1024;
-
-    // compute the limit after which tokens are treated as `Occurrences::COMMON`
-    let eqlimit1 = sqrt(file1.len()).min(MAX_EQLIMIT);
-    let eqlimit2 = sqrt(file2.len()).min(MAX_EQLIMIT);
-
-    // first collect how often each token occurs in a file
-    let mut occurrences1 = Vec::new();
-    for token in file1 {
-        let bucket = token.0 as usize;
-        if bucket >= occurrences1.len() {
-            occurrences1.resize(bucket + 1, 0u32);
-        }
-        occurrences1[bucket] += 1;
-    }
-
-    // do the same thing for
-    let mut occurrences2 = Vec::new();
-    let token_occurrences2: Vec<_> = file2
-        .iter()
+/// Classify each token of `file` by how often it occurs in the other file, as given by `other_counts`.
+fn token_occurrences(file: &[Token], other_counts: &[u32], eqlimit: u32) -> Vec<Occurrences> {
+    file.iter()
         .map(|token| {
-            let bucket = token.0 as usize;
-            if bucket >= occurrences2.len() {
-                occurrences2.resize(bucket + 1, 0);
-            }
-            occurrences2[bucket] += 1;
-            let occurrences1 = *occurrences1.get(bucket).unwrap_or(&0);
-            Occurrences::from_occurrences(occurrences1, eqlimit2)
+            let occurrences = other_counts.get(token.0 as usize).copied().unwrap_or(0);
+            Occurrences::from_occurrences(occurrences, eqlimit)
         })
-        .collect();
-
-    let token_occurrences1: Vec<_> = file1
-        .iter()
-        .map(|token| {
-            let bucket = token.0 as usize;
-            let occurrences2 = *occurrences2.get(bucket).unwrap_or(&0);
-            Occurrences::from_occurrences(occurrences2, eqlimit1)
-        })
-        .collect();
-
-    (token_occurrences1, token_occurrences2)
+        .collect()
 }
 
 /// Categorizes how frequently a token appears in a file.
@@ -133,8 +152,13 @@ fn prune_unmatched_tokens(
 fn should_prune_common_line(token_status: &[Occurrences], pos: usize) -> bool {
     const WINDOW_SIZE: usize = 100;
 
+    // Git's `xdl_clean_mmatch` starts both `rpdis0` and `rpdis1` at 1 and sums them,
+    // so the line under test is counted twice. Here, the backward scan stops just
+    // before the candidate so we initialize the count to 1 to account for it. In the
+    // forward scan we'll start from the candidate line and count it there, leaving a
+    // count of 2; matching `xdl_clean_mmatch`'s behavior.
     let mut unmatched_before = 0;
-    let mut common_before = 0;
+    let mut common_before = 1;
 
     let start = pos.saturating_sub(WINDOW_SIZE);
     for status in token_status[start..pos].iter().rev() {
@@ -153,7 +177,10 @@ fn should_prune_common_line(token_status: &[Occurrences], pos: usize) -> bool {
         return false;
     }
 
-    let end = token_status.len().min(pos + WINDOW_SIZE);
+    // The candidate line gets walked over and counted in this scan so the
+    // count starts at 0 here. We also make sure to walk a full `WINDOW_SIZE`
+    // lines after the candidate and not just walk `WINDOW_SIZE` in total.
+    let end = token_status.len().min(pos + WINDOW_SIZE + 1);
     let mut unmatched_after = 0;
     let mut common_after = 0;
     for status in token_status[pos..end].iter() {
@@ -194,6 +221,51 @@ mod tests {
         assert!(
             !should_prune_common_line(&token_status, 500),
             "only the last 100 items before the current line should contribute to the backward scan"
+        );
+    }
+
+    #[test]
+    fn candidate_line_counts_exactly_twice() {
+        // `xdl_clean_mmatch` starts both frequent-line counters at 1 and sums them, so the
+        // line under test contributes 2 and six unmatched lines around it is the boundary:
+        // `6 > 3 * 2` is false and git keeps the line, seven discards it.
+        let run = |before: usize, after: usize| {
+            let mut token_status = vec![Occurrences::Some; 40];
+            let pos = 20;
+            token_status[pos - before..pos].fill(Occurrences::None);
+            token_status[pos] = Occurrences::Common;
+            token_status[pos + 1..=pos + after].fill(Occurrences::None);
+            should_prune_common_line(&token_status, pos)
+        };
+        assert!(
+            !run(3, 3),
+            "six unmatched lines must keep the candidate: counting it twice gives `6 > 3 * 2`, which is false"
+        );
+        assert!(
+            run(3, 4),
+            "seven unmatched lines must prune the candidate: counting it twice gives `7 > 3 * 2`, which is true"
+        );
+    }
+
+    #[test]
+    fn forward_scan_reaches_a_hundred_lines_past_the_candidate() {
+        // git's forward scan runs while `(i + r) <= i + XDL_SIMSCAN_WINDOW`, covering the
+        // 100 lines after the candidate. Here the hundredth is what tips the ratio.
+        let pos = 120;
+        let mut token_status = vec![Occurrences::Some; 300];
+        token_status[pos - 3..pos].fill(Occurrences::None);
+        token_status[pos..pos + 25].fill(Occurrences::Common);
+        token_status[pos + 25..=pos + 100].fill(Occurrences::None);
+
+        assert!(
+            should_prune_common_line(&token_status, pos),
+            "the unmatched line 100 positions after the candidate must be counted to exceed the pruning threshold"
+        );
+
+        token_status[pos + 100] = Occurrences::Some;
+        assert!(
+            !should_prune_common_line(&token_status, pos),
+            "without the hundredth unmatched line, the candidate must stay at the threshold and be kept"
         );
     }
 }

@@ -1,6 +1,7 @@
-use bstr::{BStr, BString};
+use bstr::BString;
+use gix_error::Result;
 
-use crate::{AsBStrOpt, AsKey, File, file::Metadata, value};
+use crate::{AsBStrOpt, AsKey, File, file::Metadata};
 
 /// Comfortable API for accessing values
 impl File {
@@ -38,6 +39,60 @@ impl File {
     ) -> Option<BString> {
         self.raw_value_filter_by(section_name, subsection_name, value_name, filter)
             .ok()
+    }
+
+    /// Like [`string()`](Self::string()), but includes implicit values without an `=` separator.
+    ///
+    /// Returns `None` if the key is absent or invalid, `Some(None)` if its last occurrence is implicit,
+    /// and `Some(Some(value))` if it has an explicit, normalized value, including an empty one.
+    /// The last occurrence wins across matching sections, even when it is implicit.
+    pub fn string_implicit(&self, key: impl AsKey) -> Option<Option<BString>> {
+        self.string_implicit_filter(key, |_| true)
+    }
+
+    /// Like [`string_implicit()`](Self::string_implicit()), but given individual key components.
+    ///
+    /// If `subsection_name` is `None`, only sections without a subsection match.
+    pub fn string_implicit_by(
+        &self,
+        section_name: impl AsRef<str>,
+        subsection_name: impl AsBStrOpt,
+        value_name: impl AsRef<str>,
+    ) -> Option<Option<BString>> {
+        self.string_implicit_filter_by(section_name, subsection_name, value_name, |_| true)
+    }
+
+    /// Like [`string_implicit()`](Self::string_implicit()), but the section containing the returned value must pass `filter`.
+    pub fn string_implicit_filter(
+        &self,
+        key: impl AsKey,
+        filter: impl FnMut(&Metadata) -> bool,
+    ) -> Option<Option<BString>> {
+        let key = key.try_as_key()?;
+        self.string_implicit_filter_by(key.section_name, key.subsection_name, key.value_name, filter)
+    }
+
+    /// Like [`string_implicit_by()`](Self::string_implicit_by()), but only sections passing `filter` participate in resolution.
+    pub fn string_implicit_filter_by(
+        &self,
+        section_name: impl AsRef<str>,
+        subsection_name: impl AsBStrOpt,
+        value_name: impl AsRef<str>,
+        mut filter: impl FnMut(&Metadata) -> bool,
+    ) -> Option<Option<BString>> {
+        let section_ids = self
+            .section_ids_by_name_and_subname(section_name.as_ref(), subsection_name.as_bstr_opt())
+            .ok()?;
+        for section_id in section_ids.rev() {
+            let section = self.sections.get(&section_id).expect("known section id");
+            if !filter(section.meta()) {
+                continue;
+            }
+            if let Some(value) = section.body.value_implicit_in(&self.backing, value_name.as_ref()) {
+                return Some(value);
+            }
+        }
+        None
     }
 
     /// Like [`path_by()`](File::path_by()), but suitable for statically known `key`s like `remote.origin.url`.
@@ -85,7 +140,7 @@ impl File {
     }
 
     /// Like [`boolean_by()`](File::boolean_by()), but suitable for statically known `key`s like `remote.origin.url`.
-    pub fn boolean(&self, key: impl AsKey) -> Result<Option<bool>, value::Error> {
+    pub fn boolean(&self, key: impl AsKey) -> Result<Option<bool>> {
         self.boolean_filter(key, |_| true)
     }
 
@@ -95,16 +150,12 @@ impl File {
         section_name: impl AsRef<str>,
         subsection_name: impl AsBStrOpt,
         value_name: impl AsRef<str>,
-    ) -> Result<Option<bool>, value::Error> {
+    ) -> Result<Option<bool>> {
         self.boolean_filter_by(section_name, subsection_name, value_name, |_| true)
     }
 
     /// Like [`boolean_filter_by()`](File::boolean_filter_by()), but suitable for statically known `key`s like `remote.origin.url`.
-    pub fn boolean_filter(
-        &self,
-        key: impl AsKey,
-        filter: impl FnMut(&Metadata) -> bool,
-    ) -> Result<Option<bool>, value::Error> {
+    pub fn boolean_filter(&self, key: impl AsKey, filter: impl FnMut(&Metadata) -> bool) -> Result<Option<bool>> {
         let Some(key) = key.try_as_key() else {
             return Ok(None);
         };
@@ -117,32 +168,17 @@ impl File {
         section_name: impl AsRef<str>,
         subsection_name: impl AsBStrOpt,
         value_name: impl AsRef<str>,
-        mut filter: impl FnMut(&Metadata) -> bool,
-    ) -> Result<Option<bool>, value::Error> {
-        let section_name = section_name.as_ref();
-        let section_ids = self
-            .section_ids_by_name_and_subname(section_name, subsection_name.as_bstr_opt())
-            .ok();
-        let Some(section_ids) = section_ids else {
-            return Ok(None);
-        };
-        let key = value_name.as_ref();
-        for section_id in section_ids.rev() {
-            let section = self.sections.get(&section_id).expect("known section id");
-            if !filter(section.meta()) {
-                continue;
-            }
-            match section.body.value_implicit_in(&self.backing, key) {
-                Some(Some(v)) => return crate::Boolean::try_from(v).map(|value| Some(value.into())),
-                Some(None) => return Ok(Some(true)),
-                None => continue,
-            }
+        filter: impl FnMut(&Metadata) -> bool,
+    ) -> Result<Option<bool>> {
+        match self.string_implicit_filter_by(section_name, subsection_name, value_name, filter) {
+            Some(Some(value)) => crate::Boolean::try_from(value).map(|value| Some(value.into())),
+            Some(None) => Ok(Some(true)),
+            None => Ok(None),
         }
-        Ok(None)
     }
 
     /// Like [`integer_by()`](File::integer_by()), but suitable for statically known `key`s like `remote.origin.url`.
-    pub fn integer(&self, key: impl AsKey) -> Result<Option<i64>, value::Error> {
+    pub fn integer(&self, key: impl AsKey) -> Result<Option<i64>> {
         self.integer_filter(key, |_| true)
     }
 
@@ -152,16 +188,12 @@ impl File {
         section_name: impl AsRef<str>,
         subsection_name: impl AsBStrOpt,
         value_name: impl AsRef<str>,
-    ) -> Result<Option<i64>, value::Error> {
+    ) -> Result<Option<i64>> {
         self.integer_filter_by(section_name, subsection_name, value_name, |_| true)
     }
 
     /// Like [`integer_filter_by()`](File::integer_filter_by()), but suitable for statically known `key`s like `remote.origin.url`.
-    pub fn integer_filter(
-        &self,
-        key: impl AsKey,
-        filter: impl FnMut(&Metadata) -> bool,
-    ) -> Result<Option<i64>, value::Error> {
+    pub fn integer_filter(&self, key: impl AsKey, filter: impl FnMut(&Metadata) -> bool) -> Result<Option<i64>> {
         let Some(key) = key.try_as_key() else {
             return Ok(None);
         };
@@ -169,22 +201,21 @@ impl File {
     }
 
     /// Like [`integer_by()`](File::integer_by()), but the section containing the returned value must pass `filter` as well.
+    /// Invalid or overflowing values include their bytes as `input` [metadata](gix_error::Error::metadata()).
     pub fn integer_filter_by(
         &self,
         section_name: impl AsRef<str>,
         subsection_name: impl AsBStrOpt,
         value_name: impl AsRef<str>,
         filter: impl FnMut(&Metadata) -> bool,
-    ) -> Result<Option<i64>, value::Error> {
+    ) -> Result<Option<i64>> {
         let Some(int) = self
             .raw_value_filter_by(section_name, subsection_name, value_name, filter)
             .ok()
         else {
             return Ok(None);
         };
-        crate::Integer::try_from(BStr::new(&int))
-            .and_then(|b| b.to_decimal().ok_or_else(|| value::Error::new("Integer overflow", int)))
-            .map(Some)
+        crate::Integer::from_bytes(int).map(Some)
     }
 
     /// Like [`strings_by()`](File::strings_by()), but suitable for statically known `key`s like `remote.origin.url`.
@@ -222,7 +253,7 @@ impl File {
     }
 
     /// Like [`integers()`](File::integers()), but suitable for statically known `key`s like `remote.origin.url`.
-    pub fn integers(&self, key: impl AsKey) -> Result<Option<Vec<i64>>, value::Error> {
+    pub fn integers(&self, key: impl AsKey) -> Result<Option<Vec<i64>>> {
         self.integers_filter(key, |_| true)
     }
 
@@ -233,16 +264,12 @@ impl File {
         section_name: impl AsRef<str>,
         subsection_name: impl AsBStrOpt,
         value_name: impl AsRef<str>,
-    ) -> Result<Option<Vec<i64>>, value::Error> {
+    ) -> Result<Option<Vec<i64>>> {
         self.integers_filter_by(section_name, subsection_name, value_name, |_| true)
     }
 
     /// Like [`integers_filter_by()`](File::integers_filter_by()), but suitable for statically known `key`s like `remote.origin.url`.
-    pub fn integers_filter(
-        &self,
-        key: impl AsKey,
-        filter: impl FnMut(&Metadata) -> bool,
-    ) -> Result<Option<Vec<i64>>, value::Error> {
+    pub fn integers_filter(&self, key: impl AsKey, filter: impl FnMut(&Metadata) -> bool) -> Result<Option<Vec<i64>>> {
         let Some(key) = key.try_as_key() else {
             return Ok(None);
         };
@@ -251,13 +278,14 @@ impl File {
 
     /// Similar to [`integers_by(…)`](File::integers_by()) but all integers are in sections that passed `filter`
     /// and that are not overflowing.
+    /// Invalid or overflowing values include their bytes as `input` [metadata](gix_error::Error::metadata()).
     pub fn integers_filter_by(
         &self,
         section_name: impl AsRef<str>,
         subsection_name: impl AsBStrOpt,
         value_name: impl AsRef<str>,
         filter: impl FnMut(&Metadata) -> bool,
-    ) -> Result<Option<Vec<i64>>, value::Error> {
+    ) -> Result<Option<Vec<i64>>> {
         let Some(values) = self
             .raw_values_filter_by(section_name, subsection_name, value_name, filter)
             .ok()
@@ -266,11 +294,8 @@ impl File {
         };
         values
             .into_iter()
-            .map(|v| {
-                crate::Integer::try_from(BStr::new(&v))
-                    .and_then(|int| int.to_decimal().ok_or_else(|| value::Error::new("Integer overflow", v)))
-            })
-            .collect::<Result<Vec<_>, _>>()
+            .map(crate::Integer::from_bytes)
+            .collect::<std::result::Result<Vec<_>, _>>()
             .map(Some)
     }
 }

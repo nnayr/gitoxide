@@ -143,7 +143,7 @@ impl State {
     /// It's required perform any case-insensitive lookup.
     /// TODO: needs multi-threaded insertion, raw-table to have multiple locks depending on bucket.
     pub fn prepare_icase_backing(&self) -> AccelerateLookup<'_> {
-        let _span = gix_features::trace::detail!("prepare_icase_backing", entries = self.entries.len());
+        let _span = gix_trace::detail!("prepare_icase_backing", entries = self.entries.len());
         let mut out = AccelerateLookup::with_capacity(self.entries.len());
         for entry in &self.entries {
             let entry_path = entry.path(self);
@@ -188,7 +188,7 @@ impl State {
                 }
             }
         }
-        gix_features::trace::debug!(directories = out.icase_dirs.len(), "stored directories");
+        gix_trace::debug!(directories = out.icase_dirs.len(), "stored directories");
         out
     }
 
@@ -381,6 +381,7 @@ impl State {
     /// Return the slice of entries which all share the same `prefix`, or `None` if there isn't a single such entry.
     ///
     /// The `prefix` must use the repository-relative, slash-separated [`State`] path format.
+    /// See [`prefixed_entries_range()`][Self::prefixed_entries_range()] for matching rules and directory prefixes.
     ///
     /// If `prefix` is empty, all entries are returned.
     pub fn prefixed_entries(&self, prefix: &BStr) -> Option<&[Entry]> {
@@ -389,7 +390,10 @@ impl State {
 
     /// Return the range of entries which all share the same `prefix`, or `None` if there isn't a single such entry.
     ///
-    /// The `prefix` must use the repository-relative, slash-separated [`State`] path format.
+    /// The `prefix` must use the repository-relative, slash-separated [`State`] path format, without a leading `/` or `./`.
+    /// Matching is case-sensitive and compares literal bytes without path normalization or glob interpretation.
+    /// The prefix may end within a path component: `dir` also matches `dirname/file` and `dir.txt`.
+    /// To match only entries inside a directory, include the trailing slash, for example `dir/`.
     ///
     /// If `prefix` is empty, the range will include all entries.
     pub fn prefixed_entries_range(&self, prefix: &BStr) -> Option<Range<usize>> {
@@ -411,12 +415,12 @@ impl State {
                 .walk_entry_stages(low_entry.path(self), low, Ordering::Less)
                 .unwrap_or(low);
         }
-        if let Some(high_entry) = self.entries.get(high) {
-            if high_entry.stage_raw() != 0 {
-                high = self
-                    .walk_entry_stages(high_entry.path(self), high, Ordering::Less)
-                    .unwrap_or(high);
-            }
+        if let Some(high_entry) = self.entries.get(high)
+            && high_entry.stage_raw() != 0
+        {
+            high = self
+                .walk_entry_stages(high_entry.path(self), high, Ordering::Less)
+                .unwrap_or(high);
         }
         (low != high).then_some(low..high)
     }
@@ -629,6 +633,10 @@ impl State {
     /// Access the `tree` extension.
     pub fn tree(&self) -> Option<&extension::Tree> {
         self.tree.as_ref()
+    }
+    /// Mutably access the `tree` extension.
+    pub fn tree_mut(&mut self) -> Option<&mut extension::Tree> {
+        self.tree.as_mut()
     }
     /// Remove the `tree` extension.
     pub fn remove_tree(&mut self) -> Option<extension::Tree> {

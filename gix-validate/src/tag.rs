@@ -46,7 +46,11 @@ pub mod name {
         }
     }
 
-    impl std::error::Error for Error {}
+    impl std::error::Error for Error {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(const { &gix_error::ClassificationMarker::VALIDATION })
+        }
+    }
 }
 
 /// Assure the given `input` resemble a valid git tag name, which is returned unchanged on success.
@@ -66,12 +70,15 @@ pub(crate) enum Mode {
     Validate,
 }
 
+/// Validate or sanitize `input` according to `mode`.
+///
+/// Validation returns `Ok(None)` when `input` is valid, while sanitization returns the rebuilt name
+/// in `Ok(Some(_))` even if it is identical to `input`. An error means validation failed.
 pub(crate) fn name_inner(input: &BStr, mode: Mode) -> Result<Option<BString>, name::Error> {
     let mut out: Option<BString> =
         matches!(mode, Mode::Sanitize).then(|| BString::from(Vec::with_capacity(input.len())));
     if input.is_empty() {
-        return if let Some(mut out) = out {
-            out.push(b'-');
+        return if let Some(out) = out {
             Ok(Some(out))
         } else {
             Err(name::Error::Empty)
@@ -149,7 +156,8 @@ pub(crate) fn name_inner(input: &BStr, mode: Mode) -> Result<Option<BString>, na
                 }
 
                 if let Some(out) = out.as_mut() {
-                    out.push(*c);
+                    // Like Git, replace the leading dot before stripping lock suffixes, preserving the component.
+                    out.push(if byte_pos == 0 && *c == b'.' { b'-' } else { *c });
                 }
 
                 if byte_pos == last && input[component_end + 1..].ends_with_str(".lock") {
@@ -175,15 +183,14 @@ pub(crate) fn name_inner(input: &BStr, mode: Mode) -> Result<Option<BString>, na
             out.remove(0);
         }
     }
-    if out.as_ref().map_or(input, |b| b.as_bstr())[0] == b'.' {
+    if out.as_ref().map_or(input, |b| b.as_bstr()).first() == Some(&b'.') {
         if let Some(out) = out.as_mut() {
             out[0] = b'-';
         } else {
             return Err(name::Error::StartsWithDot);
         }
     }
-    let last = out.as_ref().map_or(input, |b| b.as_bstr()).len() - 1;
-    if out.as_ref().map_or(input, |b| b.as_bstr())[last] == b'.' {
+    if out.as_ref().map_or(input, |b| b.as_bstr()).last() == Some(&b'.') {
         if let Some(out) = out.as_mut() {
             let last = out.len() - 1;
             out[last] = b'-';

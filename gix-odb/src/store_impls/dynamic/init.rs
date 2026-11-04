@@ -2,18 +2,13 @@ use std::{path::PathBuf, sync::Arc};
 
 use arc_swap::ArcSwap;
 
-use crate::{
-    Store,
-    store::types::{MutableIndexAndPack, SlotMapIndex},
-};
+use crate::{Store, store::types::SlotMapIndex};
 
 /// Options for use in [`Store::at_opts()`].
 #[derive(Clone, Debug)]
 pub struct Options {
     /// How to obtain a size for the slot map.
     pub slots: Slots,
-    /// The kind of hash we expect in our packs and would use for loose object iteration and object writing.
-    pub object_hash: gix_hash::Kind,
     /// If false, no multi-pack indices will be used. If true, they will be used if their hash matches `object_hash`.
     pub use_multi_pack_index: bool,
     /// The maximum size of a single allocation caused by user-controlled on-disk pack data.
@@ -34,7 +29,6 @@ impl Default for Options {
     fn default() -> Self {
         Options {
             slots: Default::default(),
-            object_hash: Default::default(),
             use_multi_pack_index: true,
             alloc_limit_bytes: None,
             current_dir: None,
@@ -43,7 +37,7 @@ impl Default for Options {
     }
 }
 
-/// Configures the number of slots in the index slotmap, which is fixed throughout the existence of the store.
+/// Configures how many pack indices the store can hold.
 #[derive(Copy, Clone, Debug)]
 pub enum Slots {
     /// The number of slots to use, that is the total number of indices we can hold at a time.
@@ -52,7 +46,7 @@ pub enum Slots {
     ///
     /// Note that this won't affect their packs, as each index can have one or more packs associated with it.
     Given(u16),
-    /// Compute the number of slots needed, as probably best used on the client side where a variety of repositories is encountered.
+    /// Size the slot map from the indices on disk, and grow it when a refresh discovers more indices.
     AsNeededByDiskState {
         /// 1.0 means no safety, 1.1 means 10% more slots than needed
         multiplier: f32,
@@ -78,21 +72,22 @@ impl Store {
     /// Note that the `slots` isn't used for packs, these are included with their multi-index or index respectively.
     /// For example, In a repository with 250m objects and geometric packing one would expect 27 index/pack pairs,
     /// or a single multi-pack index.
+    /// `object_hash` is the hash expected in packs and used for loose object iteration and object writing.
     /// `replacements` is an iterator over pairs of old and new object ids for replacement support.
     /// This means that when asking for object `X`, one will receive object `X-replaced` given an iterator like `Some((X, X-replaced))`.
     pub fn at_opts(
         objects_dir: PathBuf,
+        object_hash: gix_hash::Kind,
         replacements: &mut dyn Iterator<Item = (gix_hash::ObjectId, gix_hash::ObjectId)>,
         Options {
             slots,
-            object_hash,
             use_multi_pack_index,
             alloc_limit_bytes,
             current_dir,
             loose_compression,
         }: Options,
     ) -> std::io::Result<Self> {
-        let _span = gix_features::trace::detail!("gix_odb::Store::at()");
+        let _span = gix_trace::detail!("gix_odb::Store::at()");
         let current_dir = current_dir.map_or_else(
             || {
                 // It's only used for real-pathing alternate paths and there it just needs to be consistent (enough).
@@ -102,7 +97,7 @@ impl Store {
         )?;
         if !objects_dir.is_dir() {
             return Err(std::io::Error::other(format!(
-                "'{}' wasn't a directory",
+                "\"{}\" wasn't a directory",
                 objects_dir.display()
             )));
         }
@@ -110,11 +105,11 @@ impl Store {
             Slots::Given(n) => n as usize,
             Slots::AsNeededByDiskState { multiplier, minimum } => {
                 let mut db_paths =
-                    crate::alternate::resolve(objects_dir.clone(), &current_dir).map_err(std::io::Error::other)?;
+                    crate::alternate::resolve(objects_dir.clone(), &current_dir).map_err(super::error_to_io)?;
                 db_paths.insert(0, objects_dir.clone());
                 let num_slots =
                     Store::collect_indices_and_mtime_sorted_by_size(db_paths, None, None, alloc_limit_bytes)
-                        .map_err(std::io::Error::other)?
+                        .map_err(super::error_to_io)?
                         .len();
 
                 let candidate = ((num_slots as f32 * multiplier) as usize).max(minimum);
@@ -140,8 +135,11 @@ impl Store {
             write: Default::default(),
             replacements,
             path: objects_dir,
-            files: Vec::from_iter(std::iter::repeat_with(MutableIndexAndPack::default).take(slot_count)),
-            index: ArcSwap::new(Arc::new(SlotMapIndex::default())),
+            slots,
+            index: ArcSwap::from_pointee(SlotMapIndex {
+                files: Arc::new((0..slot_count).map(|_| Arc::default()).collect()),
+                ..Default::default()
+            }),
             use_multi_pack_index,
             object_hash,
             alloc_limit_bytes,

@@ -2,17 +2,115 @@
 
 title plumbing "${kind}"
 snapshot="$snapshot/plumbing"
+
+if test "$kind" != "small"; then
+title "gix tracing"
+(with "buffered traces on stderr"
+  sandbox
+  unset CLICOLOR CLICOLOR_FORCE FORCE_COLOR NO_COLOR
+
+  # Pipe stderr to exercise terminal detection, keeping command output separate.
+  # pipefail preserves the command's failure status through the capture pipeline.
+  function capture-trace() (
+    set -o pipefail
+    "$exe_plumbing" "$@" 2>&1 >trace-out | cat >trace-err
+  )
+
+  expect_run $SUCCESSFULLY capture-trace env
+  cp trace-out expected-out
+  for trace in -t -tt -ttt -tttt; do
+    case "$trace" in
+      -t|-tt) span_marker='run [' ;;
+      *) span_marker='run:' ;;
+    esac
+    it "$trace preserves stdout and emits plain spans without progress" && {
+      expect_run $SUCCESSFULLY capture-trace "$trace" --no-verbose env
+      expect_run $SUCCESSFULLY cmp expected-out trace-out
+      expect_run $SUCCESSFULLY grep -Fq "$span_marker" trace-err
+      expect_run $WITH_FAILURE grep -Fq $'\033' trace-err
+    }
+  done
+
+  it "traces independently of verbose progress" && {
+    expect_run $SUCCESSFULLY capture-trace -t --verbose env
+    expect_run $SUCCESSFULLY cmp expected-out trace-out
+    expect_run $SUCCESSFULLY grep -Fq 'run [' trace-err
+  }
+
+  it "flushes completed spans when a command fails" && {
+    expect_run $WITH_FAILURE capture-trace -t --format json env
+    expect_run $SUCCESSFULLY test ! -s trace-out
+    expect_run $SUCCESSFULLY grep -Fq 'run [' trace-err
+    expect_run $SUCCESSFULLY grep -Fq "JSON output isn't supported" trace-err
+    expect_run $WITH_FAILURE grep -Fq $'\033' trace-err
+  }
+
+  it "traces completion generation without changing the generated script" && {
+    expect_run $SUCCESSFULLY capture-trace completions --shell bash
+    cp trace-out expected-completions
+    expect_run $SUCCESSFULLY capture-trace -t completions --shell bash
+    expect_run $SUCCESSFULLY cmp expected-completions trace-out
+    expect_run $SUCCESSFULLY grep -Fq 'run [' trace-err
+  }
+
+  if test "$kind" = "max" || test "$kind" = "async"; then
+    # Empty bare repos keep OPNR cheap; fresh databases give each case run IDs 1 and 2.
+    mkdir corpus
+    git init --bare -q corpus/one.git
+    git init --bare -q corpus/two.git
+
+    for threads in 1 2; do
+      it "keeps corpus runs silent without tracing ($threads threads)" && {
+        expect_run $SUCCESSFULLY capture-trace --no-verbose --threads "$threads" \
+          corpus --db "corpus-$threads-off.db" --path corpus run --include-task OPNR
+        expect_run $SUCCESSFULLY test ! -s trace-out
+        expect_run $SUCCESSFULLY test ! -s trace-err
+      }
+
+      for trace in -t -tt -ttt -tttt; do
+        it "$trace flushes both corpus run traces ($threads threads)" && {
+          expect_run $SUCCESSFULLY capture-trace "$trace" --no-verbose --threads "$threads" \
+            corpus --db "corpus-$threads$trace.db" --path corpus run --include-task OPNR
+          expect_run $SUCCESSFULLY test ! -s trace-out
+          for run_id in 1 2; do
+            case "$trace" in
+              -t|-tt) span_pattern="run \[.*run_id: $run_id$" ;;
+              *) span_pattern="run\{run_id=$run_id\}:.*close" ;;
+            esac
+            expect_run $SUCCESSFULLY grep -Eq "$span_pattern" trace-err
+          done
+          expect_run $WITH_FAILURE grep -Fq $'\033' trace-err
+        }
+      done
+    done
+  fi
+  
+  it "keeps status worker spans under the command's root span" && {
+    git init -q status-repo
+    printf 'tracked\n' >status-repo/tracked
+    git -C status-repo add tracked
+    git -C status-repo commit -qm initial
+    expect_run $SUCCESSFULLY capture-trace -tt --no-verbose -r status-repo status
+    for span in gix::tree_index_status gix::index_worktree_status gix_status::index_as_worktree walk; do
+      expect_run $SUCCESSFULLY grep -Fq "$span [" trace-err
+    done
+    expect_run $SUCCESSFULLY test "$(grep -Ec '^(INFO|DEBUG) +[[:alnum:]_].* \[' trace-err)" = 1
+  }
+)
+fi
+
 title "gix-tempfile crate"
 (when "testing 'gix-tempfile'"
   snapshot="$snapshot/gix-tempfile"
-  cd gix-tempfile
+  sandbox
+  manifest="$root/../gix-tempfile/Cargo.toml"
   ABORTED=143
 
   (when "running the example program to raise a signal with a tempfile present"
     it "fails as the process aborts" && {
-      expect_run $ABORTED cargo run --features signals --example delete-tempfiles-on-sigterm
+      expect_run $ABORTED cargo run --manifest-path "$manifest" --features signals --example delete-tempfiles-on-sigterm
     }
-    TEMPFILE="$(cargo run --features signals --example delete-tempfiles-on-sigterm 2>/dev/null || true)"
+    TEMPFILE="$(cargo run --manifest-path "$manifest" --features signals --example delete-tempfiles-on-sigterm 2>/dev/null || true)"
     it "outputs a tempfile with an expected name" && {
       expect_run $SUCCESSFULLY test "$TEMPFILE" = "tempfile.ext"
     }
@@ -24,7 +122,7 @@ title "gix-tempfile crate"
   (when "running the example program to help assure there cannot be deadlocks"
     ABORTED=134
     it "succeeds as it won't deadlock" && {
-      expect_run $ABORTED cargo run --release --features signals --example try-deadlock-on-cleanup -- 1
+      expect_run $ABORTED cargo run --manifest-path "$manifest" --release --features signals --example try-deadlock-on-cleanup -- 1
     }
   )
 )
@@ -32,12 +130,13 @@ title "gix-tempfile crate"
 title '`gix` crate'
 (when "testing 'gix'"
   snapshot="$snapshot/gix"
-  cd gix
+  sandbox
+  manifest="$root/../gix/Cargo.toml"
   ABORTED=143
 
   (when "running the example program to check order of signal handlers"
     it "fails as the process aborts" && {
-      expect_run $ABORTED cargo run --no-default-features --features interrupt --example interrupt-handler-allows-graceful-shutdown
+      expect_run $ABORTED cargo run --manifest-path "$manifest" --no-default-features --features interrupt --example interrupt-handler-allows-graceful-shutdown
     }
     it "cleans up the tempfile it created" && {
       expect_run $WITH_FAILURE test -e "example-file.tmp"
@@ -45,7 +144,7 @@ title '`gix` crate'
   )
   (when "running the example program to check reversibility of signal handlers"
     it "fails as the process aborts" && {
-      expect_run $ABORTED cargo run --no-default-features --features interrupt --example reversible-interrupt-handlers
+      expect_run $ABORTED cargo run --manifest-path "$manifest" --no-default-features --features interrupt --example reversible-interrupt-handlers
     }
   )
 )
@@ -53,6 +152,35 @@ title '`gix` crate'
 title "gix (with repository)"
 (with "a git repository"
   snapshot="$snapshot/repository"
+
+  title "gix editor"
+  (sandbox
+    git init -q
+    touch first second
+    printf '%s\n' '#!/bin/sh' \
+      'test "$#" = 2 && test "$1" = first && test "$2" = second' >check-editor
+    cp check-editor "check editor"
+    chmod +x "check editor"
+
+    it "launches the configured editor with all paths" && {
+      expect_run $SUCCESSFULLY "$exe_plumbing" --no-verbose -c "core.editor=sh check-editor" editor first second
+    }
+    it "preserves shell execution for editor command strings" && {
+      expect_run $SUCCESSFULLY env GIT_EDITOR='exec true' "$exe_plumbing" --no-verbose editor first second
+    }
+    it "launches an existing editor path with spaces directly" && {
+      expect_run $SUCCESSFULLY env GIT_EDITOR="$PWD/check editor" "$exe_plumbing" --no-verbose editor first second
+    }
+    it "launches a trusted relative editor path from the repository directly" && {
+      expect_run $SUCCESSFULLY env GIT_EDITOR='./check editor' "$exe_plumbing" --no-verbose editor first second
+    }
+    it "rejects an explicitly empty editor" && {
+      expect_run $WITH_FAILURE env GIT_EDITOR= "$exe_plumbing" --no-verbose editor
+    }
+    it "honors the whitespace-padded no-op editor" && {
+      expect_run $SUCCESSFULLY env 'GIT_EDITOR=: ' "$exe_plumbing" --no-verbose editor first second
+    }
+  )
 
   title "gix index"
   (with "the 'entries' sub-command"
@@ -75,6 +203,59 @@ title "gix (with repository)"
       it "escapes repository-controlled paths in rich output" && {
         WITH_SNAPSHOT="$snapshot/control-characters-rich" \
         expect_run $SUCCESSFULLY "$exe_plumbing" --no-verbose index entries --no-attributes --format rich
+      }
+    )
+  )
+
+  title "gix exclude"
+  (with "the 'query' sub-command"
+    snapshot="$snapshot/exclude/query"
+    (sandbox
+      git init -q
+
+      # An ignored directory with an indexed file must still expose untracked ignored children.
+      mkdir -p src/bin other/bin
+      printf 'bin/\nbuild/\n' >.gitignore
+      printf 'fn main() {}\n' >src/bin/stub_gen.rs
+      git add -f .gitignore src/bin/stub_gen.rs
+      printf 'extra\n' >src/bin/extra.txt
+      printf 'other\n' >other/bin/file.txt
+      printf '%s\n' \
+        src/bin \
+        src/bin/ \
+        src/bin/stub_gen.rs \
+        src/bin/extra.txt \
+        other/bin \
+        other/bin/file.txt >paths
+
+      it "handles tracked paths below ignored directories" && {
+        WITH_SNAPSHOT="$snapshot/tracked-paths-below-ignored-directories" \
+        expect_run $SUCCESSFULLY "$exe_plumbing" --no-verbose exclude query \
+          src/bin src/bin/ src/bin/stub_gen.rs src/bin/extra.txt other/bin other/bin/file.txt
+      }
+      it "produces the same output for paths read from stdin" && {
+        WITH_SNAPSHOT="$snapshot/same-paths-from-stdin" \
+        expect_run $SUCCESSFULLY "$exe_plumbing" --no-verbose exclude query <paths
+      }
+      it "resolves stdin paths relative to the current directory" && {
+        (
+          cd src &&
+          WITH_SNAPSHOT="$snapshot/stdin-paths-relative-to-cwd" \
+          expect_run $SUCCESSFULLY "$exe_plumbing" --no-verbose exclude query \
+            < <(printf 'bin/stub_gen.rs\nbin/extra.txt\n')
+        )
+      }
+      it "doesn't show ignore patterns for tracked paths" && {
+        WITH_SNAPSHOT="$snapshot/tracked-path-with-ignore-patterns" \
+        expect_run $SUCCESSFULLY "$exe_plumbing" --no-verbose exclude query --show-ignore-patterns src/bin/stub_gen.rs
+      }
+      it "keeps positional output in input order" && {
+        WITH_SNAPSHOT="$snapshot/positional-output-order" \
+        expect_run $SUCCESSFULLY "$exe_plumbing" --no-verbose exclude query src/bin/stub_gen.rs other/bin/file.txt
+      }
+      it "preserves directory intent for missing paths" && {
+        WITH_SNAPSHOT="$snapshot/missing-directory" \
+        expect_run $SUCCESSFULLY "$exe_plumbing" --no-verbose exclude query build/
       }
     )
   )
@@ -162,6 +343,16 @@ title "gix (with repository)"
               WITH_SNAPSHOT="$snapshot/file-v-any" \
               expect_run $SUCCESSFULLY "$exe_plumbing" --no-verbose -c protocol.version=2 remote -n "$git_daemon_url" refs
             }
+            if [[ "$kind" == "async" ]]; then
+            it "keeps async progress alive while tracing" && {
+              expect_run $SUCCESSFULLY bash -c \
+                '"$1" -t -c protocol.version=2 remote -n "$2" refs >remote-out 2>remote-err' \
+                -- "$exe_plumbing" "$git_daemon_url"
+              expect_run $SUCCESSFULLY test -s remote-out
+              expect_run $SUCCESSFULLY grep -Fq 'Connecting to' remote-err
+              expect_run $SUCCESSFULLY grep -Fq 'run [' remote-err
+            }
+            fi
           )
         )
         if [[ "$kind" == "small" ]]; then
@@ -233,9 +424,23 @@ title "gix (with repository)"
 title "gix attributes"
 (with "gix attributes"
   (with "the 'validate-baseline' sub-command"
-    it "passes when operating on all of our files" && {
-      expect_run_sh_no_pipefail $SUCCESSFULLY "find . -type f | sed 's|^./||' | $exe_plumbing --no-verbose attributes validate-baseline"
-    }
+    (sandbox
+      git init -q
+      # Cover attribute inheritance, overrides, binary files, and ignore rules in a disposable repository.
+      printf '%s\n' '*.txt text' '*.bin binary' 'nested/** custom=root' >.gitattributes
+      printf '%s\n' '*.ignored' >.gitignore
+      mkdir nested
+      printf '%s\n' '*.txt -text custom=nested' >nested/.gitattributes
+      printf 'text\n' >file.txt
+      printf '\0binary\n' >file.bin
+      printf 'nested\n' >nested/file.txt
+      touch file.ignored
+      git add .gitattributes .gitignore file.txt file.bin nested
+
+      it "agrees with Git for fixture attributes and ignore rules" && {
+        expect_run_sh_no_pipefail $SUCCESSFULLY "find . -path ./.git -prune -o -type f -print | sed 's|^./||' | $exe_plumbing --no-verbose attributes validate-baseline"
+      }
+    )
   )
 )
 
@@ -270,6 +475,46 @@ title "gix commit-graph"
 
 (with "gix free"
   snapshot="$snapshot/no-repo"
+  title "gix free commit-graph verify"
+  (when "verifying standalone commit-graphs"
+    for object_format in sha1 sha256; do
+      (sandbox
+        # Copy both graph layouts out of the repository so verification cannot infer its object format from it.
+        git init --object-format="$object_format" -q repo
+        (
+          cd repo
+          git -c commit.gpgsign=false commit --allow-empty -q -m "first"
+          git commit-graph write --reachable
+          cp -R .git/objects/info ../graph-info
+          rm -f .git/objects/info/commit-graph
+          git commit-graph write --reachable --split
+          git -c commit.gpgsign=false commit --allow-empty -q -m "second"
+          git commit-graph write --reachable --split=no-merge
+          cp -R .git/objects/info ../split-graph-info
+        )
+
+        if test "$object_format" = sha1; then
+          mismatched_format=sha256
+        else
+          mismatched_format=sha1
+        fi
+        for graph_path in graph-info graph-info/commit-graph split-graph-info split-graph-info/commit-graphs; do
+          it "verifies $object_format at $graph_path with an explicit object format" && {
+            expect_run $SUCCESSFULLY "$exe_plumbing" --no-verbose --object-hash "$object_format" free commit-graph verify "$graph_path"
+          }
+          it "rejects $object_format at $graph_path when $mismatched_format is requested" && {
+            expect_run $WITH_FAILURE "$exe_plumbing" --no-verbose --object-hash "$mismatched_format" free commit-graph verify "$graph_path"
+          }
+        done
+
+        it "does not hide a corrupt $object_format monolithic graph behind a valid split graph" && {
+          printf 'invalid graph\n' >split-graph-info/commit-graph
+          expect_run $WITH_FAILURE "$exe_plumbing" --no-verbose --object-hash "$object_format" free commit-graph verify split-graph-info
+        }
+      )
+    done
+  )
+
   title "gix free pack"
   (when "running 'pack'"
     snapshot="$snapshot/pack"
@@ -476,6 +721,21 @@ title "gix commit-graph"
             }
             it "persists the origin remote" && {
               expect_run_sh $SUCCESSFULLY 'test -n "$(git -C clone config --get remote.origin.url)"'
+            }
+            it "records the remote default as a symbolic tracking reference" && {
+              expect_run_sh $SUCCESSFULLY 'test "$(git -C clone symbolic-ref refs/remotes/origin/HEAD)" = refs/remotes/origin/main'
+              expect_run_sh $SUCCESSFULLY 'test "$(git -C clone rev-parse refs/remotes/origin/HEAD)" = "$(git -C remote rev-parse HEAD)"'
+            }
+            it "prints the initial bare mapping without persisting it" && {
+              function clone-bare() {
+                "$exe_plumbing" --no-verbose clone --bare "$PWD/remote" bare >bare-output
+              }
+              expect_run $SUCCESSFULLY clone-bare
+              expect_run $SUCCESSFULLY grep -Fq '+refs/heads/*:refs/heads/*' bare-output
+              expect_run_sh $SUCCESSFULLY 'test "$(git -C bare rev-parse refs/heads/main)" = "$(git -C remote rev-parse HEAD)"'
+              expect_run_sh $SUCCESSFULLY 'test "$(git -C bare for-each-ref --format="%(refname)" refs/remotes)" = ""'
+              expect_run_sh $SUCCESSFULLY 'test "$(git -C bare config --get-all remote.origin.fetch)" = ""'
+              expect_run_sh $SUCCESSFULLY 'test "$(git -C bare config --get branch.main.remote)" = ""'
             }
           )
         )

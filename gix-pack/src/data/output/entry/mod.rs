@@ -1,5 +1,7 @@
+use gix_error::Result;
 use std::io::Write;
 
+use gix_error::{ErrorExt, ResultExt, bail, message};
 use gix_hash::ObjectId;
 
 use crate::{data, data::output, find};
@@ -31,16 +33,6 @@ pub enum Kind {
     },
 }
 
-/// The error returned by [`output::Entry::from_data()`].
-#[expect(missing_docs)]
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("{0}")]
-    ZlibDeflate(#[from] std::io::Error),
-    #[error(transparent)]
-    EntryType(#[from] crate::data::entry::decode::Error),
-}
-
 impl output::Entry {
     /// An object which can be identified as invalid easily which happens if objects didn't exist even if they were referred to.
     pub fn invalid() -> output::Entry {
@@ -61,15 +53,18 @@ impl output::Entry {
     }
 
     /// Create an Entry from a previously counted object which is located in a pack. It's `entry` is provided here.
-    /// The `version` specifies what kind of target `Entry` version the caller desires.
+    /// The `target_version` specifies what kind of target `Entry` version the caller desires. Both supported versions use
+    /// the same entry encoding.
+    ///
+    /// Errors from `pack_offset_to_oid` are propagated rather than triggering recompression as if the base were absent.
     pub fn from_pack_entry(
         mut entry: find::Entry,
         count: &output::Count,
         potential_bases: &[output::Count],
         bases_index_offset: usize,
-        pack_offset_to_oid: Option<impl FnMut(u32, u64) -> Option<ObjectId>>,
+        pack_offset_to_oid: Option<impl FnMut(u32, u64) -> Result<Option<ObjectId>>>,
         target_version: data::Version,
-    ) -> Option<Result<Self, Error>> {
+    ) -> Option<Result<Self>> {
         if entry.version != target_version {
             return None;
         }
@@ -77,7 +72,7 @@ impl output::Entry {
         let pack_offset_must_be_zero = 0;
         let pack_entry = match data::Entry::from_bytes(&entry.data, pack_offset_must_be_zero, count.id.kind()) {
             Ok(e) => e,
-            Err(err) => return Some(Err(err.into())),
+            Err(err) => return Some(Err(err)),
         };
 
         use crate::data::entry::Header::*;
@@ -88,27 +83,31 @@ impl output::Entry {
             Tag => Some(output::entry::Kind::Base(gix_object::Kind::Tag)),
             OfsDelta { base_distance } => {
                 let pack_location = count.entry_pack_location.as_ref().expect("packed");
-                let base_offset = pack_location
-                    .pack_offset
-                    .checked_sub(base_distance)
-                    .expect("pack-offset - distance is firmly within the pack");
-                potential_bases
-                    .binary_search_by(|e| {
-                        e.entry_pack_location
-                            .as_ref()
-                            .expect("packed")
-                            .pack_offset
-                            .cmp(&base_offset)
-                    })
-                    .ok()
-                    .map(|idx| output::entry::Kind::DeltaRef {
+                let Some(base_offset) =
+                    crate::data::entry::Header::verified_base_pack_offset(pack_location.pack_offset, base_distance)
+                else {
+                    return Some(Err(
+                        message("an ofs-delta base distance pointing before pack start").corrupted_error()
+                    ));
+                };
+                match potential_bases.binary_search_by(|e| {
+                    e.entry_pack_location
+                        .as_ref()
+                        .expect("packed")
+                        .pack_offset
+                        .cmp(&base_offset)
+                }) {
+                    Ok(idx) => Some(output::entry::Kind::DeltaRef {
                         object_index: idx + bases_index_offset,
-                    })
-                    .or_else(|| {
-                        pack_offset_to_oid
-                            .and_then(|mut f| f(pack_location.pack_id, base_offset))
-                            .map(|id| output::entry::Kind::DeltaOid { id })
-                    })
+                    }),
+                    Err(_) => match pack_offset_to_oid {
+                        Some(mut lookup) => match lookup(pack_location.pack_id, base_offset) {
+                            Ok(base_id) => base_id.map(|id| output::entry::Kind::DeltaOid { id }),
+                            Err(err) => return Some(Err(err)),
+                        },
+                        None => None,
+                    },
+                }
             }
             RefDelta { base_id: _ } => None, // ref deltas are for thin packs or legacy, repack them as base objects
         }
@@ -139,7 +138,7 @@ impl output::Entry {
         count: &output::Count,
         obj: &gix_object::Data<'_>,
         compression: gix_zlib::Compression,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self> {
         Ok(output::Entry {
             id: count.id.to_owned(),
             kind: Kind::Base(obj.kind),
@@ -148,31 +147,29 @@ impl output::Entry {
                 let mut out = gix_zlib::stream::deflate::Write::new(Vec::new(), compression);
                 if let Err(err) = std::io::copy(&mut &*obj.data, &mut out) {
                     match err.kind() {
-                        std::io::ErrorKind::Other => return Err(Error::ZlibDeflate(err)),
+                        std::io::ErrorKind::Other => {
+                            bail!(err.and_raise(message("Failed to compress pack entry")));
+                        }
                         err => unreachable!("Should never see other errors than zlib, but got {:?}", err),
                     }
                 }
-                out.flush()?;
+                out.flush()
+                    .or_raise(|| message("Failed to finish compressing pack entry"))?;
                 out.into_inner()
             },
         })
     }
 
-    /// Transform ourselves into pack entry header of `version` which can be written into a pack.
+    /// Transform ourselves into a pack entry header which can be written into a pack of `version`.
     ///
     /// `index_to_pack(object_index) -> pack_offset` is a function to convert the base object's index into
     /// the input object array (if each object is numbered) to an offset into the pack.
     /// This information is known to the one calling the method.
     pub fn to_entry_header(
         &self,
-        version: data::Version,
+        _version: data::Version,
         index_to_base_distance: impl FnOnce(usize) -> u64,
     ) -> data::entry::Header {
-        assert!(
-            matches!(version, data::Version::V2),
-            "we can only write V2 pack entries for now"
-        );
-
         use Kind::*;
         match self.kind {
             Base(kind) => {

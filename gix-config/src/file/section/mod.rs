@@ -1,4 +1,5 @@
 use bstr::{BStr, BString, ByteSlice};
+use gix_error::Result;
 use smallvec::SmallVec;
 
 use crate::{
@@ -11,22 +12,9 @@ use crate::{
 pub(crate) mod body;
 pub(crate) use body::BodyData;
 pub use body::{BodyRef, BodyRefIter};
-use gix_features::threading::OwnShared;
+use gix_parallel::OwnShared;
 
 use crate::file::{SectionId, write::platform_newline};
-
-/// Errors related to changing values in a section.
-pub mod value {
-    /// The error returned when adding or changing a value in a section.
-    #[derive(Debug, thiserror::Error)]
-    #[allow(missing_docs)]
-    pub enum Error {
-        #[error(transparent)]
-        ValueName(#[from] crate::parse::section::value_name::Error),
-        #[error(transparent)]
-        Span(#[from] crate::parse::span::Error),
-    }
-}
 
 impl std::ops::Deref for SectionData {
     type Target = BodyData;
@@ -52,12 +40,18 @@ impl<'a> HeaderRef<'a> {
             .is_some_and(|separator| separator.as_slice_in(self.backing) == b".")
     }
 
-    /// Return the subsection name, if present, i.e. "origin" in `[remote "origin"]`.
+    /// Return the name used for lookups, lowercasing legacy names like `Origin` in `[remote.Origin]`.
+    /// Quoted subsection names are decoded and retain their case.
+    /// Use [`Self::subsection_name_original()`] to preserve legacy spelling.
     pub fn subsection_name(&self) -> Option<&'a BStr> {
-        self.header
-            .subsection_name
-            .as_ref()
-            .map(|subsection_name| subsection_name.value_in(self.backing))
+        self.header.subsection_name(self.backing)
+    }
+
+    /// Return the original subsection spelling, preserving legacy names like `Origin` in `[remote.Origin]`.
+    /// Quoted subsection names are decoded, including unescaping, and retain their case.
+    /// Use [`Self::subsection_name()`] for lookups or [`Self::to_bstring()`] for the exact header syntax.
+    pub fn subsection_name_original(&self) -> Option<&'a BStr> {
+        self.header.subsection_name_original(self.backing)
     }
 
     /// Return the name of the header, like "remote" in `[remote "origin"]`.
@@ -85,11 +79,13 @@ impl<'file> SectionRef<'file> {
 
 impl Section {
     /// Create an owned section with an empty body.
+    /// Invalid section or subsection name bytes are stored as `input` [metadata](gix_error::Error::metadata())
+    /// on validation errors.
     pub fn new(
         name: impl AsRef<str>,
         subsection: impl IntoBStringOpt,
         meta: impl Into<OwnShared<file::Metadata>>,
-    ) -> Result<Self, parse::section::header::Error> {
+    ) -> Result<Self> {
         let mut backing = Vec::new();
         let data = SectionData::new(name, subsection.into_bstring_opt(), meta, &mut backing)?;
         Ok(Section { backing, data })
@@ -120,7 +116,7 @@ impl Section {
         Section { backing, data }
     }
 
-    pub(crate) fn into_data(self, target: &mut Vec<u8>) -> Result<SectionData, parse::span::Error> {
+    pub(crate) fn into_data(self, target: &mut Vec<u8>) -> Result<SectionData> {
         self.data.copy_to_backing_in(&self.backing, target)
     }
 }
@@ -132,7 +128,7 @@ impl SectionData {
         subsection: impl Into<Option<BString>>,
         meta: impl Into<OwnShared<file::Metadata>>,
         backing: &mut Vec<u8>,
-    ) -> Result<Self, parse::section::header::Error> {
+    ) -> Result<Self> {
         Ok(SectionData {
             header: parse::section::HeaderData::new_in(name, subsection, backing)?,
             body: Default::default(),
@@ -155,7 +151,7 @@ impl SectionData {
         &self.meta
     }
 
-    pub(crate) fn copy_to_backing_in(&self, source: &[u8], target: &mut Vec<u8>) -> Result<Self, parse::span::Error> {
+    pub(crate) fn copy_to_backing_in(&self, source: &[u8], target: &mut Vec<u8>) -> Result<Self> {
         Ok(SectionData {
             header: self.header.copy_to_backing_in(source, target)?,
             body: self.body.copy_to_backing_in(source, target)?,
@@ -256,16 +252,15 @@ impl<'file> SectionRef<'file> {
                 _ => {}
             }
             event.write_to_in(self.backing, &mut out)?;
-            if let Event::ValueNotDone(_) = event {
-                if self
+            if let Event::ValueNotDone(_) = event
+                && self
                     .body_data()
                     .0
                     .get(idx + 1)
                     .filter(|e| matches!(e, Event::Newline(_)))
                     .is_none()
-                {
-                    out.write_all(nl)?;
-                }
+            {
+                out.write_all(nl)?;
             }
         }
         Ok(())

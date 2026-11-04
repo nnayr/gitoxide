@@ -25,26 +25,31 @@ pub struct Args {
     /// The amount of threads to use for some operations.
     ///
     /// If unset, or the value is 0, there is no limit and all logical cores can be used.
-    #[clap(long, short = 't')]
+    #[clap(long)]
     pub threads: Option<usize>,
 
     /// Display verbose messages and progress information
     #[clap(long, short = 'v')]
     pub verbose: bool,
 
-    /// Display structured `tracing` output in a tree-like structure.
-    #[clap(long)]
+    /// Display tracing output; repeat for more detail and a flat format.
+    ///
+    /// Once is forest-formatted at `info`, twice is forest-formatted at `debug`,
+    /// three times is flat at `debug`, and four times is flat at `trace`.
+    /// Output is buffered independently and written to stderr when the command finishes.
+    /// Colors follow stderr's terminal capabilities and environment configuration.
+    #[clap(
+        long,
+        short = 't',
+        action = clap::ArgAction::Count,
+        value_parser = clap::value_parser!(u8).range(0..=4)
+    )]
     #[cfg(feature = "tracing")]
-    pub trace: bool,
+    pub trace: u8,
 
     /// Turn off verbose message display for commands where these are shown by default.
     #[clap(long, conflicts_with("verbose"))]
     pub no_verbose: bool,
-
-    /// Bring up a terminal user interface displaying progress visually.
-    #[cfg(feature = "prodash-render-tui")]
-    #[clap(long, conflicts_with("verbose"))]
-    pub progress: bool,
 
     /// Don't default malformed configuration flags, but show an error instead. Ignore IO errors as well.
     ///
@@ -53,13 +58,6 @@ pub struct Args {
     //       for these.
     #[clap(long, short = 's')]
     pub strict: bool,
-
-    /// The progress TUI will stay up even though the work is already completed.
-    ///
-    /// Use this to be able to read progress messages or additional information visible in the TUI log pane.
-    #[cfg(feature = "prodash-render-tui")]
-    #[clap(long, conflicts_with("verbose"), requires("progress"))]
-    pub progress_keep_open: bool,
 
     /// Determine the format to use when outputting statistics.
     #[clap(
@@ -164,8 +162,17 @@ pub enum Subcommands {
     Merge(merge::Platform),
     /// Print paths relevant to the Git installation.
     Env,
+    /// Open paths in the editor selected by Git's precedence rules.
+    Editor {
+        /// Paths to open, or none to start the editor without a file.
+        paths: Vec<PathBuf>,
+    },
     Diff(diff::Platform),
     Log(log::Platform),
+    /// Interactively browse commits and their graph.
+    #[cfg(feature = "tix")]
+    #[clap(visible_alias = "tui", visible_alias = "interactive", visible_alias = "i")]
+    Tix(gix_tix::command::Platform),
     Worktree(worktree::Platform),
     /// Subcommands that need no Git repository to run.
     #[clap(subcommand)]
@@ -384,6 +391,10 @@ pub mod merge_base {
 }
 
 pub mod worktree {
+    use std::path::PathBuf;
+
+    use gix::bstr::BString;
+
     #[derive(Debug, clap::Parser)]
     #[command(about = "Commands for handling worktrees")]
     pub struct Platform {
@@ -395,6 +406,33 @@ pub mod worktree {
     pub enum SubCommands {
         /// List all worktrees, along with some accompanying information.
         List,
+        /// Add and check out a linked worktree.
+        ///
+        /// Without COMMIT-ISH, reuse the local branch named after PATH or create it from HEAD.
+        /// An explicit local branch is attached; other revisions produce a detached HEAD.
+        /// New branches are retained if subsequent worktree setup fails, like Git.
+        #[clap(visible_alias = "create")]
+        Add {
+            /// Create a new branch at COMMIT-ISH, or HEAD if it is omitted.
+            #[clap(short = 'b', long, value_name = "NEW-BRANCH", value_parser = crate::shared::AsBString, conflicts_with = "detach")]
+            branch: Option<BString>,
+            /// Detach HEAD instead of attaching to or creating a branch.
+            #[clap(short = 'd', long)]
+            detach: bool,
+            /// Where to create the checkout, relative to the current directory.
+            path: PathBuf,
+            /// An existing local branch or a revision that resolves to a commit.
+            #[clap(value_name = "COMMIT-ISH", value_parser = crate::shared::AsBString)]
+            commit_ish: Option<BString>,
+        },
+        /// Remove a linked worktree and its private Git directory, keeping its branch.
+        Remove {
+            /// Discard changes and initialized submodules; repeat to override a worktree lock.
+            #[clap(short, long, action = clap::ArgAction::Count)]
+            force: u8,
+            /// The worktree path or a unique path suffix.
+            worktree: PathBuf,
+        },
     }
 }
 
@@ -614,12 +652,49 @@ pub mod diff {
 pub mod log {
     use gix::bstr::BString;
 
-    /// List all commits in a repository, optionally limited to those that change a given path.
+    #[derive(Debug, Copy, Clone, clap::ValueEnum)]
+    pub enum Sorting {
+        /// Visit commits breadth-first, without guaranteeing children precede parents.
+        BreadthFirst,
+        /// Prioritize the newest queued commits, without guaranteeing children precede parents.
+        NewestFirst,
+        /// Prioritize the oldest queued commits, starting with the tips rather than the oldest ancestors.
+        OldestFirst,
+        /// Show children before parents without intermixing branches.
+        TopoOrder,
+        /// Show children before parents, otherwise prioritizing newer commit dates.
+        DateOrder,
+    }
+
+    impl From<Sorting> for gix::revision::walk::Sorting {
+        fn from(value: Sorting) -> Self {
+            use gix::revision::walk::CommitTimeOrder;
+
+            match value {
+                Sorting::BreadthFirst => Self::BreadthFirst,
+                Sorting::NewestFirst => Self::ByCommitTime(CommitTimeOrder::NewestFirst),
+                Sorting::OldestFirst => Self::ByCommitTime(CommitTimeOrder::OldestFirst),
+                Sorting::TopoOrder => Self::TopoOrder,
+                Sorting::DateOrder => Self::DateOrder,
+            }
+        }
+    }
+
+    /// List reachable commits in the chosen order, optionally excluding hidden ancestry.
     #[derive(Debug, clap::Parser)]
     pub struct Platform {
-        /// The git path specification to show a log for.
-        #[clap(value_parser = crate::shared::AsBString)]
-        pub pathspec: Option<BString>,
+        /// The order in which to return commits.
+        #[clap(long, value_enum, default_value = "date-order")]
+        pub sort: Sorting,
+        /// Follow only the first parent of visible commits; hidden ancestry follows all parents.
+        #[clap(long)]
+        pub first_parent: bool,
+        /// Revision expressions such as HEAD, main..topic, main...topic, or ^main. Defaults to HEAD if omitted.
+        #[clap(value_name = "REVISION", value_parser = crate::shared::AsBString)]
+        pub revisions: Vec<BString>,
+        /// Git pathspecs limiting the history, separated from revisions by -- (currently unsupported).
+        #[clap(last = true, value_name = "PATHSPEC", value_parser = crate::shared::AsBString)]
+        pub pathspecs: Vec<BString>,
     }
 }
 
@@ -826,7 +901,7 @@ pub mod clone {
         #[clap(long, short = 'H')]
         pub handshake_info: bool,
 
-        /// The clone will be bare and a working tree checkout won't be available.
+        /// Clone branches into refs/heads without remote-tracking refs, upstream configuration, or a working tree.
         #[clap(long)]
         pub bare: bool,
 
@@ -841,8 +916,17 @@ pub mod clone {
         pub remote: OsString,
 
         /// The name of the reference to check out.
-        #[clap(long = "ref", value_parser = crate::shared::AsPartialRefName, value_name = "REF_NAME")]
+        #[clap(
+            long = "ref",
+            value_parser = crate::shared::AsPartialRefName,
+            value_name = "REF_NAME",
+            conflicts_with = "revision"
+        )]
         pub ref_name: Option<gix::refs::PartialName>,
+
+        /// Fetch only this full reference or object ID and check it out with a detached HEAD.
+        #[clap(long, value_parser = crate::shared::AsBString, value_name = "REVISION")]
+        pub revision: Option<gix::bstr::BString>,
 
         /// The directory to initialize with the new repository and to which all data should be written.
         pub directory: Option<PathBuf>,
@@ -1276,11 +1360,11 @@ pub mod exclude {
 
     use gix::bstr::BString;
 
-    use crate::shared::CheckPathSpec;
+    use crate::shared::AsBString;
 
     #[derive(Debug, clap::Subcommand)]
     pub enum Subcommands {
-        /// Check if path-specs are excluded and print the result similar to `git check-ignore`.
+        /// Check if paths are excluded and print the result similar to `git check-ignore`.
         Query {
             /// Print various statistics to stderr.
             #[clap(long, short = 's')]
@@ -1295,9 +1379,9 @@ pub mod exclude {
             /// Useful for undoing previous patterns using the '!' prefix.
             #[clap(long, short = 'p')]
             patterns: Vec<OsString>,
-            /// The git path specifications to check for exclusion, or unset to read from stdin one per line.
-            #[clap(value_parser = CheckPathSpec)]
-            pathspec: Vec<BString>,
+            /// The paths to check for exclusion, or unset to read from stdin one per line.
+            #[clap(value_parser = AsBString)]
+            paths: Vec<BString>,
         },
     }
 }

@@ -1,14 +1,20 @@
 use bstr::BStr;
 
-use crate::protocol::context::Error;
+use gix_error::{Result, bail};
 
 mod write {
     use bstr::{BStr, BString};
 
-    use crate::protocol::{Context, ContextOptions, context::serde::validate};
+    use crate::protocol::{Capability, Context, ContextOptions, context::serde::validate};
 
     impl Context {
-        /// Write ourselves to `out` such that [`from_bytes()`][Self::from_bytes()] can decode it losslessly.
+        /// Write the serializable fields to `out` for decoding with [`from_bytes()`][Self::from_bytes()].
+        /// Unsupported capabilities and `quit` are omitted. Fields enabled by `authtype` are only
+        /// written if that capability is set.
+        /// Invalid field values, except `password`, `credential`, and `oauth_refresh_token` secrets,
+        /// are retained as `input` bytes in the I/O error.
+        /// After [wrapping](gix_error::Error::from_error()), inspect them with
+        /// [metadata](gix_error::Error::metadata()).
         pub fn write_to(&self, mut out: impl std::io::Write) -> std::io::Result<()> {
             use bstr::ByteSlice;
             fn write_key(out: &mut impl std::io::Write, key: &str, value: &BStr) -> std::io::Result<()> {
@@ -19,13 +25,18 @@ mod write {
             }
             let Context {
                 options: ContextOptions { protect_protocol },
+                capability,
                 protocol,
                 host,
                 path,
                 username,
                 password,
+                authtype,
+                credential,
+                ephemeral,
                 oauth_refresh_token,
                 password_expiry_utc,
+                www_authenticate,
                 url,
                 // We only decode quit and interpret it, but won't get to pass it on as it means to stop the
                 // credential helper invocation chain.
@@ -35,6 +46,13 @@ mod write {
                 if let Some(value) = value {
                     validate(key, value.as_slice().into(), *protect_protocol).map_err(std::io::Error::other)?;
                     write_key(&mut out, key, value.as_ref()).ok();
+                }
+            }
+            // Git clears capability flags when parsing a URL, so announce them afterward.
+            for value in capability {
+                match value {
+                    Capability::Authtype => write_key(&mut out, "capability[]", "authtype".into())?,
+                    Capability::Unsupported(_) => {}
                 }
             }
             for (key, value) in [
@@ -55,6 +73,22 @@ mod write {
                 validate(key, value.as_str().into(), *protect_protocol).map_err(std::io::Error::other)?;
                 write_key(&mut out, key, value.as_bytes().as_bstr()).ok();
             }
+            if self.supports_authtype() {
+                for (key, value) in [("authtype", authtype), ("credential", credential)] {
+                    if let Some(value) = value {
+                        validate(key, value.as_str().into(), *protect_protocol).map_err(std::io::Error::other)?;
+                        write_key(&mut out, key, value.as_bytes().as_bstr()).ok();
+                    }
+                }
+                if let Some(value) = ephemeral {
+                    write_key(&mut out, "ephemeral", if *value { "1" } else { "0" }.into()).ok();
+                }
+            }
+            for value in www_authenticate {
+                let key = "wwwauth[]";
+                validate(key, value.as_ref(), *protect_protocol).map_err(std::io::Error::other)?;
+                write_key(&mut out, key, value.as_ref()).ok();
+            }
             Ok(())
         }
 
@@ -69,39 +103,44 @@ mod write {
 
 ///
 pub mod decode {
-    use bstr::{BString, ByteSlice};
+    use bstr::ByteSlice;
 
-    use crate::protocol::{Context, ContextOptions, context, context::serde::validate};
+    use gix_error::{ErrorExt, Result, bail, validation};
 
-    /// The error returned by [`from_bytes()`][Context::from_bytes()].
-    #[derive(Debug, thiserror::Error)]
-    #[expect(missing_docs)]
-    pub enum Error {
-        #[error("Illformed UTF-8 in value of key {key:?}: {value:?}")]
-        IllformedUtf8InValue { key: String, value: BString },
-        #[error(transparent)]
-        Encoding(#[from] context::Error),
-        #[error("Invalid format in line {line:?}, expecting key=value")]
-        Syntax { line: BString },
-    }
+    use crate::protocol::{
+        Capability, Context, ContextOptions,
+        context::serde::{is_secret_field, validate},
+    };
 
     impl Context {
         /// Decode ourselves from `input` which is the format written by [`write_to()`][Self::write_to()].
+        /// Fields enabled by `authtype` require a preceding `capability[]=authtype` line.
+        /// Unsupported capability names are retained for inspection, but do not enable any fields
+        /// and are omitted when encoding the context again.
         /// `options` control what to support during deserialization.
-        pub fn from_bytes(input: &[u8], options: ContextOptions) -> Result<Self, Error> {
+        /// Invalid line or value bytes, except `password`, `credential`, and `oauth_refresh_token` secrets,
+        /// are stored as `input` in [`gix_error::Message::values`].
+        /// After [wrapping](gix_error::Error::from_error()), inspect them with
+        /// [metadata](gix_error::Error::metadata()).
+        pub fn from_bytes(input: &[u8], options: ContextOptions) -> Result<Self> {
             let mut ctx = Context {
                 options,
                 ..Context::default()
             };
             let Context {
                 options: _,
+                capability,
                 protocol,
                 host,
                 path,
                 username,
                 password,
+                authtype,
+                credential,
+                ephemeral,
                 oauth_refresh_token,
                 password_expiry_utc,
+                www_authenticate,
                 url,
                 quit,
             } = &mut ctx;
@@ -111,24 +150,47 @@ pub mod decode {
                     it.next().and_then(|k| k.to_str().ok()),
                     it.next().map(ByteSlice::as_bstr),
                 ) {
-                    (Some(key), Some(value)) => validate(key, value, options.protect_protocol)
-                        .map(|_| (key, value.to_owned()))
-                        .map_err(Into::into),
-                    _ => Err(Error::Syntax { line: line.into() }),
+                    (Some(key), Some(value)) => {
+                        validate(key, value, options.protect_protocol).map(|_| (key, value.to_owned()))
+                    }
+                    _ => Err(validation("Invalid format, expecting key=value")
+                        .with_input(line)
+                        .raise()),
                 }
             }) {
                 let (key, value) = res?;
                 match key {
-                    "protocol" | "host" | "username" | "password" | "oauth_refresh_token" => {
+                    "authtype" | "credential" | "ephemeral" if !capability.contains(&Capability::Authtype) => {}
+                    "protocol"
+                    | "host"
+                    | "username"
+                    | "password"
+                    | "oauth_refresh_token"
+                    | "authtype"
+                    | "credential"
+                    | "capability[]" => {
                         if !value.is_utf8() {
-                            return Err(Error::IllformedUtf8InValue { key: key.into(), value });
+                            let mut error = validation(format!("Illformed UTF-8 in value of key {key:?}"));
+                            if !is_secret_field(key) {
+                                error = error.with_input(value);
+                            }
+                            bail!(error);
                         }
                         let value = value.to_string();
+                        if key == "capability[]" {
+                            capability.push(match value.as_str() {
+                                "authtype" => Capability::Authtype,
+                                _ => Capability::Unsupported(value),
+                            });
+                            continue;
+                        }
                         *match key {
                             "protocol" => &mut *protocol,
                             "host" => host,
                             "username" => username,
                             "password" => password,
+                            "authtype" => authtype,
+                            "credential" => credential,
                             "oauth_refresh_token" => oauth_refresh_token,
                             _ => unreachable!("checked field names in match above"),
                         } = Some(value);
@@ -138,8 +200,10 @@ pub mod decode {
                     }
                     "url" => *url = Some(value),
                     "path" => *path = Some(value),
-                    "quit" => {
-                        *quit = gix_config_value::Boolean::try_from(value.as_bstr())
+                    "wwwauth[]" => www_authenticate.push(value),
+                    "quit" | "ephemeral" => {
+                        let storage = if key == "quit" { &mut *quit } else { &mut *ephemeral };
+                        *storage = gix_config_value::Boolean::try_from(value.as_bstr())
                             .ok()
                             .map(Into::into);
                     }
@@ -151,7 +215,11 @@ pub mod decode {
     }
 }
 
-fn validate(key: &str, value: &BStr, protect_protocol: bool) -> Result<(), Error> {
+fn is_secret_field(key: &str) -> bool {
+    matches!(key, "password" | "credential" | "oauth_refresh_token")
+}
+
+fn validate(key: &str, value: &BStr, protect_protocol: bool) -> Result {
     if key.contains('\0')
         || key.contains('\n')
         || key.contains('\r')
@@ -159,10 +227,17 @@ fn validate(key: &str, value: &BStr, protect_protocol: bool) -> Result<(), Error
         || value.contains(&b'\n')
         || (protect_protocol && value.contains(&b'\r'))
     {
-        return Err(Error::Encoding {
-            key: key.to_owned(),
-            value: value.to_owned(),
-        });
+        if is_secret_field(key) {
+            bail!(gix_error::validation(format!(
+                "{key:?} must not contain null bytes or newlines"
+            )));
+        }
+        bail!(
+            gix_error::validation(format!(
+                "{key:?}={value:?} must not contain null bytes or newlines neither in key nor in value."
+            ))
+            .with_input(value)
+        );
     }
     Ok(())
 }

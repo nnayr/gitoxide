@@ -37,8 +37,8 @@
 //!
 //! # Known differences to the `git config` specification
 //!
-//! - Legacy headers like `[section.subsection]` are supposed to be turned into to lower case and compared
-//!   case-sensitively. We keep its case and compare case-insensitively.
+//! - Legacy headers like `[section.subsection]` are supposed to be turned into lower case. We keep their case,
+//!   but like git, look them up by their subsection name in lower case and compare it case-sensitively.
 //!
 //! [`git-config` files]: https://git-scm.com/docs/git-config#_configuration_file
 //! [`File`]: crate::File
@@ -50,6 +50,7 @@
 )]
 #![cfg_attr(all(doc, feature = "document-features"), feature(doc_cfg))]
 #![deny(missing_docs, unsafe_code)]
+#![allow(rustdoc::redundant_explicit_links)] // Rust 1.99 flags links in re-exported documentation.
 
 pub mod file;
 

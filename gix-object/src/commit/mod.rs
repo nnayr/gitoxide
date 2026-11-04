@@ -1,12 +1,23 @@
-use std::ops::Range;
-
-use bstr::{BStr, BString, ByteSlice};
+use bstr::{BStr, ByteSlice};
+use gix_error::Result;
 
 use crate::parse::parse_signature;
 use crate::{Commit, CommitRef, TagRef};
 
-/// The well-known field name for gpg signatures.
+/// The well-known field name for signatures on SHA-1 commits.
 pub const SIGNATURE_FIELD_NAME: &str = "gpgsig";
+/// The well-known field name for signatures on SHA-256 commits.
+pub const SIGNATURE_FIELD_NAME_SHA256: &str = "gpgsig-sha256";
+
+/// Return the signature field name Git uses for `hash_kind`.
+pub fn signature_field_name(hash_kind: gix_hash::Kind) -> &'static str {
+    #[cfg(feature = "sha256")]
+    if hash_kind == gix_hash::Kind::Sha256 {
+        return SIGNATURE_FIELD_NAME_SHA256;
+    }
+    let _ = hash_kind;
+    SIGNATURE_FIELD_NAME
+}
 
 mod decode;
 ///
@@ -19,40 +30,13 @@ pub mod message;
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MessageRef<'a> {
     /// The title of the commit, as separated from the body with two consecutive newlines. The newlines are not included.
+    /// Without a body separator, a final LF or CRLF is also excluded. All other whitespace is preserved.
     #[cfg_attr(feature = "serde", serde(borrow))]
     pub title: &'a BStr,
     /// All bytes not consumed by the title, excluding the separating newlines.
     ///
     /// The body is `None` if there was now title separation or the body was empty after the separator.
     pub body: Option<&'a BStr>,
-}
-
-/// The raw commit data, parseable by [`CommitRef`] or [`Commit`], which was fed into a program to produce a signature.
-///
-/// See [`extract_signature()`](crate::CommitRefIter::signature()) for how to obtain it.
-// TODO: implement `std::io::Read` to avoid allocations
-#[derive(PartialEq, Eq, Debug, Hash, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct SignedData<'a> {
-    /// The raw commit data that includes the signature.
-    data: &'a [u8],
-    /// The byte range at which we find the signature. All but the signature is the data that was signed.
-    signature_range: Range<usize>,
-}
-
-impl SignedData<'_> {
-    /// Convenience method to obtain a copy of the signed data.
-    pub fn to_bstring(&self) -> BString {
-        let mut buf = BString::from(&self.data[..self.signature_range.start]);
-        buf.extend_from_slice(&self.data[self.signature_range.end..]);
-        buf
-    }
-}
-
-impl From<SignedData<'_>> for BString {
-    fn from(value: SignedData<'_>) -> Self {
-        value.to_bstring()
-    }
 }
 
 ///
@@ -64,12 +48,8 @@ mod write;
 impl<'a> CommitRef<'a> {
     /// Deserialize a commit from the given `data` bytes while avoiding most allocations, using `object_hash` to know
     /// what kind of hash to expect for validation.
-    pub fn from_bytes(mut data: &'a [u8], object_hash: gix_hash::Kind) -> Result<CommitRef<'a>, crate::decode::Error> {
-        let input = &mut data;
-        match decode::commit(input, object_hash) {
-            Ok(tag) => Ok(tag),
-            Err(err) => Err(err),
-        }
+    pub fn from_bytes(mut data: &'a [u8], object_hash: gix_hash::Kind) -> Result<CommitRef<'a>> {
+        decode::commit(&mut data, object_hash)
     }
 }
 
@@ -98,14 +78,14 @@ impl<'a> CommitRef<'a> {
     /// Return the author, with whitespace trimmed.
     ///
     /// This is different from the `author` field which may contain whitespace.
-    pub fn author(&self) -> Result<gix_actor::SignatureRef<'a>, crate::decode::Error> {
+    pub fn author(&self) -> Result<gix_actor::SignatureRef<'a>> {
         parse_signature(self.author).map(|signature| signature.trim())
     }
 
     /// Return the committer, with whitespace trimmed.
     ///
     /// This is different from the `committer` field which may contain whitespace.
-    pub fn committer(&self) -> Result<gix_actor::SignatureRef<'a>, crate::decode::Error> {
+    pub fn committer(&self) -> Result<gix_actor::SignatureRef<'a>> {
         parse_signature(self.committer).map(|signature| signature.trim())
     }
 
@@ -115,7 +95,7 @@ impl<'a> CommitRef<'a> {
     }
 
     /// Returns the time at which this commit was created, or a default time if it could not be parsed.
-    pub fn time(&self) -> Result<gix_date::Time, crate::decode::Error> {
+    pub fn time(&self) -> Result<gix_date::Time> {
         parse_signature(self.committer).map(|signature| signature.time().unwrap_or_default())
     }
 }
@@ -123,12 +103,12 @@ impl<'a> CommitRef<'a> {
 /// Conversion
 impl CommitRef<'_> {
     /// Copy all fields of this instance into a fully owned commit, consuming this instance.
-    pub fn into_owned(self) -> Result<Commit, crate::decode::Error> {
+    pub fn into_owned(self) -> Result<Commit> {
         self.try_into()
     }
 
     /// Copy all fields of this instance into a fully owned commit, internally cloning this instance.
-    pub fn to_owned(self) -> Result<Commit, crate::decode::Error> {
+    pub fn to_owned(self) -> Result<Commit> {
         self.try_into()
     }
 }
@@ -182,13 +162,14 @@ where
     ///
     /// A merge tag is a tag object embedded within the respective header field of a commit, making
     /// it a child object of sorts.
-    pub fn mergetags(self) -> impl Iterator<Item = Result<TagRef<'a>, crate::decode::Error>> {
+    pub fn mergetags(self) -> impl Iterator<Item = Result<TagRef<'a>>> {
         let hash_kind = self.hash_kind;
         self.find_all("mergetag").map(move |b| TagRef::from_bytes(b, hash_kind))
     }
 
     /// Return the cryptographic signature provided by gpg/pgp verbatim.
     pub fn pgp_signature(self) -> Option<&'a BStr> {
-        self.find(SIGNATURE_FIELD_NAME)
+        let field_name = signature_field_name(self.hash_kind);
+        self.find(field_name)
     }
 }

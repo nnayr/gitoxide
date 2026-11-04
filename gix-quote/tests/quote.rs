@@ -34,22 +34,90 @@ mod single {
     }
 }
 
+mod for_display {
+    use bstr::ByteSlice;
+    use gix_quote::for_display;
+
+    fn render(input: &[u8], scratch: &mut Vec<u8>) -> Vec<u8> {
+        for_display(input.as_bstr(), scratch).to_vec()
+    }
+
+    #[test]
+    fn safe_ascii_and_unicode_remain_unchanged() {
+        let mut scratch = Vec::new();
+        for input in [b"hello world".as_slice(), "hello 💡".as_bytes()] {
+            assert_eq!(
+                render(input, &mut scratch),
+                input,
+                "safe text should remain easy to read"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_controls_and_ambiguous_bytes_are_quoted_losslessly() {
+        let mut scratch = Vec::new();
+        assert_eq!(
+            render(b"control-\0\x08\t\n\r\x1b\x7f\"\\end", &mut scratch),
+            br#""control-\0\x08\t\n\r\x1b\x7f\"\\end""#,
+            "terminal-active and syntax bytes must be escaped"
+        );
+        assert_eq!(
+            render(b"invalid-\xff", &mut scratch),
+            br#""invalid-\xff""#,
+            "invalid UTF-8 must remain recoverable"
+        );
+    }
+}
+
 mod ansi_c {
+    mod quote {
+        use bstr::ByteSlice;
+        use gix_quote::ansi_c;
+
+        #[test]
+        fn matches_git_quote_c_style() {
+            for (input, expected) in [
+                (b"Name".as_slice(), b"Name".as_slice()),
+                (b"With SP in it", b"With SP in it"),
+                (b"Name and a\nLF", br#""Name and a\nLF""#),
+                (b"Name and an\tHT", br#""Name and an\tHT""#),
+                (b"Name\"", br#""Name\"""#),
+                ("濱野\t純".as_bytes(), br#""\346\277\261\351\207\216\t\347\264\224""#),
+            ] {
+                assert_eq!(
+                    ansi_c::quote(input.as_bstr()).as_ref(),
+                    expected.as_bstr(),
+                    "Git-compatible C-style quoting"
+                );
+            }
+        }
+
+        #[test]
+        fn every_byte_round_trips() {
+            let input = (0..=u8::MAX).collect::<Vec<_>>();
+            let quoted = ansi_c::quote(input.as_bstr());
+            let (unquoted, consumed) = ansi_c::undo(&quoted).expect("quoted bytes are valid");
+            assert_eq!(unquoted.as_ref(), input.as_bstr(), "quoting is lossless");
+            assert_eq!(consumed, quoted.len(), "the entire quoted value is consumed");
+        }
+    }
+
     mod undo {
+        use std::borrow::Cow;
+
         use bstr::ByteSlice;
         use gix_quote::ansi_c;
 
         macro_rules! test {
             ($name:ident, $input:literal, $expected:literal, $consumed:literal) => {
                 #[test]
-                fn $name() {
+                fn $name() -> gix_error::TestResult {
                     assert_eq!(
-                        ansi_c::undo($input.as_bytes().as_bstr()).expect("valid input"),
-                        (
-                            std::borrow::Cow::Borrowed($expected.as_bytes().as_bstr()),
-                            $consumed
-                        )
+                        ansi_c::undo($input.as_bytes().as_bstr())?,
+                        (Cow::Borrowed($expected.as_bytes().as_bstr()), $consumed)
                     );
+                    Ok(())
                 }
             };
         }
@@ -77,8 +145,18 @@ mod ansi_c {
         fn out_of_quote_characters_can_be_passed_and_will_not_be_consumed() {
             let input = br#""hello there" out of quote"#.as_bstr();
             let (unquoted, consumed) = ansi_c::undo(input).expect("valid input");
-            assert_eq!(unquoted, std::borrow::Cow::Borrowed(b"hello there".as_bstr()));
+            assert_eq!(unquoted, Cow::Borrowed(b"hello there".as_bstr()));
             assert_eq!(&input[consumed..], " out of quote");
+        }
+
+        #[test]
+        fn a_quote_that_is_never_closed_is_an_error() {
+            for unterminated in [r#"""#, r#""abc"#, r#""abc def"#, r#""abc\"#, r#""\""#] {
+                assert!(
+                    ansi_c::undo(unterminated.into()).is_err(),
+                    "{unterminated:?} should not parse"
+                );
+            }
         }
 
         #[test]

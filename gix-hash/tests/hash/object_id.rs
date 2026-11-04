@@ -17,29 +17,22 @@ mod from_hex {
     }
 
     mod invalid {
-        use gix_hash::{ObjectId, decode};
+        use gix_hash::ObjectId;
 
         #[test]
         fn non_hex_characters() {
-            assert!(matches!(
-                ObjectId::from_hex(b"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").unwrap_err(),
-                decode::Error::Invalid
-            ));
+            insta::assert_debug_snapshot!(ObjectId::from_hex(b"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")
+                    .expect_err("non hex characters"), "non hex characters", @"Invalid character encountered");
         }
 
         #[test]
         fn too_short() {
-            assert!(matches!(
-                ObjectId::from_hex(b"abcd").unwrap_err(),
-                decode::Error::InvalidHexEncodingLength(4)
-            ));
+            insta::assert_debug_snapshot!(ObjectId::from_hex(b"abcd").expect_err("too short"), "too short", @"A hash sized 4 hexadecimal characters is invalid");
         }
         #[test]
         fn too_long() {
-            assert!(matches!(
-                ObjectId::from_hex(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaf").unwrap_err(),
-                decode::Error::InvalidHexEncodingLength(41)
-            ));
+            insta::assert_debug_snapshot!(ObjectId::from_hex(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaf")
+                    .expect_err("too long"), "too long", @"A hash sized 41 hexadecimal characters is invalid");
         }
     }
 }
@@ -60,34 +53,34 @@ fn from_bytes_or_panic_sha256() {
 
 #[cfg(feature = "sha1")]
 mod sha1 {
+    use gix_error::Result;
     use std::str::FromStr as _;
 
     use gix_hash::{Kind, ObjectId, hasher};
 
-    fn hash_contents(s: &[u8]) -> Result<ObjectId, hasher::Error> {
+    fn hash_contents(s: &[u8]) -> Result<ObjectId> {
         let mut hasher = hasher(Kind::Sha1);
         hasher.update(s);
         hasher.try_finalize()
     }
 
     #[test]
-    fn empty_blob() {
+    fn empty_blob() -> gix_testtools::TestResult {
         let actual = ObjectId::empty_blob(Kind::Sha1);
-        assert_eq!(actual, hash_contents(b"blob 0\0").expect("empty blob to not collide"),);
+        assert_eq!(actual, hash_contents(b"blob 0\0")?,);
         assert_eq!(format!("{actual:?}"), "Sha1(e69de29bb2d1d6434b8b29ae775ad8c2e48c5391)");
+        Ok(())
     }
 
     #[test]
-    fn empty_tree() {
-        assert_eq!(
-            ObjectId::empty_tree(Kind::Sha1),
-            hash_contents(b"tree 0\0").expect("empty tree to not collide"),
-        );
+    fn empty_tree() -> gix_testtools::TestResult {
+        assert_eq!(ObjectId::empty_tree(Kind::Sha1), hash_contents(b"tree 0\0")?);
+        Ok(())
     }
 
     /// Check the test vectors from RFC 3174.
     #[test]
-    fn rfc_3174() {
+    fn rfc_3174() -> gix_testtools::TestResult {
         let fixtures: &[(&[u8], &str)] = &[
             (b"abc", "A9 99 3E 36 47 06 81 6A BA 3E 25 71 78 50 C2 6C 9C D0 D8 9D"),
             (
@@ -105,10 +98,11 @@ mod sha1 {
         ];
         for (input, output) in fixtures {
             assert_eq!(
-                hash_contents(input).expect("RFC inputs to not collide"),
-                ObjectId::from_str(&output.to_lowercase().replace(' ', "")).expect("RFC digests to be valid"),
+                hash_contents(input)?,
+                ObjectId::from_str(&output.to_lowercase().replace(' ', ""))?,
             );
         }
+        Ok(())
     }
 
     /// Check the “SHA‐1 is a Shambles” chosen‐prefix collision.
@@ -122,46 +116,36 @@ mod sha1 {
         let message_b = include_bytes!("../fixtures/shambles/messageB");
         assert_ne!(message_a, message_b);
 
-        let expected =
-            ObjectId::from_str("8ac60ba76f1999a1ab70223f225aefdc78d4ddc0").expect("Shambles digest to be valid");
-
-        let Err(hasher::Error::CollisionAttack { digest }) = hash_contents(message_a) else {
-            panic!("expected Shambles input to collide");
-        };
-        assert_eq!(digest, expected);
-
-        let Err(hasher::Error::CollisionAttack { digest }) = hash_contents(message_b) else {
-            panic!("expected Shambles input to collide");
-        };
-        assert_eq!(digest, expected);
+        insta::assert_debug_snapshot!(hash_contents(message_a).expect_err("shambles"), "shambles", @"Detected SHA-1 collision attack with digest 8ac60ba76f1999a1ab70223f225aefdc78d4ddc0");
+        insta::assert_debug_snapshot!(hash_contents(message_b).expect_err("shambles"), "shambles", @"Detected SHA-1 collision attack with digest 8ac60ba76f1999a1ab70223f225aefdc78d4ddc0");
     }
 }
 
 #[cfg(feature = "sha256")]
 mod sha256 {
+    use gix_error::Result;
     use gix_hash::{Kind, ObjectId, hasher};
 
-    fn hash_contents(s: &[u8]) -> Result<ObjectId, hasher::Error> {
+    fn hash_contents(s: &[u8]) -> Result<ObjectId> {
         let mut hasher = hasher(Kind::Sha256);
         hasher.update(s);
         hasher.try_finalize()
     }
 
     #[test]
-    fn empty_blob() {
+    fn empty_blob() -> gix_testtools::TestResult {
         let actual = ObjectId::empty_blob(Kind::Sha256);
-        assert_eq!(actual, hash_contents(b"blob 0\0").expect("empty blob to not collide"),);
+        assert_eq!(actual, hash_contents(b"blob 0\0")?,);
         assert_eq!(
             format!("{actual:?}"),
             "Sha256(473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813)"
         );
+        Ok(())
     }
 
     #[test]
-    fn empty_tree() {
-        assert_eq!(
-            ObjectId::empty_tree(Kind::Sha256),
-            hash_contents(b"tree 0\0").expect("empty tree to not collide"),
-        );
+    fn empty_tree() -> gix_testtools::TestResult {
+        assert_eq!(ObjectId::empty_tree(Kind::Sha256), hash_contents(b"tree 0\0")?);
+        Ok(())
     }
 }

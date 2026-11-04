@@ -87,6 +87,7 @@ fn various_valid_index_lookups_by_path_and_stage() {
         (":0:path", "path", 0),
         (":1:dir/path", "dir/path", 1),
         (":2:dir/path@{part-of-path}", "dir/path@{part-of-path}", 2),
+        (":3:dir/path", "dir/path", 3),
     ] {
         let rec = parse(spec);
 
@@ -109,8 +110,14 @@ fn empty_top_level_regex_are_invalid() {
 #[test]
 fn regex_with_empty_exclamation_mark_prefix_is_invalid() {
     let err = try_parse(r#":/!hello"#).unwrap_err();
-    assert_eq!(err.input.as_ref().map(AsRef::as_ref), Some(b"!hello".as_ref()));
-    insta::assert_snapshot!(err, @"need one character after /!, typically -: \"!hello\"");
+    assert_eq!(
+        err.metadata()
+            .next()
+            .expect("diagnostic metadata is retained")
+            .get("input"),
+        Some(&gix_error::MetadataValue::from(b"!hello".as_ref()))
+    );
+    insta::assert_snapshot!(err, @r#"need one character after /!, typically -, input="!hello""#);
 }
 
 #[test]

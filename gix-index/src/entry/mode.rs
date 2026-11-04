@@ -11,6 +11,12 @@ impl Mode {
         *self == Self::DIR | Self::SYMLINK
     }
 
+    /// Return whether this entry is a directory for ignore and sparse-pattern matching.
+    /// Sparse directories and gitlinks are directories regardless of whether they exist on disk.
+    pub fn is_dir_for_pattern_matching(&self) -> bool {
+        self.is_sparse() || self.is_submodule()
+    }
+
     /// Convert this instance to a tree's entry mode, or return `None` if for some
     /// and unexpected reason the bitflags don't resemble any known entry-mode.
     pub fn to_tree_entry_mode(&self) -> Option<gix_object::tree::EntryMode> {
@@ -25,13 +31,12 @@ impl Mode {
     /// * if `executable_bit` is false the executable bit will not be compared
     ///   `Change::ExecutableBit` will never be generated
     ///
-    /// If there is a type change then we will use whatever information is
-    /// present on the FS. Specifically if `has_symlinks` is false we will
-    /// never generate `Change::TypeChange { new_mode: Mode::SYMLINK }`. and
-    /// if `executable_bit` is false we will never generate `Change::TypeChange
-    /// { new_mode: Mode::FILE_EXECUTABLE }` (all files are assumed to be not
-    /// executable). That means that unstaging and staging files can be a lossy
-    /// operation on such file systems.
+    /// Type changes use the type observed on disk. Actual symlinks retain their
+    /// type even if `has_symlinks` is false; that option only permits regular
+    /// files to represent existing symlink entries. If `executable_bit` is false,
+    /// type changes never produce `Change::Type { new_mode: Mode::FILE_EXECUTABLE }`
+    /// (all files are assumed to be not executable). That means that unstaging
+    /// and staging files can be a lossy operation on such file systems.
     ///
     /// If a directory replaced a normal file/symlink we assume that the
     /// directory is a submodule. Normal (non-submodule) directories would
@@ -58,8 +63,7 @@ impl Mode {
     }
 
     /// Like [`change_to_match_fs`](Self::change_to_match_fs) but accepts pre-extracted
-    /// file-type and permission bits, for callers that already have them (e.g. cached
-    /// metadata from a batched directory enumeration).
+    /// file-type and permission bits, for callers that already have them.
     ///
     /// Note that some parameters are mutually exclusive, but inconsistency won't be a problem
     /// if the source of the data is consistent.
@@ -84,6 +88,7 @@ impl Mode {
     ) -> Option<Change> {
         match self {
             Mode::FILE if !is_file => (),
+            Mode::FILE_EXECUTABLE if is_dir || is_symlink => (),
             Mode::SYMLINK if is_symlink => return None,
             Mode::SYMLINK if has_symlinks && !is_symlink => (),
             Mode::SYMLINK if !has_symlinks && !is_file => (),
@@ -96,7 +101,7 @@ impl Mode {
             Mode::COMMIT
         } else if executable_bit && is_executable {
             Mode::FILE_EXECUTABLE
-        } else if has_symlinks && is_symlink {
+        } else if is_symlink {
             Mode::SYMLINK
         } else {
             Mode::FILE

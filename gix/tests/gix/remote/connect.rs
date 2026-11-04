@@ -1,43 +1,206 @@
+#[cfg(any(
+    feature = "blocking-http-transport-curl",
+    feature = "blocking-http-transport-reqwest"
+))]
+mod http_authentication {
+    use gix_error::ErrorExt;
+    use gix_testtools::TestResult;
+    use std::io::{BufRead, Write};
+
+    #[test]
+    fn cached_credentials_are_selected_without_prompting() -> TestResult {
+        if gix_testtools::run_in_isolated_process()? {
+            return Ok(());
+        }
+        check_cached_credentials(Some("Basic realm=\"GitHub\" domain_hint=\"example\""), false)
+    }
+
+    #[test]
+    fn authtype_credentials_are_selected_with_or_without_a_challenge() -> TestResult {
+        if gix_testtools::run_in_isolated_process()? {
+            return Ok(());
+        }
+        for challenge in [Some("Bearer"), None] {
+            check_cached_credentials(challenge, true)?;
+        }
+        Ok(())
+    }
+
+    fn check_cached_credentials(challenge: Option<&str>, authtype: bool) -> TestResult {
+        let _environment = gix_testtools::Env::new()
+            .set("GIT_TERMINAL_PROMPT", "0")
+            .set("GCM_INTERACTIVE", "never")
+            .set("NO_PROXY", "*")
+            .set("no_proxy", "*");
+        let directory = gix_testtools::tempfile::tempdir()?;
+        let _cwd = gix_testtools::set_current_dir(directory.path())?;
+        let mut repo = crate::init_repo_isolated(directory.path(), gix::create::Kind::Bare)?.to_thread_local();
+
+        // Like GCM, this helper needs the server's account hint to choose a cached credential.
+        // The credentials are fictitious, and both the helper and gix must keep prompting disabled.
+        repo.config_snapshot_mut().set_raw_value(
+            "credential.helper",
+            if authtype {
+                r#"!f() {
+                    announced=no
+                    while IFS= read -r line; do
+                        test "$line" != 'capability[]=authtype' || announced=yes
+                    done
+                    test "$announced" = yes || exit 1
+                    printf 'capability[]=authtype\nauthtype=Bearer\ncredential=cached-token\nephemeral=1\n'
+                }; f"#
+            } else {
+                r#"!f() {
+                test "$GIT_TERMINAL_PROMPT" = 0 && test "$GCM_INTERACTIVE" = never || exit 1
+                hint=missing
+                while IFS= read -r line; do
+                    case "$line" in
+                        'wwwauth[]=Basic realm="GitHub" domain_hint="example"') hint=present ;;
+                    esac
+                done
+                test "$hint" = present || exit 1
+                printf 'username=cached-user\npassword=cached-password\n'
+            }; f"#
+            },
+        )?;
+        repo.config_snapshot_mut()
+            .set_raw_value("gitoxide.credentials.terminalPrompt", "false")?;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let url = format!("http://{}/repo", listener.local_addr()?);
+        let remote = repo.remote_at(url)?;
+        let connection = remote.connect(gix::remote::Direction::Fetch)?;
+        let mut authenticate = connection.configured_credentials_for_current_url();
+        let challenge = challenge
+            .map(|value| format!("WWW-Authenticate: {value}\r\n"))
+            .unwrap_or_default();
+        let server = std::thread::spawn(move || -> std::io::Result<()> {
+            let (stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+            let mut stream = std::io::BufReader::new(stream);
+            let mut line = String::new();
+            while stream.read_line(&mut line)? != 0 && line != "\r\n" {
+                line.clear();
+            }
+            write!(
+                stream.get_mut(),
+                "HTTP/1.1 401 Unauthorized\r\n{challenge}Content-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+        });
+
+        let mut obtained = None;
+        let result = connection
+            .with_credentials(|action| {
+                obtained = Some(authenticate(action));
+                // Stop after credential lookup, before the transport sends these dummy credentials.
+                Err(gix_error::message("The handler asked to stop trying to obtain credentials").raise())
+            })
+            .ref_map(gix::progress::Discard, Default::default());
+        server.join().expect("the HTTP fixture thread does not panic")?;
+        assert!(
+            result.is_err(),
+            "the callback stops the handshake after credential lookup"
+        );
+        let outcome = obtained
+            .expect("the 401 response invokes the credential callback")?
+            .expect("the cached credential is complete");
+        assert_eq!(
+            outcome.credentials,
+            if authtype {
+                gix::sec::identity::Credentials::Encoded {
+                    authtype: "Bearer".into(),
+                    credential: "cached-token".into(),
+                    oauth_refresh_token: None,
+                }
+            } else {
+                gix::sec::identity::Credentials::UsernamePassword {
+                    username: "cached-user".into(),
+                    password: "cached-password".into(),
+                    oauth_refresh_token: None,
+                }
+            },
+            "the selected authentication method and cached secret reach the transport credentials"
+        );
+        Ok(())
+    }
+}
+
 #[cfg(feature = "blocking-network-client")]
 mod blocking_io {
     mod protocol_allow {
         use gix::remote::Direction::Fetch;
+        use gix_testtools::TestResult;
         use serial_test::serial;
 
         use crate::remote;
 
         #[test]
+        #[serial]
         fn deny() {
+            let mut error_snapshots = Vec::new();
             for name in ["protocol_denied", "protocol_file_denied"] {
                 let repo = remote::repo(name);
                 let remote = repo.find_remote("origin").unwrap();
-                assert!(matches!(
-                    remote.connect(Fetch).err(),
-                    Some(gix::remote::connect::Error::ProtocolDenied {
-                        url: _,
-                        scheme: gix::url::Scheme::File
-                    })
+                let err = remote.connect(Fetch).err().expect("protocol is denied");
+                error_snapshots.push(gix_testtools::redact_debug_snapshot(
+                    &(err),
+                    &[(
+                        &(gix_testtools::scripted_fixture_read_only("make_remote_repos.sh")
+                            .expect("remote fixture")
+                            .canonicalize()
+                            .expect("fixture exists"))
+                        .to_string_lossy(),
+                        "<fixture>",
+                    )],
                 ));
+                assert!(err.is_permission_denied(), "protocol policy requires authorization");
+                assert!(!err.is_validation(), "a policy denial is not malformed URL input");
+                let denial = err
+                    .classify()
+                    .filter(|classification| classification.class() == gix_error::Class::PermissionDenied)
+                    .find_map(|classification| classification.error().downcast_ref::<gix::error::Message>())
+                    .expect("protocol denial retains its policy details");
+                assert!(denial.values.contains_key("input"), "the denied URL is retained");
             }
+            insta::assert_debug_snapshot!(error_snapshots, "deny", @r#"
+            [
+                Protocol File is denied per configuration, input="<fixture>/base",
+                Protocol File is denied per configuration, input="<fixture>/base",
+            ]
+            "#);
         }
 
         #[test]
         #[serial]
-        fn user() -> crate::Result {
-            for (env_value, should_allow) in [(None, true), (Some("0"), false), (Some("1"), true)] {
+        fn user() -> TestResult {
+            let _environment = gix_testtools::isolate_git_environment()?;
+            for (env_value, should_allow) in [
+                (None, Some(true)),
+                (Some("0"), Some(false)),
+                (Some("false"), Some(false)),
+                (Some("1"), Some(true)),
+                (Some("true"), Some(true)),
+                (Some("invalid"), None),
+            ] {
                 let _env = env_value.map(|value| gix_testtools::Env::new().set("GIT_PROTOCOL_FROM_USER", value));
                 let repo = gix::open_opts(
                     remote::repo("protocol_file_user").git_dir(),
                     gix::open::Options::isolated().permissions(gix::open::Permissions {
                         env: gix::open::permissions::Environment {
                             git_prefix: gix_sec::Permission::Allow,
+                            http_transport: gix_sec::Permission::Deny,
                             ..gix::open::permissions::Environment::all()
                         },
                         ..gix::open::Permissions::isolated()
                     }),
                 )?;
                 let remote = repo.find_remote("origin")?;
-                assert_eq!(remote.connect(Fetch).is_ok(), should_allow, "Value = {env_value:?}");
+                let result = remote.connect(Fetch);
+                if let Some(should_allow) = should_allow {
+                    assert_eq!(result.is_ok(), should_allow, "Value = {env_value:?}");
+                } else {
+                    assert!(result.is_err(), "invalid booleans must be reported");
+                }
             }
             Ok(())
         }

@@ -1,8 +1,11 @@
 use std::fmt::Formatter;
 use std::path::PathBuf;
 
-use anyhow::{Context as AnyhowContext, Result};
-use gix::bstr::BString;
+use gix::{
+    Result,
+    bstr::BString,
+    error::{ResultExt, message},
+};
 
 #[cfg(feature = "archive")]
 pub mod archive;
@@ -17,11 +20,13 @@ pub use credential::function as credential;
 pub mod attributes;
 #[cfg(feature = "clean")]
 pub mod clean;
+#[cfg(feature = "clean")]
+pub use clean::function::clean;
 pub mod diff;
 pub mod dirty;
 pub mod dirwalk;
-#[cfg(feature = "clean")]
-pub use clean::function::clean;
+mod editor;
+pub use editor::function as editor;
 #[cfg(feature = "blocking-client")]
 pub mod clone;
 pub mod exclude;
@@ -61,7 +66,7 @@ pub fn init(directory: Option<PathBuf>) -> Result<gix::discover::repository::Pat
         gix::create::Kind::WithWorktree,
         gix::create::Options::default(),
     )
-    .with_context(|| "Repository initialization failed")
+    .or_raise(|| message("Repository initialization failed"))
 }
 
 pub enum PathsOrPatterns {

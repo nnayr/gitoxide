@@ -1,5 +1,6 @@
 use gix_attributes::State;
 use gix_pathspec::{MagicSignature, SearchMode};
+use gix_testtools::TestResult;
 
 use crate::parse::{NormalizedPattern, check_against_baseline, check_valid_inputs};
 
@@ -18,12 +19,47 @@ fn repeated_matcher_keywords() {
 }
 
 #[test]
+fn empty_keywords_are_ignored() {
+    let input = vec![
+        (
+            ":(top,)some/path",
+            pat_with_path_and_sig("some/path", MagicSignature::TOP),
+        ),
+        (
+            ":(,top)some/path",
+            pat_with_path_and_sig("some/path", MagicSignature::TOP),
+        ),
+        (
+            ":(top,,icase)some/path",
+            pat_with_path_and_sig("some/path", MagicSignature::TOP | MagicSignature::ICASE),
+        ),
+        (":(,)some/path", pat_with_path("some/path")),
+        (":(,,)some/path", pat_with_path("some/path")),
+        (
+            ":(icase,)some/path",
+            pat_with_path_and_sig("some/path", MagicSignature::ICASE),
+        ),
+        (
+            ":(attr:someAttr,)some/path",
+            pat(
+                "some/path",
+                MagicSignature::empty(),
+                SearchMode::ShellGlob,
+                vec![("someAttr", State::Set)],
+            ),
+        ),
+    ];
+
+    check_valid_inputs(input);
+}
+
+#[test]
 fn glob_negations_are_always_literal() {
     check_valid_inputs([("!a", pat_with_path("!a")), (r"\!a", pat_with_path(r"\!a"))]);
 }
 
 #[test]
-fn literal_default_prevents_parsing() {
+fn literal_default_prevents_parsing() -> gix_testtools::TestResult {
     let pattern = gix_pathspec::parse(
         ":".as_bytes(),
         gix_pathspec::Defaults {
@@ -31,8 +67,7 @@ fn literal_default_prevents_parsing() {
             search_mode: SearchMode::PathAwareGlob,
             literal: true,
         },
-    )
-    .expect("valid");
+    )?;
     assert!(!pattern.is_nil());
     assert_eq!(pattern.path(), ":");
     assert!(matches!(pattern.search_mode, SearchMode::Literal));
@@ -45,8 +80,7 @@ fn literal_default_prevents_parsing() {
             search_mode: SearchMode::Literal,
             literal: true,
         },
-    )
-    .expect("valid");
+    )?;
     assert_eq!(pattern.path(), input, "no parsing happens at all");
     assert!(matches!(pattern.search_mode, SearchMode::Literal));
 
@@ -57,16 +91,16 @@ fn literal_default_prevents_parsing() {
             search_mode: SearchMode::Literal,
             literal: false,
         },
-    )
-    .expect("valid");
+    )?;
     assert_eq!(pattern.path(), "f[o][o]", "in literal default mode, we still parse");
     assert!(matches!(pattern.search_mode, SearchMode::Literal));
+    Ok(())
 }
 
 #[test]
-fn there_is_no_pathspec_pathspec() {
+fn there_is_no_pathspec_pathspec() -> gix_testtools::TestResult {
     check_against_baseline(":");
-    let pattern = gix_pathspec::parse(":".as_bytes(), Default::default()).expect("valid");
+    let pattern = gix_pathspec::parse(":".as_bytes(), Default::default())?;
     assert!(pattern.is_nil());
 
     let actual: NormalizedPattern = pattern.into();
@@ -79,13 +113,13 @@ fn there_is_no_pathspec_pathspec() {
             search_mode: SearchMode::PathAwareGlob,
             literal: false,
         },
-    )
-    .expect("valid");
+    )?;
     assert!(pattern.is_nil());
+    Ok(())
 }
 
 #[test]
-fn defaults_are_used() -> crate::Result {
+fn defaults_are_used() -> TestResult {
     let defaults = gix_pathspec::Defaults {
         signature: MagicSignature::EXCLUDE,
         search_mode: SearchMode::Literal,
@@ -101,7 +135,7 @@ fn defaults_are_used() -> crate::Result {
 }
 
 #[test]
-fn literal_from_defaults_is_overridden_by_element_glob() -> crate::Result {
+fn literal_from_defaults_is_overridden_by_element_glob() -> TestResult {
     let defaults = gix_pathspec::Defaults {
         search_mode: SearchMode::Literal,
         ..Default::default()
@@ -116,7 +150,7 @@ fn literal_from_defaults_is_overridden_by_element_glob() -> crate::Result {
 }
 
 #[test]
-fn glob_from_defaults_is_overridden_by_element_glob() -> crate::Result {
+fn glob_from_defaults_is_overridden_by_element_glob() -> TestResult {
     let defaults = gix_pathspec::Defaults {
         search_mode: SearchMode::PathAwareGlob,
         ..Default::default()
@@ -283,6 +317,10 @@ fn attributes_in_signature() {
         (
             ":(attr:someAttr anotherAttr)",
             pat_with_attrs(vec![("someAttr", State::Set), ("anotherAttr", State::Set)]),
+        ),
+        (
+            ":(attr:builtin_objectmode)",
+            pat_with_attrs(vec![("builtin_objectmode", State::Set)]),
         ),
     ];
 

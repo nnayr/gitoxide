@@ -1,3 +1,4 @@
+use gix_error::Result;
 use std::{
     any::Any,
     borrow::Cow,
@@ -8,7 +9,8 @@ use std::{
 
 use base64::Engine;
 use bstr::BStr;
-pub use traits::{Error, GetResponse, Http, PostBodyDataKind, PostResponse};
+use gix_error::{ErrorExt, message};
+pub use traits::{GetResponse, Http, PostBodyDataKind, PostResponse};
 
 use crate::{
     Protocol, Service,
@@ -39,9 +41,10 @@ mod traits;
 
 ///
 pub mod options {
+    use gix_error::Result;
     /// A function to authenticate a URL.
     pub type AuthenticateFn =
-        dyn FnMut(gix_credentials::helper::Action) -> gix_credentials::protocol::Result + Send + Sync;
+        dyn FnMut(gix_credentials::helper::Action) -> Result<Option<gix_credentials::protocol::Outcome>> + Send + Sync;
 
     /// Possible settings for the `http.followRedirects` configuration option.
     #[derive(Default, Debug, Copy, Clone, PartialEq, Eq)]
@@ -152,6 +155,7 @@ pub struct Options {
     pub proxy_auth_method: options::ProxyAuthMethod,
     /// If authentication is needed for the proxy as its URL contains a username, this method must be set to provide a password
     /// for it before making the request, and to store it if the connection succeeds.
+    /// The curl backend requires a username and password and rejects pre-encoded credentials.
     pub proxy_authenticate: Option<(gix_credentials::helper::Action, Arc<Mutex<options::AuthenticateFn>>)>,
     /// The `HTTP` `USER_AGENT` string presented to an `HTTP` server, notably not the user agent present to the `git` server.
     ///
@@ -216,7 +220,7 @@ pub struct Transport<H: Http> {
     http: H,
     service: Option<Service>,
     line_provider: Option<StreamingPeekableIter<H::ResponseBody>>,
-    identity: Option<gix_sec::identity::Account>,
+    credentials: Option<gix_sec::identity::Credentials>,
     trace: bool,
 }
 
@@ -225,14 +229,14 @@ impl<H: Http> Transport<H> {
     /// Note that we will always fallback to other versions as supported by the server.
     /// If `trace` is `true`, all packetlines received or sent will be passed to the facilities of the `gix-trace` crate.
     pub fn new_http(http: H, url: gix_url::Url, desired_version: Protocol, trace: bool) -> Self {
-        let identity = url
-            .user()
-            .zip(url.password())
-            .map(|(user, pass)| gix_sec::identity::Account {
-                username: user.to_string(),
-                password: pass.to_string(),
-                oauth_refresh_token: None,
-            });
+        let credentials =
+            url.user()
+                .zip(url.password())
+                .map(|(user, pass)| gix_sec::identity::Credentials::UsernamePassword {
+                    username: user.to_string(),
+                    password: pass.to_string(),
+                    oauth_refresh_token: None,
+                });
         Transport {
             url: url.to_bstring().to_string(),
             user_agent_header: concat!("User-Agent: git/oxide-", env!("CARGO_PKG_VERSION")),
@@ -241,25 +245,29 @@ impl<H: Http> Transport<H> {
             service: None,
             http,
             line_provider: None,
-            identity,
+            credentials,
             trace,
         }
     }
 }
 
 impl<H: Http> Transport<H> {
-    /// Returns the identity that the transport uses when connecting to the remote.
-    pub fn identity(&self) -> Option<&gix_sec::identity::Account> {
-        self.identity.as_ref()
+    /// Returns the credentials that the transport uses when connecting to the remote.
+    pub fn credentials(&self) -> Option<&gix_sec::identity::Credentials> {
+        self.credentials.as_ref()
     }
 
     fn sync_redirected_base_url(&mut self) {
-        Self::sync_redirected_base_url_from(&self.http, &mut self.url, &mut self.identity);
+        Self::sync_redirected_base_url_from(&self.http, &mut self.url, &mut self.credentials);
     }
 
     /// Update `url` with the backend's accepted redirect target, clearing credentials if the
-    /// redirected authority must not reuse the original identity.
-    fn sync_redirected_base_url_from(http: &H, url: &mut String, identity: &mut Option<gix_sec::identity::Account>) {
+    /// redirected authority must not reuse the original credentials.
+    fn sync_redirected_base_url_from(
+        http: &H,
+        url: &mut String,
+        credentials: &mut Option<gix_sec::identity::Credentials>,
+    ) {
         let Some(redirected_url) = http.redirected_base_url() else {
             return;
         };
@@ -267,8 +275,8 @@ impl<H: Http> Transport<H> {
             return;
         }
 
-        if !redirect::can_reuse_identity(&redirected_url, url) {
-            *identity = None;
+        if !redirect::can_reuse_credentials(&redirected_url, url) {
+            *credentials = None;
         }
         *url = redirected_url;
     }
@@ -286,40 +294,67 @@ impl<H: Http + Default> Transport<H> {
 }
 
 impl<H: Http> Transport<H> {
-    fn check_content_type(service: Service, kind: &str, headers: <H as Http>::Headers) -> Result<(), client::Error> {
+    fn check_content_type(
+        service: Service,
+        kind: &str,
+        headers: <H as Http>::Headers,
+    ) -> std::result::Result<(), client::Error> {
         let wanted_content_type = format!("application/x-{}-{}", service.as_str(), kind);
-        if !headers.lines().collect::<Result<Vec<_>, _>>()?.iter().any(|l| {
-            let mut tokens = l.split(':');
-            tokens.next().zip(tokens.next()).is_some_and(|(name, value)| {
-                name.eq_ignore_ascii_case("content-type") && value.trim() == wanted_content_type
+        if !headers
+            .lines()
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .iter()
+            .any(|l| {
+                let mut tokens = l.split(':');
+                tokens.next().zip(tokens.next()).is_some_and(|(name, value)| {
+                    name.eq_ignore_ascii_case("content-type") && value.trim() == wanted_content_type
+                })
             })
-        }) {
-            return Err(client::Error::Http(Error::Detail {
-                description: format!(
+        {
+            return Err(client::Error::Http(
+                message!(
                     "Didn't find '{wanted_content_type}' header to indicate 'smart' protocol, and 'dumb' protocol is not supported."
-                ),
-            }));
+                )
+                .unsupported_error(),
+            ));
         }
         Ok(())
     }
 
-    fn add_basic_auth_if_present(&self, headers: &mut Vec<Cow<'_, str>>) -> Result<(), client::Error> {
-        if let Some(gix_sec::identity::Account {
-            username,
-            password,
-            oauth_refresh_token: _,
-        }) = &self.identity
-        {
+    fn add_auth_if_present(&self, headers: &mut Vec<Cow<'_, str>>) -> std::result::Result<(), client::Error> {
+        if let Some(credentials) = &self.credentials {
             #[cfg(not(feature = "http-client-insecure-credentials"))]
             if self.url.starts_with("http://") {
                 return Err(client::Error::AuthenticationRefused(
                     "Will not send credentials in clear text over http",
                 ));
             }
-            headers.push(Cow::Owned(format!(
-                "Authorization: Basic {}",
-                base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"))
-            )));
+            let authorization = match credentials {
+                gix_sec::identity::Credentials::UsernamePassword { username, password, .. } => format!(
+                    "Authorization: Basic {}",
+                    base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"))
+                ),
+                gix_sec::identity::Credentials::Encoded {
+                    authtype, credential, ..
+                } => {
+                    if authtype.is_empty()
+                        || !authtype
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+                    {
+                        return Err(client::Error::AuthenticationRefused(
+                            "Invalid HTTP authentication scheme",
+                        ));
+                    }
+                    if credential.is_empty() || credential.bytes().any(|byte| byte.is_ascii_control()) {
+                        return Err(client::Error::AuthenticationRefused(
+                            "Invalid HTTP authentication credential",
+                        ));
+                    }
+                    format!("Authorization: {authtype} {credential}")
+                }
+            };
+            headers.push(Cow::Owned(authorization));
         }
         Ok(())
     }
@@ -335,8 +370,11 @@ fn append_url(base: &str, suffix: &str) -> String {
 }
 
 impl<H: Http> client::TransportWithoutIO for Transport<H> {
-    fn set_identity(&mut self, identity: gix_sec::identity::Account) -> Result<(), client::Error> {
-        self.identity = Some(identity);
+    fn set_credentials(
+        &mut self,
+        credentials: gix_sec::identity::Credentials,
+    ) -> std::result::Result<(), client::Error> {
+        self.credentials = Some(credentials);
         Ok(())
     }
 
@@ -348,7 +386,7 @@ impl<H: Http> client::TransportWithoutIO for Transport<H> {
         false
     }
 
-    fn configure(&mut self, config: &dyn Any) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    fn configure(&mut self, config: &dyn Any) -> Result {
         self.http.configure(config)
     }
 }
@@ -358,7 +396,7 @@ impl<H: Http> blocking_io::Transport for Transport<H> {
         &mut self,
         service: Service,
         extra_parameters: &'a [(&'a str, Option<&'a str>)],
-    ) -> Result<SetServiceResponse<'_>, client::Error> {
+    ) -> std::result::Result<SetServiceResponse<'_>, client::Error> {
         let url = append_url(self.url.as_ref(), &format!("info/refs?service={}", service.as_str()));
         let static_headers = [Cow::Borrowed(self.user_agent_header)];
         let mut dynamic_headers = Vec::<Cow<'_, str>>::new();
@@ -384,13 +422,13 @@ impl<H: Http> blocking_io::Transport for Transport<H> {
             );
             dynamic_headers.push(format!("Git-Protocol: {parameters}").into());
         }
-        self.add_basic_auth_if_present(&mut dynamic_headers)?;
+        self.add_auth_if_present(&mut dynamic_headers)?;
         let GetResponse { headers, mut body } = self
             .http
             .get(url.as_ref(), &self.url, static_headers.iter().chain(&dynamic_headers))
             .map_err(|err| {
                 self.sync_redirected_base_url();
-                client::Error::from(err)
+                client::Error::Http(err)
             })?;
         if let Err(err) = <Transport<H>>::check_content_type(service, "advertisement", headers) {
             const MAX_ERROR_BODY_DRAIN_BYTES: u64 = 1024 * 1024;
@@ -418,13 +456,14 @@ impl<H: Http> blocking_io::Transport for Transport<H> {
 
         if let Some(announced_service) = line.as_bstr().strip_prefix(b"# service=") {
             if announced_service != service.as_str().as_bytes() {
-                return Err(client::Error::Http(Error::Detail {
-                    description: format!(
+                return Err(client::Error::Http(
+                    message!(
                         "Expected to see service {:?}, but got {:?}",
                         service.as_str(),
                         announced_service
-                    ),
-                }));
+                    )
+                    .raise(),
+                ));
             }
 
             line_reader.as_read().read_to_end(&mut Vec::new())?;
@@ -449,8 +488,16 @@ impl<H: Http> blocking_io::Transport for Transport<H> {
         write_mode: client::WriteMode,
         on_into_read: MessageKind,
         trace: bool,
-    ) -> Result<RequestWriter<'_>, client::Error> {
+    ) -> std::result::Result<RequestWriter<'_>, client::Error> {
         let service = self.service.ok_or(client::Error::MissingHandshake)?;
+        // A worker cannot accept another request while blocked sending the previous response.
+        if let Some(previous_response) = self.line_provider.as_mut()
+            && !previous_response.inner_mut().fill_buf()?.is_empty()
+        {
+            return Err(client::Error::Http(
+                message("previous HTTP response body was not fully consumed").raise(),
+            ));
+        }
         let url = append_url(&self.url, service.as_str());
         let static_headers = &[
             Cow::Borrowed(self.user_agent_header),
@@ -458,7 +505,7 @@ impl<H: Http> blocking_io::Transport for Transport<H> {
             format!("Accept: application/x-{}-result", service.as_str()).into(),
         ];
         let mut dynamic_headers = Vec::new();
-        self.add_basic_auth_if_present(&mut dynamic_headers)?;
+        self.add_auth_if_present(&mut dynamic_headers)?;
         if self.actual_version != Protocol::V1 {
             dynamic_headers.push(Cow::Owned(format!(
                 "Git-Protocol: version={}",
@@ -476,7 +523,7 @@ impl<H: Http> blocking_io::Transport for Transport<H> {
             .post(&url, &self.url, all_headers, write_mode.into())
             .map_err(|err| {
                 self.sync_redirected_base_url();
-                client::Error::from(err)
+                client::Error::Http(err)
             })?;
         self.sync_redirected_base_url();
         let line_provider = self
@@ -532,7 +579,7 @@ impl<H: Http, B: BufRead + Unpin> BufRead for HeadersThenBody<H, B> {
 }
 
 impl<H: Http, B: ReadlineBufRead + Unpin> ReadlineBufRead for HeadersThenBody<H, B> {
-    fn readline(&mut self) -> Option<std::io::Result<Result<PacketLineRef<'_>, gix_packetline::decode::Error>>> {
+    fn readline(&mut self) -> Option<std::io::Result<Result<PacketLineRef<'_>>>> {
         if let Err(err) = self.handle_headers() {
             return Some(Err(err));
         }
@@ -550,7 +597,7 @@ impl<'a, H: Http, B: ExtendedBufRead<'a> + Unpin> ExtendedBufRead<'a> for Header
         self.body.set_progress_handler(handle_progress);
     }
 
-    fn peek_data_line(&mut self) -> Option<std::io::Result<Result<&[u8], client::Error>>> {
+    fn peek_data_line(&mut self) -> Option<std::io::Result<std::result::Result<&[u8], client::Error>>> {
         if let Err(err) = self.handle_headers() {
             return Some(Err(err));
         }
@@ -582,3 +629,123 @@ pub fn connect<H: Http + Default>(url: gix_url::Url, desired_version: Protocol, 
 
 ///
 pub mod redirect;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::blocking_io::Transport as _;
+    use gix_error::Result;
+
+    struct FailingHttp;
+
+    impl Http for FailingHttp {
+        type Headers = std::io::Empty;
+        type ResponseBody = std::io::Empty;
+        type PostBody = std::io::Sink;
+
+        fn get(
+            &mut self,
+            _url: &str,
+            _base_url: &str,
+            _headers: impl IntoIterator<Item = impl AsRef<str>>,
+        ) -> Result<GetResponse<Self::Headers, Self::ResponseBody>> {
+            Err(gix_error::ClassificationMarker::with_source(
+                gix_error::Class::Retryable,
+                message("temporary backend failure"),
+            )
+            .and_raise(message("GET failed")))
+        }
+
+        fn post(
+            &mut self,
+            _url: &str,
+            _base_url: &str,
+            _headers: impl IntoIterator<Item = impl AsRef<str>>,
+            _body: PostBodyDataKind,
+        ) -> Result<PostResponse<Self::Headers, Self::ResponseBody, Self::PostBody>> {
+            Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused).and_raise(message("POST failed")))
+        }
+
+        fn configure(&mut self, _config: &dyn Any) -> Result {
+            Ok(())
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "http-client-insecure-credentials"))]
+    fn authentication_headers_refuse_cleartext() -> gix_error::TestResult {
+        for credentials in [
+            gix_sec::identity::Credentials::UsernamePassword {
+                username: "user".into(),
+                password: "secret".into(),
+                oauth_refresh_token: None,
+            },
+            gix_sec::identity::Credentials::Encoded {
+                authtype: "Bearer".into(),
+                credential: "secret".into(),
+                oauth_refresh_token: None,
+            },
+        ] {
+            let mut transport =
+                Transport::new_http(FailingHttp, "http://localhost/repo".try_into()?, Protocol::V2, false);
+            transport.credentials = Some(credentials);
+            let mut headers = Vec::new();
+            assert!(
+                matches!(
+                    transport.add_auth_if_present(&mut headers),
+                    Err(client::Error::AuthenticationRefused(_))
+                ),
+                "Basic passwords and pre-encoded tokens both require HTTPS"
+            );
+            assert!(headers.is_empty(), "refused credentials never become an HTTP header");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn backend_failures_remain_http_errors() {
+        let mut transport = Transport::new_http(
+            FailingHttp,
+            "http://localhost/repo".try_into().expect("valid URL"),
+            Protocol::V2,
+            false,
+        );
+        let get_error = transport
+            .handshake(Service::UploadPack, &[])
+            .err()
+            .expect("GET fails in the backend");
+        transport.service = Some(Service::UploadPack);
+        let post_error = transport
+            .request(client::WriteMode::Binary, MessageKind::Flush, false)
+            .err()
+            .expect("POST fails in the backend");
+
+        let errors = [get_error, post_error];
+        insta::assert_debug_snapshot!(errors, "GET and POST backend failures retain HTTP context and their I/O causes", @"
+        [
+            Http(
+                GET failed
+                
+                Caused by:
+                    0: temporary backend failure,
+            ),
+            Http(
+                POST failed
+                
+                Caused by:
+                    0: connection refused,
+            ),
+        ]
+        ");
+        for err in errors {
+            assert!(
+                matches!(err, client::Error::Http(_)),
+                "HTTP backend failures retain their transport error variant: {err:?}"
+            );
+            assert!(
+                gix_error::classify(&err).can_retry_lenient(),
+                "retryable backend causes survive conversion: {err:?}"
+            );
+        }
+    }
+}

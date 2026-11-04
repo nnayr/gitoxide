@@ -2,14 +2,14 @@ lints.workspace = true
 
 [package]
 name = "gix-transport"
-version = "0.57.2"
+version = "0.62.0"
 repository = "https://github.com/GitoxideLabs/gitoxide"
 license = "MIT OR Apache-2.0"
 description = "A crate of the gitoxide project dedicated to implementing the git transport layer"
 authors = ["Sebastian Thiel <sebastian.thiel@icloud.com>"]
 edition = "2024"
 include = ["/src/**/*", "/LICENSE-*"]
-rust-version = "1.85"
+rust-version = "1.88"
 
 [lib]
 doctest = false
@@ -23,7 +23,7 @@ blocking-client = ["gix-packetline/blocking-io"]
 http-client = [
     "base64",
     "parking_lot",
-    "gix-features/io-pipe",
+    "gix-utils/io-pipe",
     "blocking-client",
     "gix-credentials",
 ]
@@ -91,14 +91,16 @@ path = "tests/async-transport.rs"
 required-features = ["async-client"]
 
 [dependencies]
-gix-command = { version = "^0.9.1", path = "../gix-command" }
-gix-path = { version = "^0.12.2", path = "../gix-path" }
-gix-features = { version = "^0.48.1", path = "../gix-features" }
-gix-url = { version = "^0.36.2", path = "../gix-url" }
-gix-sec = { version = "^0.14.1", path = "../gix-sec" }
-gix-packetline = { version = "^0.21.5", path = "../gix-packetline" }
-gix-credentials = { version = "^0.38.2", path = "../gix-credentials", optional = true }
-gix-quote = { version = "^0.7.2", path = "../gix-quote" }
+gix-trace = { version = "^0.3.1", path = "../gix-trace" }
+gix-utils = { version = "^0.5.2", path = "../gix-utils", features = ["bstr"] }
+gix-command = { version = "^0.12.1", path = "../gix-command" }
+gix-error = { version = "^0.5.2", path = "../gix-error" }
+gix-path = { version = "^0.14.1", path = "../gix-path" }
+gix-url = { version = "^0.40.1", path = "../gix-url" }
+gix-sec = { version = "^0.16.1", path = "../gix-sec" }
+gix-packetline = { version = "^0.24.1", path = "../gix-packetline" }
+gix-credentials = { version = "^0.42.1", path = "../gix-credentials", optional = true }
+gix-quote = { version = "^0.10.1", path = "../gix-quote" }
 
 serde = { version = "1.0.114", optional = true, default-features = false, features = [
     "std",
@@ -108,7 +110,6 @@ bstr = { version = "1.12.0", default-features = false, features = [
     "std",
     "unicode",
 ] }
-thiserror = "2.0.18"
 parking_lot = { version = "0.12.4", optional = true }
 
 # for async-client
@@ -134,15 +135,42 @@ async-std = { version = "1.12.0", optional = true }
 document-features = { version = "0.2.0", optional = true }
 
 [dev-dependencies]
+gix-testtools = { path = "../tests/tools", default-features = false, features = ["sha1", "sha256"] }
+insta = "1.46.3"
 gix-transport = { path = ".", features = ["parking_lot"] }
 gix-pack = { path = "../gix-pack", default-features = false, features = [
     "sha1",
+    "sha256",
     "streaming-input",
 ] }
-gix-hash = { path = "../gix-hash", features = ["sha1"] }
+gix-hash = { path = "../gix-hash", features = ["sha1", "sha256"] }
 async-std = { version = "1.9.0", features = ["attributes"] }
-bisync = "0.3.0"
+gix-macros = { path = "../gix-macros" }
 blocking = "1.6.2"
 
 [package.metadata.docs.rs]
 features = ["http-client-curl", "document-features", "serde"]
+
+[package.metadata.qa]
+checks = [
+    { args = ["--all-features"] },
+    { args = ["--features", "blocking-client"] },
+    { args = ["--features", "async-client"] },
+    { args = ["--features", "async-client,async-std"] },
+    { args = ["--features", "http-client"] },
+    { args = ["--features", "http-client-curl"] },
+    { args = ["--features", "http-client-reqwest"] },
+]
+tests = [
+    { args = ["--features", "http-client-curl"] },
+    { args = ["--features", "http-client-curl,http-client-insecure-credentials", "--test", "blocking-transport-http-only"] },
+    { args = ["--features", "http-client-reqwest"] },
+    { args = ["--no-default-features", "--features", "blocking-client,http-client-reqwest,http-client-insecure-credentials", "--test", "blocking-transport"] },
+    { args = ["--features", "async-client"] },
+    # As of 2026-10-13, only `handshake_v1_and_request` and
+    # `handshake_v2_and_request` have been made `GIX_TEST_FIXTURE_HASH`-aware.
+    { args = ["--features", "blocking-client,http-client-insecure-credentials", "--test", "blocking-transport", "-E", "test(handshake_v1_and_request) | test(handshake_v2_and_request)"], env = { GIX_TEST_FIXTURE_HASH = "sha1" } },
+    { args = ["--features", "blocking-client,http-client-insecure-credentials", "--test", "blocking-transport", "-E", "test(handshake_v1_and_request) | test(handshake_v2_and_request)"], env = { GIX_TEST_FIXTURE_HASH = "sha256" } },
+    { args = ["--features", "async-client", "--test", "async-transport", "-E", "test(handshake_v1_and_request) | test(handshake_v2_and_request)"], env = { GIX_TEST_FIXTURE_HASH = "sha1" } },
+    { args = ["--features", "async-client", "--test", "async-transport", "-E", "test(handshake_v1_and_request) | test(handshake_v2_and_request)"], env = { GIX_TEST_FIXTURE_HASH = "sha256" } },
+]

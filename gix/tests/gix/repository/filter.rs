@@ -1,20 +1,21 @@
+use gix_testtools::{Result, TestResult};
 use std::path::Path;
 
 #[test]
-fn pipeline_in_nonbare_repo_without_index() -> crate::Result {
+fn pipeline_in_nonbare_repo_without_index() -> TestResult {
     let repo = named_subrepo_opts("make_basic_repo.sh", "all-untracked", Default::default())?;
-    let _ = repo.filter_pipeline(None).expect("does not fail due to missing index");
+    let _ = repo.filter_pipeline(None)?;
     Ok(())
 }
 
 use gix::bstr::ByteSlice;
-use gix_filter::driver::apply::Delay;
+use gix_filter::pipeline::convert::to_worktree;
 
 use super::blob_id;
 use crate::util::{named_repo, named_subrepo_opts};
 
 #[test]
-fn pipeline_in_repo_without_special_options() -> crate::Result {
+fn pipeline_in_repo_without_special_options() -> TestResult {
     let repo = named_repo("make_basic_repo.sh")?;
     let (mut pipe, index) = repo.filter_pipeline(None)?;
 
@@ -25,7 +26,7 @@ fn pipeline_in_repo_without_special_options() -> crate::Result {
     }
 
     {
-        let out = pipe.convert_to_worktree(input.as_bytes(), "file".into(), Delay::Forbid)?;
+        let out = pipe.convert_to_worktree(input.as_bytes(), "file".into(), to_worktree::Options::default())?;
         assert!(!out.is_changed(), "no filtering is configured, nothing changes");
     }
 
@@ -33,9 +34,104 @@ fn pipeline_in_repo_without_special_options() -> crate::Result {
 }
 
 #[test]
+fn repo_local_filter_driver_configuration_overrides_global_configuration() -> TestResult {
+    let mut repo = named_repo("make_basic_repo.sh")?;
+    repo.config_snapshot_mut()
+        .append_config(
+            ["filter.lfs.clean=global-clean", "filter.lfs.smudge=global-smudge"],
+            gix_config::Source::User,
+        )?
+        .append_config(["filter.lfs.clean=local-clean"], gix_config::Source::Local)?;
+
+    let drivers = gix::filter::Pipeline::options(&repo)?.drivers;
+    assert_eq!(drivers.len(), 1, "configuration for the same driver is merged");
+    assert_eq!(
+        drivers[0].clean.as_deref().map(Vec::as_slice),
+        Some(b"local-clean".as_slice()),
+        "repository-local properties take precedence"
+    );
+    assert_eq!(
+        drivers[0].smudge.as_deref().map(Vec::as_slice),
+        Some(b"global-smudge".as_slice()),
+        "properties not overridden locally are inherited"
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(all(feature = "blob-diff", feature = "merge"))]
+fn legacy_driver_names_are_canonical() -> TestResult {
+    let repo = named_repo("make_legacy_config_consumers.sh")?;
+    let filters = gix::filter::Pipeline::options(&repo)?.drivers;
+    assert_eq!(
+        filters.len(),
+        2,
+        r#"[filter.Legacy] folds to legacy and merges with quoted "legacy"; quoted "Legacy" stays distinct"#
+    );
+    let filter = filters
+        .iter()
+        .find(|driver| driver.name == "legacy")
+        .expect(r#"[filter.Legacy] and [filter "legacy"] both identify the lowercase legacy filter"#);
+    assert_eq!(
+        filter.clean.as_deref().map(Vec::as_slice),
+        Some(b"legacy-clean".as_slice()),
+        r#"[filter.Legacy] supplies clean for legacy; quoted "Legacy" is distinct and cannot override it"#
+    );
+    assert_eq!(
+        filter.smudge.as_deref().map(Vec::as_slice),
+        Some(b"quoted-smudge".as_slice()),
+        r#"[filter "legacy"] supplies smudge for the same driver as the lowercased [filter.Legacy]"#
+    );
+
+    let diff = repo.diff_resource_cache(Default::default(), Default::default())?;
+    let diffs = diff.filter.drivers();
+    assert_eq!(
+        diffs.len(),
+        2,
+        r#"[diff.Legacy] folds to legacy and merges with quoted "legacy"; quoted "Legacy" stays distinct"#
+    );
+    let diff = diffs
+        .iter()
+        .find(|driver| driver.name == "legacy")
+        .expect(r#"[diff.Legacy] and [diff "legacy"] both identify the lowercase legacy diff driver"#);
+    assert_eq!(
+        diff.command.as_ref().map(|value| value.as_bstr()),
+        Some("legacy-diff".into()),
+        r#"[diff.Legacy] supplies command for legacy; quoted "Legacy" configures a separate driver"#
+    );
+    assert_eq!(
+        diff.binary_to_text_command.as_ref().map(|value| value.as_bstr()),
+        Some("quoted-textconv".into()),
+        r#"[diff "legacy"] supplies textconv for the same driver as the lowercased [diff.Legacy]"#
+    );
+
+    let merge = repo.merge_resource_cache(Default::default())?;
+    let merges = merge.drivers();
+    assert_eq!(
+        merges.len(),
+        2,
+        r#"[merge.Legacy] folds to legacy and merges with quoted "legacy"; quoted "Legacy" stays distinct"#
+    );
+    let merge = merges
+        .iter()
+        .find(|driver| driver.name == "legacy")
+        .expect(r#"[merge.Legacy] and [merge "legacy"] both identify the lowercase legacy merge driver"#);
+    assert_eq!(
+        merge.command, "legacy-merge",
+        r#"[merge.Legacy] supplies driver for legacy; quoted "Legacy" is distinct and cannot override it"#
+    );
+    assert_eq!(
+        merge.recursive.as_ref().map(|value| value.as_bstr()),
+        Some("binary".into()),
+        r#"[merge "legacy"] supplies recursive for the same driver as the lowercased [merge.Legacy]"#
+    );
+    Ok(())
+}
+
+#[test]
 #[cfg(unix)]
-fn pipeline_worktree_file_to_object() -> crate::Result {
-    let repo = named_repo("repo_with_untracked_files.sh")?;
+fn pipeline_worktree_file_to_object() -> TestResult {
+    let repo = named_repo("repo_with_untracked_files.sh")?.with_object_memory();
     let work_dir = repo.workdir().expect("non-bare");
     let (mut pipe, index) = repo.filter_pipeline(None)?;
     fn take_two<A, B, C>(t: Option<(A, B, C)>) -> Option<(A, B)> {
@@ -49,10 +145,13 @@ fn pipeline_worktree_file_to_object() -> crate::Result {
         take_two(pipe.worktree_file_to_object("embedded-repository".into(), &index)?),
         Some((submodule_id, gix::object::tree::EntryKind::Commit))
     );
-    assert_eq!(
-        take_two(pipe.worktree_file_to_object("submodule".into(), &index)?),
-        Some((submodule_id, gix::object::tree::EntryKind::Commit))
-    );
+    for path in ["submodule", "submodule/", "submodule/.", "empty-dir/../submodule"] {
+        assert_eq!(
+            take_two(pipe.worktree_file_to_object(path.into(), &index)?),
+            Some((submodule_id, gix::object::tree::EntryKind::Commit)),
+            "directory validation preserves safe path spellings: {path}"
+        );
+    }
     assert_eq!(
         take_two(pipe.worktree_file_to_object("uninitialized-embedded-repository".into(), &index)?),
         None,
@@ -90,12 +189,73 @@ fn pipeline_worktree_file_to_object() -> crate::Result {
         None,
         "untrackable entries are just ignored as if they didn't exist"
     );
+    for path in [
+        "directory-link/embedded-repository",
+        "directory-link/submodule",
+        "directory-link/file",
+        "directory-link/link",
+        "directory-link/",
+        "directory-link/.",
+        "empty-dir/../directory-link/",
+        "empty-dir/../directory-link/.",
+        "directory-link/../file",
+        "../file",
+    ] {
+        let err = pipe
+            .worktree_file_to_object(path.into(), &index)
+            .expect_err("object creation must not traverse a symlink");
+        assert!(err.is_validation(), "the unsafe path is rejected: {path}: {err:?}");
+    }
+    for path in ["", ".", "..", "empty-dir/.."] {
+        let err = pipe
+            .worktree_file_to_object(path.into(), &index)
+            .expect_err("a path without a file name must not be added, even if it has a parent");
+        assert!(err.is_validation(), "the path without a file name is rejected: {path}");
+        assert_eq!(
+            err.metadata().next().expect("the validation error retains its input")["input"],
+            gix_error::MetadataValue::from(path.as_bytes()),
+            "the original path bytes remain available in the validation error"
+        );
+    }
     Ok(())
 }
 
 #[test]
 #[cfg(unix)]
-fn worktree_file_to_object_opens_submodules_after_path_options_were_consumed() -> crate::Result {
+fn worktree_file_to_object_recomputes_submodule_trust() -> TestResult {
+    fn check_submodule_trust(meta: &gix_config::file::Metadata) -> bool {
+        if meta
+            .path
+            .as_ref()
+            .is_some_and(|path| path.ends_with(Path::new("modules/submodule/config")))
+        {
+            assert_eq!(
+                meta.trust,
+                gix_sec::Trust::Full,
+                "the fixture submodule is owned by this user, regardless of the parent's forced trust"
+            );
+        }
+        true
+    }
+    let repo = named_subrepo_opts(
+        "repo_with_untracked_files.sh",
+        ".",
+        gix::open::Options::isolated()
+            .with_trust(gix_sec::Trust::Reduced)
+            .filter_config_section(check_submodule_trust),
+    )?;
+    assert_eq!(repo.git_dir_trust(), gix_sec::Trust::Reduced, "parent trust is forced");
+    let (mut pipe, index) = repo.filter_pipeline(None)?;
+    assert!(
+        pipe.worktree_file_to_object("submodule".into(), &index)?.is_some(),
+        "opening the submodule consults its local core.worktree configuration"
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn worktree_file_to_object_opens_submodules_after_path_options_were_consumed() -> TestResult {
     let repo = named_repo("repo_with_untracked_files.sh")?;
     let submodule = gix::open_opts(
         repo.workdir().expect("non-bare").join("submodule"),
@@ -104,7 +264,7 @@ fn worktree_file_to_object_opens_submodules_after_path_options_were_consumed() -
     let checked_out_head = submodule.head_id()?;
     let mut repo = gix::open_opts(repo.git_dir(), gix::open::Options::isolated().open_path_as_is(true))?;
 
-    fn submodule_entry(repo: &gix::Repository) -> crate::Result<Option<(gix::ObjectId, gix::object::tree::EntryKind)>> {
+    fn submodule_entry(repo: &gix::Repository) -> Result<Option<(gix::ObjectId, gix::object::tree::EntryKind)>> {
         let (mut pipe, index) = repo.filter_pipeline(None)?;
         Ok(pipe
             .worktree_file_to_object("submodule".into(), &index)?
@@ -137,7 +297,7 @@ fn worktree_file_to_object_opens_submodules_after_path_options_were_consumed() -
 }
 
 #[test]
-fn pipeline_with_autocrlf() -> crate::Result {
+fn pipeline_with_autocrlf() -> TestResult {
     let repo = named_repo("make_config_repo.sh")?;
     let (mut pipe, index) = repo.filter_pipeline(None)?;
 
@@ -154,7 +314,7 @@ fn pipeline_with_autocrlf() -> crate::Result {
     }
 
     {
-        let out = pipe.convert_to_worktree("hi\n".as_bytes(), "file".into(), Delay::Forbid)?;
+        let out = pipe.convert_to_worktree("hi\n".as_bytes(), "file".into(), to_worktree::Options::default())?;
         assert_eq!(
             out.as_bytes()
                 .expect("a buffer is needed for eol conversions")

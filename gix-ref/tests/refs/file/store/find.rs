@@ -1,8 +1,73 @@
+#[test]
+fn resolved_lookup_skips_unresolvable_candidates_but_keeps_the_original_reference() -> gix_testtools::TestResult {
+    let store = crate::file::store_at("make_resolved_lookup.sh")?;
+    assert!(
+        store.try_find_resolved("missing")?.is_none(),
+        "an absent name is distinct from an existing candidate that cannot resolve"
+    );
+    assert_eq!(
+        store
+            .find_resolved("missing")
+            .expect_err("the non-optional lookup reports an absent name")
+            .downcast_any_ref::<gix_ref::file::find::NotFound>()
+            .expect("absence retains its concrete lookup error")
+            .name,
+        gix_ref::bstr::BStr::new("missing"),
+        "only an absent name becomes a not-found error for the input"
+    );
+    assert_eq!(
+        store.find("main")?.name,
+        "refs/tags/main",
+        "raw lookup keeps dangling refs"
+    );
+    for (name, expected) in [("main", "refs/heads/main"), ("cycle", "refs/heads/cycle")] {
+        assert_eq!(
+            store.find_resolved(name)?.name,
+            expected,
+            "resolved lookup skips dangling or cyclic tags"
+        );
+    }
+    let alias = store.find_resolved("alias")?;
+    assert_eq!(
+        alias.name, "refs/heads/alias",
+        "the symbolic candidate keeps its own name"
+    );
+    assert!(
+        matches!(alias.target, gix_ref::Target::Symbolic(_)),
+        "lookup does not mutate the symbolic target"
+    );
+    for err in [
+        store
+            .find_resolved("refs/tags/main")
+            .expect_err("the only candidate dangles"),
+        store
+            .try_find_resolved("refs/tags/main")
+            .expect_err("an existing dangling candidate is not an absent name"),
+    ] {
+        assert!(err.is_not_found(), "missing referents retain their classification");
+        assert_eq!(
+            err.downcast_any_ref::<gix_ref::file::find::NotFound>()
+                .expect("a missing symbolic target retains its concrete lookup error")
+                .name,
+            gix_ref::bstr::BStr::new("refs/tags/missing"),
+            "resolution failures identify the missing target, not the existing candidate"
+        );
+    }
+    assert!(
+        store
+            .try_find_resolved("refs/tags/cycle")
+            .expect_err("an existing cyclic candidate is not an absent name")
+            .is_corrupted(),
+        "cycles remain real resolution errors"
+    );
+    Ok(())
+}
+
 mod existing {
     use crate::{file::store_at, hex_to_id};
 
     #[test]
-    fn various_repositories() -> crate::Result {
+    fn various_repositories() -> gix_testtools::TestResult {
         for fixture in [
             "make_ref_repository.sh",
             "make_packed_ref_repository.sh",
@@ -13,7 +78,7 @@ mod existing {
             let c1 = hex_to_id("134385f6d781b7e97062102c6a483440bfda2a03");
             let r = store.find("main")?;
             assert_eq!(r.target.into_id(), c1);
-            assert_eq!(r.name.as_bstr(), "refs/heads/main");
+            assert_eq!(r.name, "refs/heads/main");
             let r = store
                 .find("A")
                 .unwrap_or_else(|_| panic!("{fixture}: should find capitalized refs"));
@@ -27,7 +92,7 @@ mod existing {
 
         // TODO: figure this out
         #[test]
-        fn possible_inputs() -> crate::Result {
+        fn possible_inputs() -> gix_testtools::TestResult {
             let store = crate::file::store()?;
             store.find_loose("dt1")?;
             store.find_loose(&String::from("dt1"))?; // Owned Strings don't have an impl for PartialName
@@ -62,7 +127,7 @@ mod existing {
         impl<'a> TryFrom<&'a CustomType> for &'a PartialNameRef {
             type Error = gix_ref::name::Error;
 
-            fn try_from(value: &'a CustomType) -> Result<Self, Self::Error> {
+            fn try_from(value: &'a CustomType) -> std::result::Result<Self, Self::Error> {
                 value.0.as_str().try_into()
             }
         }
@@ -94,7 +159,7 @@ mod existing {
         impl<'a> TryFrom<&'a CustomName> for PartialName {
             type Error = gix_ref::name::Error;
 
-            fn try_from(value: &'a CustomName) -> Result<Self, Self::Error> {
+            fn try_from(value: &'a CustomName) -> std::result::Result<Self, Self::Error> {
                 PartialName::try_from(value.to_partial_name())
             }
         }
@@ -105,15 +170,14 @@ mod loose {
     use crate::{file::store, hex_to_id};
 
     mod existing {
-        use std::path::Path;
 
         use crate::file::store;
 
         #[test]
-        fn capitalized_branch() -> crate::Result {
+        fn capitalized_branch() -> gix_testtools::TestResult {
             let store = store()?;
             assert_eq!(
-                store.find("A")?.name.as_bstr(),
+                store.find("A")?,
                 "refs/heads/A",
                 "capitalized loose refs can be found fine"
             );
@@ -121,27 +185,38 @@ mod loose {
         }
 
         #[test]
-        fn success_and_failure() -> crate::Result {
+        fn success_and_failure() -> gix_testtools::TestResult {
+            let mut error_snapshots = Vec::new();
             let store = store()?;
-            for (partial_name, expected_path) in &[("main", Some("refs/heads/main")), ("does-not-exist", None)] {
-                let reference = store.find_loose(*partial_name);
+            for (partial_name, expected_path) in [("main", Some("refs/heads/main")), ("does-not-exist", None)] {
+                let reference = store.find_loose(partial_name);
                 match expected_path {
-                    Some(expected_path) => assert_eq!(reference?.name.as_bstr(), expected_path),
+                    Some(expected_path) => assert_eq!(reference?, expected_path),
                     None => match reference {
                         Ok(_) => panic!("Expected error"),
-                        Err(gix_ref::file::find::existing::Error::NotFound { name }) => {
-                            assert_eq!(name, Path::new(*partial_name));
+                        Err(err) => {
+                            error_snapshots.push(gix_testtools::redact_debug_snapshot(&err, &[]));
+                            assert_eq!(
+                                err.downcast_any_ref::<gix_ref::file::find::NotFound>()
+                                    .expect("absent reference")
+                                    .name,
+                                partial_name
+                            );
                         }
-                        Err(err) => panic!("Unexpected err: {err:?}"),
                     },
                 }
             }
+            insta::assert_debug_snapshot!(error_snapshots, "success and failure", @r#"
+            [
+                The ref partially named "does-not-exist" could not be found,
+            ]
+            "#);
             Ok(())
         }
     }
 
     #[test]
-    fn fetch_head_can_be_parsed() -> crate::Result {
+    fn fetch_head_can_be_parsed() -> gix_testtools::TestResult {
         let store = store()?;
         assert_eq!(
             store.find_loose("FETCH_HEAD")?.target.id(),
@@ -152,7 +227,7 @@ mod loose {
     }
 
     #[test]
-    fn success() -> crate::Result {
+    fn success() -> gix_testtools::TestResult {
         let store = store()?;
         for (partial_name, expected_path, expected_ref_kind) in &[
             ("dt1", "refs/tags/dt1", gix_ref::Kind::Object),     // tags before heads
@@ -170,14 +245,14 @@ mod loose {
             ("refs/heads/main", "refs/heads/main", gix_ref::Kind::Object),
         ] {
             let reference = store.try_find_loose(*partial_name)?.expect("exists");
-            assert_eq!(reference.name.as_bstr(), expected_path);
+            assert_eq!(reference, *expected_path);
             assert_eq!(reference.target.to_ref().kind(), *expected_ref_kind);
         }
         Ok(())
     }
 
     #[test]
-    fn failure() -> crate::Result {
+    fn failure() -> gix_testtools::TestResult {
         let store = store()?;
         for (partial_name, reason, is_err) in &[
             ("foobar", "does not exist", false),
@@ -192,11 +267,47 @@ mod loose {
                 assert!(reference.is_none(), "{}", reason);
             }
         }
+
+        let mut store = store;
+        store.prohibit_windows_device_names = true;
+        let name = "refs/heads/CON";
+        let err = store
+            .try_find_loose(name)
+            .expect_err("reserved device names cannot be read when prohibited");
+        insta::assert_debug_snapshot!(gix_testtools::redact_debug_snapshot(&(err), &[(&(store.git_dir()).to_string_lossy(), "<git-dir>")]), "rejecting a device name retains the original I/O error kind", @r#"
+        Could not read reference, path="<git-dir>/refs/heads/CON"
+
+        Caused by:
+            0: I/O error (Other)
+            1: Illegal use of reserved Windows device name in "refs/heads/CON"
+        "#);
+        let details = err.metadata().next().expect("reference read context");
+        assert!(
+            err.downcast_any_ref::<gix_error::Message>().is_some(),
+            "the reference read diagnostic retains its concrete type"
+        );
+        assert_eq!(details.len(), 1, "read context contains only the path");
+        assert_eq!(
+            details["path"],
+            gix_error::MetadataValue::Path(store.git_dir().join(name)),
+            "the resolved reference path remains a native path"
+        );
+        assert_eq!(
+            err.downcast_any_ref::<std::io::Error>()
+                .expect("the original read error is retained")
+                .kind(),
+            std::io::ErrorKind::Other,
+            "rejecting a device name retains the original I/O error kind"
+        );
+        assert!(
+            !err.is_corrupted(),
+            "a prohibited path does not imply corrupt ref contents"
+        );
         Ok(())
     }
 
     #[test]
-    fn prefix_file_collision_is_not_found() -> crate::Result {
+    fn prefix_file_collision_is_not_found() -> gix_testtools::TestResult {
         let (_tmp, store) = crate::file::store_writable("make_ref_repository.sh")?;
 
         assert!(

@@ -65,12 +65,7 @@ mod single {
 mod multiple {
     use bstr::BString;
     use gix_hash::ObjectId;
-    use gix_refspec::{
-        MatchGroup,
-        match_group::Item,
-        match_group::validate::Fix,
-        parse::{Error, Operation},
-    };
+    use gix_refspec::{MatchGroup, match_group::Item, match_group::validate::Fix, parse::Operation};
 
     use crate::matching::baseline;
 
@@ -90,27 +85,110 @@ mod multiple {
 
     #[test]
     fn fetch_and_update_and_negations() {
-        baseline::invalid_specs_fail_to_parse_where_git_shows_surprising_behaviour(
-            ["refs/heads/f*:refs/remotes/origin/a*", "^f1"],
-            Error::NegativePartialName,
-        );
-        baseline::invalid_specs_fail_to_parse_where_git_shows_surprising_behaviour(
-            ["heads/f2", "^refs/heads/f*:refs/remotes/origin/a*"],
-            Error::NegativeWithDestination,
-        );
+        baseline::agrees_with_fetch_specs(["refs/heads/f*:refs/remotes/origin/a*", "^f1"]);
         baseline::agrees_with_fetch_specs(["refs/heads/f*:refs/remotes/origin/a*", "^refs/heads/f1"]);
-        baseline::invalid_specs_fail_to_parse_where_git_shows_surprising_behaviour(
-            ["^heads/f2", "refs/heads/f*:refs/remotes/origin/a*"],
-            Error::NegativePartialName,
-        );
+        baseline::agrees_with_fetch_specs(["^heads/f2", "refs/heads/f*:refs/remotes/origin/a*"]);
         baseline::agrees_with_fetch_specs(["^refs/heads/f2", "refs/heads/f*:refs/remotes/origin/a*"]);
-        baseline::invalid_specs_fail_to_parse_where_git_shows_surprising_behaviour(
-            ["^main", "refs/heads/*:refs/remotes/origin/*"],
-            Error::NegativePartialName,
-        );
+        baseline::agrees_with_fetch_specs(["^main", "refs/heads/*:refs/remotes/origin/*"]);
         baseline::agrees_with_fetch_specs(["^refs/heads/main", "refs/heads/*:refs/remotes/origin/*"]);
         baseline::agrees_with_fetch_specs(["refs/heads/*:refs/remotes/origin/*", "^refs/heads/main"]);
         baseline::agrees_with_fetch_specs(["refs/heads/*:refs/remotes/origin/*", "^refs/heads/*-deploy"]);
+    }
+
+    #[test]
+    fn negative_sources_are_matched_literally_in_both_directions() {
+        let target = ObjectId::from_hex(b"1111111111111111111111111111111111111111").expect("valid object id");
+        let remote_item = Item {
+            full_ref_name: "refs/heads/main".into(),
+            target: &target,
+            object: None,
+        };
+        let local_item = Item {
+            full_ref_name: "refs/remotes/origin/main".into(),
+            target: &target,
+            object: None,
+        };
+        let positive = "refs/heads/*:refs/remotes/origin/*";
+
+        for (negative, should_exclude) in [
+            ("^main", false),
+            ("^heads/*", false),
+            ("^refs/heads/main", true),
+            ("^refs/heads/*", true),
+        ] {
+            let specs = || {
+                [positive, negative]
+                    .into_iter()
+                    .map(|spec| gix_refspec::parse(spec.into(), Operation::Fetch).expect("valid refspec"))
+            };
+
+            let outcome = MatchGroup::from_fetch_specs(specs()).match_lhs([remote_item].into_iter());
+            assert_eq!(
+                outcome.mappings.is_empty(),
+                should_exclude,
+                "{negative} applies literally when matching sources"
+            );
+
+            let outcome = MatchGroup::from_fetch_specs(specs()).match_rhs([local_item].into_iter());
+            assert_eq!(
+                outcome.mappings.is_empty(),
+                should_exclude,
+                "{negative} applies literally after reverse mapping destinations"
+            );
+        }
+    }
+
+    #[test]
+    fn reverse_fetch_mapping_preserves_sources_for_negation_and_deduplication() -> gix_testtools::TestResult {
+        let target = gix_testtools::object_hash().null();
+        let item = Item {
+            full_ref_name: "refs/remotes/origin/main".into(),
+            target: &target,
+            object: None,
+        };
+        for (negative, expected) in [
+            ("^main", vec!["refs/heads/main"]),
+            ("^refs/heads/main", vec!["main"]),
+            ("^heads/main", vec!["main", "refs/heads/main"]),
+        ] {
+            let specs = [
+                "main:refs/remotes/origin/main",
+                "refs/heads/main:refs/remotes/origin/main",
+                "main:refs/remotes/origin/main",
+                negative,
+            ]
+            .into_iter()
+            .map(|spec| gix_refspec::parse(spec.into(), Operation::Fetch))
+            .collect::<gix_error::Result<Vec<_>>>()?;
+            let outcome = MatchGroup::from_fetch_specs(specs).match_rhs(std::iter::once(item));
+            let sources: Vec<_> = outcome.mappings.iter().map(|mapping| mapping.lhs.to_string()).collect();
+            assert_eq!(
+                sources, expected,
+                "{negative} excludes literal sources, and only identical mappings are deduplicated"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn glob_prefix_and_suffix_cannot_overlap_in_either_direction() -> gix_testtools::TestResult {
+        let target = gix_testtools::object_hash().null();
+        let item = Item {
+            full_ref_name: "refs/heads/main".into(),
+            target: &target,
+            object: None,
+        };
+        let spec = gix_refspec::parse("refs/heads/*heads/main:refs/heads/*heads/main".into(), Operation::Fetch)?;
+        let group = MatchGroup::from_fetch_specs([spec]);
+        assert!(
+            group.clone().match_lhs(std::iter::once(item)).mappings.is_empty(),
+            "a glob capture cannot have negative length when matching sources"
+        );
+        assert!(
+            group.match_rhs(std::iter::once(item)).mappings.is_empty(),
+            "a glob capture cannot have negative length when matching destinations"
+        );
+        Ok(())
     }
 
     #[test]
@@ -184,38 +262,40 @@ mod multiple {
 
     #[test]
     fn fetch_and_update_with_conflicts() {
-        baseline::agrees_with_fetch_specs_validation_error(
-            [
+        insta::assert_debug_snapshot!(baseline::agrees_with_fetch_specs_validation_error([
                 "refs/heads/f1:refs/remotes/origin/conflict",
                 "refs/heads/f2:refs/remotes/origin/conflict",
-            ],
-            "Found 1 issue that prevents the refspec mapping to be used: \n\tConflicting destination \"refs/remotes/origin/conflict\" would be written by refs/heads/f1 (\"refs/heads/f1:refs/remotes/origin/conflict\"), refs/heads/f2 (\"refs/heads/f2:refs/remotes/origin/conflict\")",
-        );
-        baseline::agrees_with_fetch_specs_validation_error(
-            [
+            ]), "conflicting destinations identify every contributing refspec", @"
+        Found 1 issue that prevents the refspec mapping to be used:\x20
+        \tConflicting destination \"refs/remotes/origin/conflict\" would be written by refs/heads/f1 (\"refs/heads/f1:refs/remotes/origin/conflict\"), refs/heads/f2 (\"refs/heads/f2:refs/remotes/origin/conflict\")
+        ");
+        insta::assert_debug_snapshot!(baseline::agrees_with_fetch_specs_validation_error([
                 "refs/heads/f1:refs/remotes/origin/conflict2",
                 "refs/heads/f2:refs/remotes/origin/conflict2",
                 "refs/heads/f1:refs/remotes/origin/conflict",
                 "refs/heads/f2:refs/remotes/origin/conflict",
                 "refs/heads/f3:refs/remotes/origin/conflict",
-            ],
-            "Found 2 issues that prevent the refspec mapping to be used: \n\tConflicting destination \"refs/remotes/origin/conflict\" would be written by refs/heads/f1 (\"refs/heads/f1:refs/remotes/origin/conflict\"), refs/heads/f2 (\"refs/heads/f2:refs/remotes/origin/conflict\"), refs/heads/f3 (\"refs/heads/f3:refs/remotes/origin/conflict\")\n\tConflicting destination \"refs/remotes/origin/conflict2\" would be written by refs/heads/f1 (\"refs/heads/f1:refs/remotes/origin/conflict2\"), refs/heads/f2 (\"refs/heads/f2:refs/remotes/origin/conflict2\")",
-        );
-        baseline::agrees_with_fetch_specs_validation_error(
-            [
+            ]), "conflicting destinations identify every contributing refspec", @"
+        Found 2 issues that prevent the refspec mapping to be used:\x20
+        \tConflicting destination \"refs/remotes/origin/conflict\" would be written by refs/heads/f1 (\"refs/heads/f1:refs/remotes/origin/conflict\"), refs/heads/f2 (\"refs/heads/f2:refs/remotes/origin/conflict\"), refs/heads/f3 (\"refs/heads/f3:refs/remotes/origin/conflict\")
+        \tConflicting destination \"refs/remotes/origin/conflict2\" would be written by refs/heads/f1 (\"refs/heads/f1:refs/remotes/origin/conflict2\"), refs/heads/f2 (\"refs/heads/f2:refs/remotes/origin/conflict2\")
+        ");
+        insta::assert_debug_snapshot!(baseline::agrees_with_fetch_specs_validation_error([
                 "refs/heads/f1:refs/remotes/origin/same",
                 "refs/tags/v0.0-f1:refs/remotes/origin/same",
-            ],
-            "Found 1 issue that prevents the refspec mapping to be used: \n\tConflicting destination \"refs/remotes/origin/same\" would be written by refs/heads/f1 (\"refs/heads/f1:refs/remotes/origin/same\"), refs/tags/v0.0-f1 (\"refs/tags/v0.0-f1:refs/remotes/origin/same\")",
-        );
-        baseline::agrees_with_fetch_specs_validation_error(
-            [
+            ]), "conflicting destinations identify every contributing refspec", @"
+        Found 1 issue that prevents the refspec mapping to be used:\x20
+        \tConflicting destination \"refs/remotes/origin/same\" would be written by refs/heads/f1 (\"refs/heads/f1:refs/remotes/origin/same\"), refs/tags/v0.0-f1 (\"refs/tags/v0.0-f1:refs/remotes/origin/same\")
+        ");
+        insta::assert_debug_snapshot!(baseline::agrees_with_fetch_specs_validation_error([
                 "+refs/heads/*:refs/remotes/origin/*",
                 "refs/heads/f1:refs/remotes/origin/f2",
                 "refs/heads/f2:refs/remotes/origin/f1",
-            ],
-            "Found 2 issues that prevent the refspec mapping to be used: \n\tConflicting destination \"refs/remotes/origin/f1\" would be written by refs/heads/f1 (\"+refs/heads/*:refs/remotes/origin/*\"), refs/heads/f2 (\"refs/heads/f2:refs/remotes/origin/f1\")\n\tConflicting destination \"refs/remotes/origin/f2\" would be written by refs/heads/f2 (\"+refs/heads/*:refs/remotes/origin/*\"), refs/heads/f1 (\"refs/heads/f1:refs/remotes/origin/f2\")",
-        );
+            ]), "conflicting destinations identify every contributing refspec", @"
+        Found 2 issues that prevent the refspec mapping to be used:\x20
+        \tConflicting destination \"refs/remotes/origin/f1\" would be written by refs/heads/f1 (\"+refs/heads/*:refs/remotes/origin/*\"), refs/heads/f2 (\"refs/heads/f2:refs/remotes/origin/f1\")
+        \tConflicting destination \"refs/remotes/origin/f2\" would be written by refs/heads/f2 (\"+refs/heads/*:refs/remotes/origin/*\"), refs/heads/f1 (\"refs/heads/f1:refs/remotes/origin/f2\")
+        ");
     }
 
     #[test]
@@ -240,162 +320,5 @@ mod multiple {
             ],
             ["refs/heads/f1:refs/heads/f1"],
         );
-    }
-}
-
-mod complex_globs {
-    use bstr::BString;
-    use gix_hash::ObjectId;
-    use gix_refspec::{MatchGroup, parse::Operation};
-
-    #[test]
-    fn one_sided_complex_glob_patterns_can_be_parsed() {
-        // The key change is that complex glob patterns with multiple asterisks
-        // can now be parsed for one-sided refspecs
-        let spec = gix_refspec::parse("refs/*/foo/*".into(), Operation::Fetch);
-        assert!(spec.is_ok(), "Should parse complex glob pattern for one-sided refspec");
-
-        let spec = gix_refspec::parse("refs/*/*/bar".into(), Operation::Fetch);
-        assert!(
-            spec.is_ok(),
-            "Should parse complex glob pattern with multiple asterisks"
-        );
-
-        let spec = gix_refspec::parse("refs/heads/[a-z.]/release/*".into(), Operation::Fetch);
-        assert!(spec.is_ok(), "Should parse complex glob pattern");
-
-        // Two-sided refspecs with multiple asterisks should still fail
-        let spec = gix_refspec::parse("refs/*/foo/*:refs/remotes/*".into(), Operation::Fetch);
-        assert!(spec.is_err(), "Two-sided refspecs with multiple asterisks should fail");
-    }
-
-    #[test]
-    fn one_sided_simple_glob_patterns_match() {
-        // Test that simple glob patterns (one asterisk) work correctly with matching
-        let refs = [
-            new_ref("refs/heads/feature/foo", "1111111111111111111111111111111111111111"),
-            new_ref("refs/heads/bugfix/bar", "2222222222222222222222222222222222222222"),
-            new_ref("refs/tags/v1.0", "3333333333333333333333333333333333333333"),
-            new_ref("refs/pull/123", "4444444444444444444444444444444444444444"),
-        ];
-        let items: Vec<_> = refs.iter().map(|r| r.to_item()).collect();
-
-        // Test: refs/heads/* should match all refs under refs/heads/
-        let spec = gix_refspec::parse("refs/heads/*".into(), Operation::Fetch).unwrap();
-        let group = MatchGroup::from_fetch_specs([spec]);
-        let outcome = group.match_lhs(items.iter().copied());
-
-        insta::assert_debug_snapshot!(outcome.mappings, @r#"
-        [
-            Mapping {
-                item_index: Some(
-                    0,
-                ),
-                lhs: FullName(
-                    "refs/heads/feature/foo",
-                ),
-                rhs: None,
-                spec_index: 0,
-            },
-            Mapping {
-                item_index: Some(
-                    1,
-                ),
-                lhs: FullName(
-                    "refs/heads/bugfix/bar",
-                ),
-                rhs: None,
-                spec_index: 0,
-            },
-        ]
-        "#);
-
-        // Test: refs/tags/* should match all refs under refs/tags/
-        let items: Vec<_> = refs.iter().map(|r| r.to_item()).collect();
-        let spec = gix_refspec::parse("refs/tags/v[0-9]*".into(), Operation::Fetch).unwrap();
-        let group = MatchGroup::from_fetch_specs([spec]);
-        let outcome = group.match_lhs(items.iter().copied());
-
-        insta::assert_debug_snapshot!(outcome.mappings, @r#"
-        [
-            Mapping {
-                item_index: Some(
-                    2,
-                ),
-                lhs: FullName(
-                    "refs/tags/v1.0",
-                ),
-                rhs: None,
-                spec_index: 0,
-            },
-        ]
-        "#);
-    }
-
-    #[test]
-    fn one_sided_glob_with_suffix_matches() {
-        // Test that glob patterns with suffix work correctly
-        let refs = [
-            new_ref("refs/heads/feature", "1111111111111111111111111111111111111111"),
-            new_ref("refs/heads/feat", "2222222222222222222222222222222222222222"),
-            new_ref("refs/heads/main", "3333333333333333333333333333333333333333"),
-        ];
-        let items: Vec<_> = refs.iter().map(|r| r.to_item()).collect();
-
-        // Test: refs/heads/feat* should match refs/heads/feature and refs/heads/feat
-        let spec = gix_refspec::parse("refs/heads/feat*".into(), Operation::Fetch).unwrap();
-        let group = MatchGroup::from_fetch_specs([spec]);
-        let outcome = group.match_lhs(items.iter().copied());
-        let mappings = outcome.mappings;
-
-        insta::assert_debug_snapshot!(mappings, @r#"
-        [
-            Mapping {
-                item_index: Some(
-                    0,
-                ),
-                lhs: FullName(
-                    "refs/heads/feature",
-                ),
-                rhs: None,
-                spec_index: 0,
-            },
-            Mapping {
-                item_index: Some(
-                    1,
-                ),
-                lhs: FullName(
-                    "refs/heads/feat",
-                ),
-                rhs: None,
-                spec_index: 0,
-            },
-        ]
-        "#);
-    }
-
-    fn new_ref(name: &str, id_hex: &str) -> Ref {
-        Ref {
-            name: name.into(),
-            target: ObjectId::from_hex(id_hex.as_bytes()).unwrap(),
-            object: None,
-        }
-    }
-
-    #[derive(Debug, Clone)]
-    struct Ref {
-        name: BString,
-        target: ObjectId,
-        object: Option<ObjectId>,
-    }
-
-    impl Ref {
-        fn to_item(&self) -> gix_refspec::match_group::Item<'_> {
-            gix_refspec::match_group::Item {
-                full_ref_name: self.name.as_ref(),
-                target: &self.target,
-                object: self.object.as_deref(),
-            }
-        }
     }
 }

@@ -8,6 +8,39 @@
 //! Valid values are the names of hash functions supported by `gix_hash::Kind` (e.g., `sha1`, `sha256`).
 //! If not set, the default hash function via `gix_hash::Kind::default()` is used.
 //!
+//! ### `GIX_TEST_FIXTURE_CACHE` and `GIX_TEST_FIXTURE_SOURCE_ROOT`
+//!
+//! Set both to absolute paths to share generated read-only scripted fixtures across equivalent source
+//! snapshots within one owned test run.
+//!
+//! A source snapshot is a source tree kept at a fixed revision or working-tree state for testing, such
+//! as a checkout or an exported copy of the workspace. It contains the crates, fixture scripts and their
+//! inputs, not the generated fixtures. Equivalent snapshots can live at different absolute paths.
+//!
+//! - `GIX_TEST_FIXTURE_SOURCE_ROOT` names the current snapshot's workspace root, for example
+//!   `/tmp/qa-run-123/snapshot-a`, not a crate directory or its `tests/fixtures` directory.
+//!   An example fixture script would be at
+//!   `/tmp/qa-run-123/snapshot-a/gix-discover/tests/fixtures/make_nested_repos.sh`.
+//! - `GIX_TEST_FIXTURE_CACHE` names the shared output directory, for example
+//!   `/tmp/qa-run-123/fixture-cache`. Use a fresh cache namespace for each owned test run.
+//!   When shared caching applies, that script's generated test files are under
+//!   `/tmp/qa-run-123/fixture-cache/<key>/fixture-<suffix>/`, including `.git/HEAD` and
+//!   `inner/.git/HEAD`. Here `<key>` is the fixture-identity hash and `<suffix>` is a random directory suffix.
+//!
+//! Tests in a second equivalent snapshot at `/tmp/qa-run-123/snapshot-b` use that path for
+//! `GIX_TEST_FIXTURE_SOURCE_ROOT` but keep `GIX_TEST_FIXTURE_CACHE` pointing to the same
+//! `/tmp/qa-run-123/fixture-cache`. Crate and script paths are keyed relative to the source root, allowing
+//! equivalent requests from both snapshots to reuse a generated fixture despite their different roots.
+//!
+//! ## Script Isolation
+//!
+//! Fixture scripts and [`git()`] use `GIT_CONFIG_PARAMETERS` to disable signing and automatic maintenance
+//! and set `init.defaultBranch=main` and `core.longpaths=true`. The latter lets Git for Windows use long paths
+//! without depending on external configuration. A script's own `GIT_CONFIG_COUNT` entries coexist with this
+//! configuration, with isolation taking precedence for shared keys. Explicit `git -c` options can override isolation.
+//! Bash fixtures trace commands to a separate descriptor so redirected stderr baselines remain unchanged.
+//! Bash older than 4.1 reports failed commands instead. Captured diagnostics are printed only on failure.
+//!
 
 //! ## Feature Flags
 #![cfg_attr(
@@ -18,6 +51,7 @@
 #![deny(missing_docs)]
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, HashMap},
     env,
     ffi::{OsStr, OsString},
@@ -37,37 +71,77 @@ use std::sync::LazyLock;
 
 pub use tempfile;
 
+/// Shared setup for tests involving Git-compatible signatures.
+pub mod signature;
+
+/// Capture complete, stable repository state for integration-test assertions.
+pub mod repository;
+
+mod fixture_cache;
+
 const ARCHIVE_DIR_NAME: &str = "generated-archives";
+const BASH_FIXTURE_PRELUDE: &str = include_str!("scripted_fixture_prelude.sh");
 
 /// A result type to allow using the try operator `?` in unit tests.
 ///
 /// Use it like so:
 ///
 /// ```no_run
-/// use gix_testtools::Result;
+/// use gix_testtools::TestResult;
 ///
 /// #[test]
-/// fn this() -> Result {
+/// fn this() -> TestResult {
 ///     let x: usize = "42".parse()?;
 ///     Ok(())
 ///
 /// }
 /// ```
+pub use gix_error::TestResult;
+
+/// A result type for reusable test helpers.
 pub type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 /// A result type for post-processing closures in `*_with_post` fixture functions.
 ///
 /// The closure can return any value `T`, which will be returned alongside the fixture path.
 /// This is useful for computing values based on the fixture contents.
-pub type PostResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+pub type PostResult<T = ()> = Result<T>;
+
+/// Rename `from` to `to`, replacing an existing file even if it is read-only.
+///
+/// On Windows, retry a permission-denied rename after clearing the destination's read-only flag.
+/// On other platforms, this is equivalent to [`std::fs::rename()`], which can replace read-only files.
+/// The replacement retains the source's permissions. If the retry fails, the destination's read-only
+/// flag is not restored. Only use this on writable fixtures or during fixture initialization, and drop
+/// any memory mappings before replacing their backing file.
+pub fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> std::io::Result<()> {
+    let (from, to) = (from.as_ref(), to.as_ref());
+    let result = std::fs::rename(from, to);
+    #[cfg(windows)]
+    if result
+        .as_ref()
+        .is_err_and(|err| err.kind() == std::io::ErrorKind::PermissionDenied)
+    {
+        let mut permissions = std::fs::metadata(to)?.permissions();
+        if permissions.readonly() {
+            #[expect(clippy::permissions_set_readonly_false, reason = "this block only runs on Windows")]
+            permissions.set_readonly(false);
+            std::fs::set_permissions(to, permissions)?;
+        }
+        return std::fs::rename(from, to);
+    }
+    result
+}
 
 /// Build `example` from `package` and copy the executable to this test process' temporary target directory.
 ///
 /// The returned executable path is stable for the lifetime of the test process and avoids races with other
 /// concurrently running tests that may cause Cargo to update the shared example binary in `target/debug/examples`.
+/// Build in the original workspace so relocated nextest runs reuse that same target directory.
 pub fn build_example_for_test(package: &str, example: &str, target_tmpdir: impl Into<PathBuf>) -> PathBuf {
     let mut cargo = std::process::Command::new(env::var_os("CARGO").unwrap_or_else(|| OsString::from(env!("CARGO"))));
     let res = cargo
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
         .args(["build", "-p", package, "--example", example])
         .status()
         .expect("cargo should run fine");
@@ -98,7 +172,7 @@ pub fn build_example_for_test(package: &str, example: &str, target_tmpdir: impl 
         }
     }
     panic!(
-        "driver at {} could be copied for stable test execution: {last_err:?}",
+        "driver at \"{}\" could be copied for stable test execution: {last_err:?}",
         shared_path.display()
     );
 }
@@ -252,14 +326,40 @@ impl Drop for GitDaemon {
 static SCRIPT_IDENTITY: LazyLock<Mutex<BTreeMap<PathBuf, u32>>> = LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
 #[cfg(feature = "worktree-exclusions")]
-static EXCLUDE_LUT: LazyLock<Mutex<Option<gix_worktree::Stack>>> = LazyLock::new(|| {
+type ExcludeCache = (gix_worktree::Stack, Option<gix_worktree::index::File>);
+
+#[cfg(feature = "worktree-exclusions")]
+static EXCLUDE_LUT: LazyLock<Mutex<Option<ExcludeCache>>> = LazyLock::new(|| {
     let cache = (|| {
         let (repo_path, _) = gix_discover::upwards(Path::new(".")).ok()?;
         let (gix_dir, work_tree) = repo_path.into_repository_and_work_tree_directories();
         let work_tree = work_tree?.canonicalize().ok()?;
 
         let mut buf = Vec::with_capacity(512);
-        let case = if gix_fs::Capabilities::probe(&work_tree).ignore_case {
+        // Read the repository's case policy instead of creating filesystem probes in the source checkout.
+        let common_dir = gix_discover::path::from_plain_file_relative_to_file(&gix_dir.join("commondir"))
+            .transpose()
+            .ok()?
+            .unwrap_or_else(|| gix_dir.clone());
+        let mut config =
+            gix_config::File::from_path_no_includes(common_dir.join("config"), gix_config::Source::Local).ok()?;
+        if config
+            .boolean_by("extensions", None, "worktreeConfig")
+            .ok()?
+            .unwrap_or(false)
+            && let Ok(worktree_config) =
+                gix_config::File::from_path_no_includes(gix_dir.join("config.worktree"), gix_config::Source::Worktree)
+        {
+            config.append(worktree_config).ok()?;
+        }
+        let ignore_case = config.boolean_by("core", None, "ignoreCase").ok()?.unwrap_or(false);
+        let object_hash = match config.string_by("extensions", None, "objectFormat") {
+            Some(format) => gix_hash::Kind::from_str(format.to_str().ok()?).ok()?,
+            None => gix_hash::Kind::from_str("sha1").ok()?,
+        };
+        let index =
+            gix_worktree::index::File::at_or_default(gix_dir.join("index"), object_hash, true, Default::default()).ok();
+        let case = if ignore_case {
             gix_worktree::ignore::glob::pattern::Case::Fold
         } else {
             Default::default()
@@ -279,13 +379,8 @@ static EXCLUDE_LUT: LazyLock<Mutex<Option<gix_worktree::Stack>>> = LazyLock::new
             gix_worktree::stack::state::ignore::Source::WorktreeThenIdMappingIfNotSkipped,
             Default::default(),
         ));
-        Some(gix_worktree::Stack::new(
-            work_tree,
-            state,
-            case,
-            buf,
-            Default::default(),
-        ))
+        let stack = gix_worktree::Stack::new(work_tree, state, case, buf, Default::default());
+        Some((stack, index))
     })();
     Mutex::new(cache)
 });
@@ -298,9 +393,16 @@ impl IsExcluded for WorktreeExclusions {
     fn is_excluded(&self, archive: &Path) -> bool {
         let mut lut = EXCLUDE_LUT.lock();
         lut.as_mut()
-            .and_then(|cache| {
+            .and_then(|(cache, index)| {
                 let archive = env::current_dir().ok()?.join(archive);
                 let relative_path = archive.strip_prefix(cache.base()).ok()?;
+                let git_path = gix_path::to_unix_separators_on_windows(gix_path::into_bstr(relative_path).ok()?);
+                if index
+                    .as_ref()
+                    .is_some_and(|index| index.entry_index_by_path(git_path.as_bstr()).is_ok())
+                {
+                    return Some(false);
+                }
                 cache
                     .at_path(
                         relative_path,
@@ -340,24 +442,18 @@ fn default_excludes() -> &'static dyn IsExcluded {
     &GITIGNORE_EXCLUSIONS
 }
 
-#[cfg(windows)]
-const GIT_PROGRAM: &str = "git.exe";
-#[cfg(not(windows))]
-const GIT_PROGRAM: &str = "git";
-
-const DISABLE_AUTO_MAINTENANCE_CONFIG: &[(&str, &str)] = &[("maintenance.auto", "false"), ("gc.auto", "0")];
-
 const ISOLATED_GIT_CONFIG: &[(&str, &str)] = &[
     ("commit.gpgsign", "false"),
     ("tag.gpgsign", "false"),
     ("init.defaultBranch", "main"),
+    ("core.longpaths", "true"),
     ("protocol.file.allow", "always"),
     ("maintenance.auto", "false"),
     ("gc.auto", "0"),
 ];
 
 static GIT_CORE_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
-    let output = std::process::Command::new(GIT_PROGRAM)
+    let output = git_command(".")
         .arg("--exec-path")
         .output()
         .expect("can execute `git --exec-path`");
@@ -377,8 +473,20 @@ static GIT_CORE_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
 pub static GIT_VERSION: LazyLock<(u8, u8, u8)> =
     LazyLock::new(|| parse_git_version().expect("git version to be parsable"));
 
-/// Define how [`scripted_fixture_writable_with_args()`] and [`rust_fixture_writable()`]
-/// produces the writable copy.
+/// The major, minor and patch level of Git resolved inside [`bash_program()`], with fixture-script isolation.
+///
+/// Unlike [`GIT_VERSION`], this accounts for Git Bash adjusting `PATH` on Windows. Scripted fixture version gates
+/// use this value. It assumes fixture scripts do not select a different Git themselves.
+///
+/// # Panics
+///
+/// If Bash or Git cannot be executed, or Git's version output cannot be parsed.
+pub static GIT_BASH_VERSION: LazyLock<(u8, u8, u8)> =
+    LazyLock::new(|| parse_git_bash_version().expect("Git version inside fixture Bash to be parsable"));
+
+/// Define how [`scripted_fixture_writable_with_args()`],
+/// [`scripted_fixture_writable_with_args_with_git_version()`], and [`rust_fixture_writable()`]
+/// produce the writable fixture.
 pub enum Creation {
     /// Run the code once and copy the data from its output to the writable location.
     /// This is fast but won't work if absolute paths are produced by the script.
@@ -406,7 +514,23 @@ pub fn should_skip_as_git_version_is_smaller_than(major: u8, minor: u8, patch: u
 }
 
 fn parse_git_version() -> Result<(u8, u8, u8)> {
-    let output = std::process::Command::new(GIT_PROGRAM).arg("--version").output()?;
+    let output = git_command(".").arg("--version").output()?;
+    git_version_from_bytes(&output.stdout)
+}
+
+fn parse_git_bash_version() -> Result<(u8, u8, u8)> {
+    let mut cmd = command_with_environment_snapshot(bash_program());
+    let output = configure_git_environment(&mut cmd, ".")
+        .args(["-c", "git --version"])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "Failed to query Git version inside fixture Bash: {}: {}",
+            output.status,
+            output.stderr.as_bstr()
+        )
+        .into());
+    }
     git_version_from_bytes(&output.stdout)
 }
 
@@ -458,16 +582,12 @@ impl Drop for AutoRevertToPreviousCWD {
     }
 }
 
-/// Run `git` in `working_dir` with all provided `args`.
+/// Run isolated `git` in `working_dir` with all provided `args`.
 pub fn run_git(working_dir: &Path, args: &[&str]) -> std::io::Result<std::process::ExitStatus> {
-    let mut cmd = std::process::Command::new(GIT_PROGRAM);
-    apply_git_config_by_environment(&mut cmd, DISABLE_AUTO_MAINTENANCE_CONFIG)
-        .current_dir(working_dir)
-        .args(args)
-        .status()
+    git_command(working_dir).args(args).status()
 }
 
-/// Run `script` with [`bash_program()`] in `cwd`.
+/// Run `script` with [`bash_program()`] in `cwd`, with the same isolation as [`git_command()`].
 ///
 /// Standard input is disconnected while standard output and error stay attached to the inherited
 /// handles.
@@ -476,8 +596,8 @@ pub fn run_git(working_dir: &Path, args: &[&str]) -> std::io::Result<std::proces
 ///
 /// This function expects the script to succeed and will panic otherwise.
 pub fn invoke_bash(cwd: impl AsRef<Path>, script: &str) {
-    let mut cmd = std::process::Command::new(bash_program());
-    let status = apply_git_config_by_environment(&mut cmd, DISABLE_AUTO_MAINTENANCE_CONFIG)
+    let mut cmd = command_with_environment_snapshot(bash_program());
+    let status = configure_git_environment(&mut cmd, cwd.as_ref())
         .current_dir(cwd)
         .arg("-c")
         .arg(script)
@@ -514,9 +634,12 @@ fn spawn_git_daemon_process(working_dir: impl AsRef<Path>) -> std::io::Result<Gi
     };
 
     let child = {
-        let mut cmd =
-            std::process::Command::new(GIT_CORE_DIR.join(if cfg!(windows) { "git-daemon.exe" } else { "git-daemon" }));
-        apply_git_config_by_environment(&mut cmd, DISABLE_AUTO_MAINTENANCE_CONFIG)
+        let mut cmd = command_with_environment_snapshot(GIT_CORE_DIR.join(if cfg!(windows) {
+            "git-daemon.exe"
+        } else {
+            "git-daemon"
+        }));
+        configure_git_environment(&mut cmd, working_dir.as_ref())
             .current_dir(working_dir)
             .args(["--verbose", "--base-path=.", "--export-all", "--user-path"])
             .arg(format!("--port={free_port}"))
@@ -576,8 +699,7 @@ fn spawn_git_daemon_inetd(working_dir: impl AsRef<Path>) -> std::io::Result<GitD
                     Err(_) => continue,
                 };
                 let stdout = stream_to_stdio(stream);
-                let mut cmd = std::process::Command::new(GIT_PROGRAM);
-                let Ok(mut child) = apply_git_config_by_environment(&mut cmd, DISABLE_AUTO_MAINTENANCE_CONFIG)
+                let Ok(mut child) = git_command(&working_dir)
                     .args([
                         "-c",
                         "uploadpack.allowrefinwant",
@@ -647,6 +769,14 @@ enum ArchivePolicy {
     Require,
 }
 
+fn archive_policy_for_git_version(is_git_version_compatible: impl FnOnce((u8, u8, u8)) -> bool) -> ArchivePolicy {
+    if is_git_version_compatible(*GIT_BASH_VERSION) {
+        ArchivePolicy::Normal
+    } else {
+        ArchivePolicy::Require
+    }
+}
+
 impl ArchivePolicy {
     /// Return the subdirectory used to keep this policy's extracted fixture separate.
     /// This way fixtures extracted from a test that has a stricter policy will not accidentally
@@ -690,7 +820,7 @@ fn fixture_base() -> PathBuf {
 pub fn fixture_bytes(path: impl AsRef<Path>) -> Vec<u8> {
     match std::fs::read(fixture_path(path.as_ref())) {
         Ok(res) => res,
-        Err(_) => panic!("File at '{}' not found", path.as_ref().display()),
+        Err(_) => panic!("File at \"{}\" not found", path.as_ref().display()),
     }
 }
 
@@ -698,6 +828,7 @@ pub fn fixture_bytes(path: impl AsRef<Path>) -> Vec<u8> {
 /// the path is returned.
 ///
 /// Note that it persists and the script at `script_name` will only be executed once if it ran without error.
+/// Inherited `GIT_TEMPLATE_DIR` is cleared; Git's installed templates remain available.
 ///
 /// ### Automatic Archive Creation
 ///
@@ -716,8 +847,64 @@ pub fn fixture_bytes(path: impl AsRef<Path>) -> Vec<u8> {
 /// or more specific `.gitignore` configurations in lower levels of the work tree.
 ///
 /// The latter is useful if the script's output is platform specific.
+/// With the `worktree-exclusions` feature, archives tracked in the source worktree's index remain eligible for
+/// regeneration even when ignored or missing from disk.
+///
+/// ### Bash Symlink Preflight
+///
+/// Scripts with the `.sh` extension run in Bash with an injected `gix_testtools_require_symlinks`
+/// function. Call it before creating fixture contents: it probes a link to an existing file in the
+/// fixture filesystem, records the result, and exits the script successfully if symlink creation is
+/// unavailable. Other setup errors still fail the script. Tests must call [`fixture_has_symlinks()`]
+/// before accessing the resulting fixture, which may be incomplete when the preflight fails.
+///
+/// Ignore archives for these fixtures, as the preflight result is host-dependent. Prefer read-only
+/// fixtures when tests only inspect their contents; record Git baselines in the script instead of
+/// invoking Git again in Rust. Use [`Creation::Execute`] when tests must mutate the fixture:
+/// [`Creation::CopyFromReadOnly`] does not preserve links.
+/// The prelude is injected only into the Bash instance running the script, not into child shells
+/// or non-shell fixture programs.
 pub fn scripted_fixture_read_only(script_name: impl AsRef<Path>) -> Result<PathBuf> {
     scripted_fixture_read_only_with_args(script_name, None::<String>)
+}
+
+/// Return whether a Bash fixture's `gix_testtools_require_symlinks` preflight succeeded.
+///
+/// Pass the fixture root, even if the script changed directories before running the preflight.
+/// An unavailable preflight prints its diagnostic and returns `Ok(false)` so the test can return
+/// early. Missing, malformed, or unreadable results are errors, not reasons to skip a test.
+/// A missing result explains that the Bash script must call `gix_testtools_require_symlinks`.
+/// A successful preflight is not a substitute for asserting that the fixture's actual links exist.
+pub fn fixture_has_symlinks(fixture_root: impl AsRef<Path>) -> std::io::Result<bool> {
+    let marker = fixture_root.as_ref().join("__gix_testtools_symlinks__");
+    let result = std::fs::read_to_string(&marker).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            std::io::Error::new(
+                err.kind(),
+                format!(
+                    "Missing symlink preflight result at \"{}\": fixture_has_symlinks() requires the Bash fixture script to call gix_testtools_require_symlinks before creating fixture contents. Pass the fixture root, not a repository subdirectory.",
+                    marker.display()
+                ),
+            )
+        } else {
+            err
+        }
+    })?;
+    if result == "supported\n" {
+        return Ok(true);
+    }
+    if let Some(diagnostic) = result.strip_prefix("unsupported\n") {
+        eprintln!(
+            "Skipping fixture at \"{}\": symlink creation is unavailable: {}",
+            fixture_root.as_ref().display(),
+            diagnostic.trim()
+        );
+        return Ok(false);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("Invalid symlink preflight result at \"{}\"", marker.display()),
+    ))
 }
 
 /// Like [`scripted_fixture_read_only()`], but uses a matching existing archive even if
@@ -732,6 +919,7 @@ pub fn scripted_fixture_read_only(script_name: impl AsRef<Path>) -> Result<PathB
 /// fixtures where rerunning the producer can legitimately change
 /// without changing semantics, for example when Git writes entries in filesystem
 /// traversal order.
+/// For fixtures requiring a particular Git version, use [`scripted_fixture_read_only_with_git_version()`] instead.
 pub fn scripted_fixture_read_only_needs_archive(script_name: impl AsRef<Path>) -> Result<PathBuf> {
     scripted_fixture_read_only_with_args_inner::<fn(FixtureState<'_>) -> PostResult, ()>(
         script_name,
@@ -748,7 +936,7 @@ pub fn scripted_fixture_read_only_needs_archive(script_name: impl AsRef<Path>) -
 /// Produce a read-only scripted fixture when the installed Git version is compatible, or extract it from a matching
 /// archive otherwise.
 ///
-/// `is_git_version_compatible` receives [`GIT_VERSION`]. If it returns `true`, this behaves like
+/// `is_git_version_compatible` receives [`GIT_BASH_VERSION`]. If it returns `true`, this behaves like
 /// [`scripted_fixture_read_only()`]. Otherwise, `GIX_TEST_IGNORE_ARCHIVES` is ignored and the fixture is only made
 /// available by extracting an archive whose identity matches the fixture script. The script is never run with an
 /// incompatible Git version, and `None` is returned if no matching archive is available.
@@ -767,6 +955,23 @@ pub fn scripted_fixture_writable(script_name: impl AsRef<Path>) -> Result<tempfi
     scripted_fixture_writable_with_args(script_name, None::<String>, Creation::CopyFromReadOnly)
 }
 
+/// Produce a writable scripted fixture when the installed Git version is compatible, or extract it from a matching
+/// archive otherwise.
+///
+/// This is the writable equivalent of [`scripted_fixture_read_only_with_git_version()`]. It returns `None` when Git is
+/// incompatible and no matching archive is available.
+pub fn scripted_fixture_writable_with_git_version(
+    script_name: impl AsRef<Path>,
+    is_git_version_compatible: impl FnOnce((u8, u8, u8)) -> bool,
+) -> Result<Option<tempfile::TempDir>> {
+    scripted_fixture_writable_with_args_with_git_version(
+        script_name,
+        None::<String>,
+        Creation::CopyFromReadOnly,
+        is_git_version_compatible,
+    )
+}
+
 /// Like [`scripted_fixture_writable()`], but passes `args` to `script_name` while providing control over
 /// the way files are created with `mode`.
 pub fn scripted_fixture_writable_with_args(
@@ -781,8 +986,29 @@ pub fn scripted_fixture_writable_with_args(
         ArgsInHash::Yes,
         default_excludes(),
         None::<(u32, _)>,
+        ArchivePolicy::Normal,
     )
-    .map(|(dir, _)| dir)
+    .map(|fixture| fixture.expect("normal fixtures fall back to generation").0)
+}
+
+/// Like [`scripted_fixture_writable_with_git_version()`], but passes `args` to `script_name` while providing control
+/// over the way files are created with `mode`.
+pub fn scripted_fixture_writable_with_args_with_git_version(
+    script_name: impl AsRef<Path>,
+    args: impl IntoIterator<Item = impl Into<String>>,
+    mode: Creation,
+    is_git_version_compatible: impl FnOnce((u8, u8, u8)) -> bool,
+) -> Result<Option<tempfile::TempDir>> {
+    scripted_fixture_writable_with_args_inner::<fn(FixtureState<'_>) -> PostResult, ()>(
+        script_name,
+        args,
+        mode,
+        ArgsInHash::Yes,
+        default_excludes(),
+        None::<(u32, _)>,
+        archive_policy_for_git_version(is_git_version_compatible),
+    )
+    .map(|fixture| fixture.map(|(dir, _)| dir))
 }
 
 /// Like [`scripted_fixture_writable()`], but passes `args` to `script_name` while providing control over
@@ -801,8 +1027,28 @@ pub fn scripted_fixture_writable_with_args_single_archive(
         ArgsInHash::No,
         default_excludes(),
         None::<(u32, _)>,
+        ArchivePolicy::Normal,
     )
-    .map(|(dir, _)| dir)
+    .map(|fixture| fixture.expect("normal fixtures fall back to generation").0)
+}
+
+/// Like [`scripted_fixture_writable_with_args_with_git_version()`], but uses a single archive for all argument sets.
+pub fn scripted_fixture_writable_with_args_single_archive_with_git_version(
+    script_name: impl AsRef<Path>,
+    args: impl IntoIterator<Item = impl Into<String>>,
+    mode: Creation,
+    is_git_version_compatible: impl FnOnce((u8, u8, u8)) -> bool,
+) -> Result<Option<tempfile::TempDir>> {
+    scripted_fixture_writable_with_args_inner::<fn(FixtureState<'_>) -> PostResult, ()>(
+        script_name,
+        args,
+        mode,
+        ArgsInHash::No,
+        default_excludes(),
+        None::<(u32, _)>,
+        archive_policy_for_git_version(is_git_version_compatible),
+    )
+    .map(|fixture| fixture.map(|(dir, _)| dir))
 }
 
 fn scripted_fixture_writable_with_args_inner<F, T>(
@@ -812,42 +1058,47 @@ fn scripted_fixture_writable_with_args_inner<F, T>(
     args_in_hash: ArgsInHash,
     excludes: &dyn IsExcluded,
     mut post_process: Option<(u32, F)>,
-) -> Result<(tempfile::TempDir, Option<T>)>
+    archive_policy: ArchivePolicy,
+) -> Result<Option<(tempfile::TempDir, Option<T>)>>
 where
     F: FnMut(FixtureState<'_>) -> PostResult<T>,
 {
     let dst = tempfile::TempDir::new()?;
-    Ok(match mode {
+    match mode {
         Creation::CopyFromReadOnly => {
             // Create the read-only fixture with post_process (modifications are cached)
-            let (ro_dir, _res_ignored) = scripted_fixture_read_only_with_args_inner(
+            let Some((ro_dir, post_result)) = scripted_fixture_read_only_with_args_inner(
                 script_name,
                 args,
                 None,
                 args_in_hash,
                 excludes,
                 post_process.as_mut().map(|(v, f)| (*v, f)),
-                ArchivePolicy::Normal,
+                archive_policy,
             )?
-            .expect("normal fixtures fall back to generation");
+            else {
+                return Ok(None);
+            };
             copy_recursively_into_existing_dir(ro_dir, dst.path())?;
-            (dst, _res_ignored)
+            Ok(Some((dst, post_result)))
         }
         Creation::Execute => {
             // Execute directly in the temp dir with post_process
-            let (_, post_result) = scripted_fixture_read_only_with_args_inner(
+            let Some((_, post_result)) = scripted_fixture_read_only_with_args_inner(
                 script_name,
                 args,
                 dst.path().into(),
                 args_in_hash,
                 excludes,
                 post_process.as_mut().map(|(v, f)| (*v, f)),
-                ArchivePolicy::Normal,
+                archive_policy,
             )?
-            .expect("normal fixtures fall back to generation");
-            (dst, post_result)
+            else {
+                return Ok(None);
+            };
+            Ok(Some((dst, post_result)))
         }
-    })
+    }
 }
 
 /// A utility to copy the entire contents of `src_dir` into `dst_dir`.
@@ -892,11 +1143,6 @@ pub fn scripted_fixture_read_only_with_args_with_git_version(
     args: impl IntoIterator<Item = impl Into<String>>,
     is_git_version_compatible: impl FnOnce((u8, u8, u8)) -> bool,
 ) -> Result<Option<PathBuf>> {
-    let archive_policy = if is_git_version_compatible(*GIT_VERSION) {
-        ArchivePolicy::Normal
-    } else {
-        ArchivePolicy::Require
-    };
     scripted_fixture_read_only_with_args_inner::<fn(FixtureState<'_>) -> PostResult, ()>(
         script_name,
         args,
@@ -904,7 +1150,7 @@ pub fn scripted_fixture_read_only_with_args_with_git_version(
         ArgsInHash::Yes,
         default_excludes(),
         None::<(u32, _)>,
-        archive_policy,
+        archive_policy_for_git_version(is_git_version_compatible),
     )
     .map(|fixture| fixture.map(|(dir, _)| dir))
 }
@@ -936,6 +1182,24 @@ pub fn scripted_fixture_read_only_with_args_single_archive(
     .map(|fixture| fixture.expect("normal fixtures fall back to generation").0)
 }
 
+/// Like [`scripted_fixture_read_only_with_args_with_git_version()`], but uses a single archive for all argument sets.
+pub fn scripted_fixture_read_only_with_args_single_archive_with_git_version(
+    script_name: impl AsRef<Path>,
+    args: impl IntoIterator<Item = impl Into<String>>,
+    is_git_version_compatible: impl FnOnce((u8, u8, u8)) -> bool,
+) -> Result<Option<PathBuf>> {
+    scripted_fixture_read_only_with_args_inner::<fn(FixtureState<'_>) -> PostResult, ()>(
+        script_name,
+        args,
+        None,
+        ArgsInHash::No,
+        default_excludes(),
+        None::<(u32, _)>,
+        archive_policy_for_git_version(is_git_version_compatible),
+    )
+    .map(|fixture| fixture.map(|(dir, _)| dir))
+}
+
 /// Like [`scripted_fixture_read_only`], but runs a Rust closure after the script completes.
 ///
 /// - `version` should be incremented when the closure's behavior changes to invalidate the cache.
@@ -964,6 +1228,22 @@ pub fn scripted_fixture_read_only_with_post<T>(
     })
 }
 
+/// Like [`scripted_fixture_read_only_with_git_version()`], but runs a Rust closure after the script completes.
+pub fn scripted_fixture_read_only_with_post_with_git_version<T>(
+    script_name: impl AsRef<Path>,
+    version: u32,
+    post_process: impl FnMut(FixtureState<'_>) -> PostResult<T>,
+    is_git_version_compatible: impl FnOnce((u8, u8, u8)) -> bool,
+) -> Result<Option<(PathBuf, T)>> {
+    scripted_fixture_read_only_with_args_with_post_with_git_version(
+        script_name,
+        None::<String>,
+        version,
+        post_process,
+        is_git_version_compatible,
+    )
+}
+
 /// Like [`scripted_fixture_read_only_with_args`], but runs a Rust closure after the script completes.
 ///
 /// See [`scripted_fixture_read_only_with_post`] for details on the closure behavior.
@@ -986,6 +1266,26 @@ pub fn scripted_fixture_read_only_with_args_with_post<T>(
         let (path, opt) = fixture.expect("normal fixtures fall back to generation");
         (path, opt.expect("post_process was provided"))
     })
+}
+
+/// Like [`scripted_fixture_read_only_with_args_with_git_version()`], but runs a Rust closure after the script completes.
+pub fn scripted_fixture_read_only_with_args_with_post_with_git_version<T>(
+    script_name: impl AsRef<Path>,
+    args: impl IntoIterator<Item = impl Into<String>>,
+    version: u32,
+    post_process: impl FnMut(FixtureState<'_>) -> PostResult<T>,
+    is_git_version_compatible: impl FnOnce((u8, u8, u8)) -> bool,
+) -> Result<Option<(PathBuf, T)>> {
+    scripted_fixture_read_only_with_args_inner(
+        script_name,
+        args,
+        None,
+        ArgsInHash::Yes,
+        default_excludes(),
+        Some((version, post_process)),
+        archive_policy_for_git_version(is_git_version_compatible),
+    )
+    .map(|fixture| fixture.map(|(path, opt)| (path, opt.expect("post_process was provided"))))
 }
 
 /// Like [`scripted_fixture_read_only_with_args_single_archive`], but runs a Rust closure after the script completes.
@@ -1012,6 +1312,27 @@ pub fn scripted_fixture_read_only_with_args_single_archive_with_post<T>(
     })
 }
 
+/// Like [`scripted_fixture_read_only_with_args_single_archive_with_git_version()`], but runs a Rust closure after the
+/// script completes.
+pub fn scripted_fixture_read_only_with_args_single_archive_with_post_with_git_version<T>(
+    script_name: impl AsRef<Path>,
+    args: impl IntoIterator<Item = impl Into<String>>,
+    version: u32,
+    post_process: impl FnMut(FixtureState<'_>) -> PostResult<T>,
+    is_git_version_compatible: impl FnOnce((u8, u8, u8)) -> bool,
+) -> Result<Option<(PathBuf, T)>> {
+    scripted_fixture_read_only_with_args_inner(
+        script_name,
+        args,
+        None,
+        ArgsInHash::No,
+        default_excludes(),
+        Some((version, post_process)),
+        archive_policy_for_git_version(is_git_version_compatible),
+    )
+    .map(|fixture| fixture.map(|(path, opt)| (path, opt.expect("post_process was provided"))))
+}
+
 /// Like [`scripted_fixture_writable`], but runs a Rust closure after the script completes.
 ///
 /// - `version` should be incremented when the closure's behavior changes to invalidate the cache.
@@ -1032,8 +1353,29 @@ pub fn scripted_fixture_writable_with_post<T>(
         ArgsInHash::Yes,
         default_excludes(),
         Some((version, post_process)),
+        ArchivePolicy::Normal,
     )
-    .map(|(tmp, opt)| (tmp, opt.expect("post_process was provided")))
+    .map(|fixture| {
+        let (tmp, opt) = fixture.expect("normal fixtures fall back to generation");
+        (tmp, opt.expect("post_process was provided"))
+    })
+}
+
+/// Like [`scripted_fixture_writable_with_git_version()`], but runs a Rust closure after the script completes.
+pub fn scripted_fixture_writable_with_post_with_git_version<T>(
+    script_name: impl AsRef<Path>,
+    version: u32,
+    post_process: impl FnMut(FixtureState<'_>) -> PostResult<T>,
+    is_git_version_compatible: impl FnOnce((u8, u8, u8)) -> bool,
+) -> Result<Option<(tempfile::TempDir, T)>> {
+    scripted_fixture_writable_with_args_with_post_with_git_version(
+        script_name,
+        None::<String>,
+        Creation::CopyFromReadOnly,
+        version,
+        post_process,
+        is_git_version_compatible,
+    )
 }
 
 /// Like [`scripted_fixture_writable_with_args`], but runs a Rust closure after the script completes.
@@ -1053,8 +1395,33 @@ pub fn scripted_fixture_writable_with_args_with_post<T>(
         ArgsInHash::Yes,
         default_excludes(),
         Some((version, post_process)),
+        ArchivePolicy::Normal,
     )
-    .map(|(tmp, opt)| (tmp, opt.expect("post_process was provided")))
+    .map(|fixture| {
+        let (tmp, opt) = fixture.expect("normal fixtures fall back to generation");
+        (tmp, opt.expect("post_process was provided"))
+    })
+}
+
+/// Like [`scripted_fixture_writable_with_args_with_git_version()`], but runs a Rust closure after the script completes.
+pub fn scripted_fixture_writable_with_args_with_post_with_git_version<T>(
+    script_name: impl AsRef<Path>,
+    args: impl IntoIterator<Item = impl Into<String>>,
+    mode: Creation,
+    version: u32,
+    post_process: impl FnMut(FixtureState<'_>) -> PostResult<T>,
+    is_git_version_compatible: impl FnOnce((u8, u8, u8)) -> bool,
+) -> Result<Option<(tempfile::TempDir, T)>> {
+    scripted_fixture_writable_with_args_inner(
+        script_name,
+        args,
+        mode,
+        ArgsInHash::Yes,
+        default_excludes(),
+        Some((version, post_process)),
+        archive_policy_for_git_version(is_git_version_compatible),
+    )
+    .map(|fixture| fixture.map(|(tmp, opt)| (tmp, opt.expect("post_process was provided"))))
 }
 
 /// Like [`scripted_fixture_writable_with_args_single_archive`], but runs a Rust closure after the script completes.
@@ -1074,8 +1441,34 @@ pub fn scripted_fixture_writable_with_args_single_archive_with_post<T>(
         ArgsInHash::No,
         default_excludes(),
         Some((version, post_process)),
+        ArchivePolicy::Normal,
     )
-    .map(|(tmp, opt)| (tmp, opt.expect("post_process was provided")))
+    .map(|fixture| {
+        let (tmp, opt) = fixture.expect("normal fixtures fall back to generation");
+        (tmp, opt.expect("post_process was provided"))
+    })
+}
+
+/// Like [`scripted_fixture_writable_with_args_single_archive_with_git_version()`], but runs a Rust closure after the
+/// script completes.
+pub fn scripted_fixture_writable_with_args_single_archive_with_post_with_git_version<T>(
+    script_name: impl AsRef<Path>,
+    args: impl IntoIterator<Item = impl Into<String>>,
+    mode: Creation,
+    version: u32,
+    post_process: impl FnMut(FixtureState<'_>) -> PostResult<T>,
+    is_git_version_compatible: impl FnOnce((u8, u8, u8)) -> bool,
+) -> Result<Option<(tempfile::TempDir, T)>> {
+    scripted_fixture_writable_with_args_inner(
+        script_name,
+        args,
+        mode,
+        ArgsInHash::No,
+        default_excludes(),
+        Some((version, post_process)),
+        archive_policy_for_git_version(is_git_version_compatible),
+    )
+    .map(|fixture| fixture.map(|(tmp, opt)| (tmp, opt.expect("post_process was provided"))))
 }
 
 /// Execute a Rust closure in a directory, returning a read-only fixture path.
@@ -1098,14 +1491,15 @@ pub fn scripted_fixture_writable_with_args_single_archive_with_post<T>(
 /// Archives can be disabled by using `.gitignore` specifications,
 /// for example `generated-archives/rust-*.tar` or `generated-archives/rust-*.tar.xz`
 /// in the `tests/fixtures` directory.
+/// With the `worktree-exclusions` feature, tracked archives are regenerated despite matching ignore rules.
 ///
 /// ### Example
 ///
 /// ```no_run
-/// use gix_testtools::{Result, FixtureState};
+/// use gix_testtools::{TestResult, FixtureState};
 ///
 /// #[test]
-/// fn test_with_rust_fixture() -> Result {
+/// fn test_with_rust_fixture() -> TestResult {
 ///     let (dir, _) = gix_testtools::rust_fixture_read_only("my_fixture", 1, |state| {
 ///         if let FixtureState::Uninitialized(path) = state {
 ///             std::fs::write(path.join("file.txt"), "content")?;
@@ -1136,10 +1530,10 @@ where
 /// ### Example
 ///
 /// ```no_run
-/// use gix_testtools::{Result, Creation, FixtureState};
+/// use gix_testtools::{TestResult, Creation, FixtureState};
 ///
 /// #[test]
-/// fn test_with_writable_rust_fixture() -> Result {
+/// fn test_with_writable_rust_fixture() -> TestResult {
 ///     let (dir, ()) = gix_testtools::rust_fixture_writable("my_fixture", 1, Creation::CopyFromReadOnly, |state| {
 ///         if let FixtureState::Uninitialized(path) = state {
 ///             std::fs::write(path.join("file.txt"), "content")?;
@@ -1257,6 +1651,7 @@ fn marker_if_needed(
                 archive_name,
                 gix_lock::acquire::Fail::AfterDurationWithBackoff(Duration::from_secs(6 * 60)),
                 None,
+                0,
             )
         })
         .transpose()?)
@@ -1306,70 +1701,74 @@ where
         if failure_marker.is_file() {
             std::fs::remove_dir_all(script_result_directory).map_err(|err| {
                 format!(
-                    "Failed to remove '{script_result_directory}', please try to do that by hand. Original error: {err}",
-                    script_result_directory = script_result_directory.display()
+                    "Failed to remove \"{}\", please try to do that by hand. Original error: {err}",
+                    script_result_directory.display()
                 )
             })?;
         }
         std::fs::create_dir_all(script_result_directory)?;
-        match extract_archive(
-            archive_file_path,
-            script_result_directory,
-            script_identity,
-            archive_policy.ignores_archive_override(),
-        ) {
-            Ok((archive_id, platform)) => {
-                eprintln!(
-                    "Extracted fixture from archive '{}' ({}, {:?})",
-                    archive_file_path.display(),
-                    archive_id,
-                    platform
-                );
-                make_fixture(FixtureState::Fresh(script_result_directory)).map(Some)
-            }
-            Err(err) => {
-                let archive_missing = err.kind() == std::io::ErrorKind::NotFound;
-                let generation_allowed = archive_policy.allows_generation();
-                if !generation_allowed || !archive_missing {
-                    // Remove incomplete output, or an empty required-fixture directory that a later call could
-                    // mistake for a valid cached fixture.
-                    std::fs::remove_dir_all(script_result_directory).map_err(|cleanup_err| {
-                        format!(
-                            "Failed to remove incomplete fixture at '{}': {cleanup_err}",
-                            script_result_directory.display()
-                        )
-                    })?;
-                }
-                if !generation_allowed {
-                    if archive_missing {
-                        return Ok(None);
-                    }
-                    return Err(err.into());
-                }
-                if !archive_missing {
-                    eprintln!("failed to extract '{}': {}", archive_file_path.display(), err);
-                    std::fs::create_dir_all(script_result_directory)?;
-                } else if !excludes.is_excluded(archive_file_path) {
+        // An explicit destination requests execution in that exact location. Normal archives may contain absolute
+        // paths (for example linked-worktree administration files), so extracting one would violate that contract.
+        // Preferred and required archives remain authoritative even with an explicit destination.
+        if !force_run || archive_policy != ArchivePolicy::Normal {
+            match extract_archive(
+                archive_file_path,
+                script_result_directory,
+                script_identity,
+                archive_policy.ignores_archive_override(),
+            ) {
+                Ok((archive_id, platform)) => {
                     eprintln!(
-                        "Archive at '{}' not found, creating fixture {}",
-                        archive_file_path.display(),
-                        description
+                        "Extracted fixture from archive \"{}\" ({archive_id}, {platform:?})",
+                        archive_file_path.display()
                     );
+                    return make_fixture(FixtureState::Fresh(script_result_directory)).map(Some);
                 }
-                let res = match make_fixture(FixtureState::Uninitialized(script_result_directory)) {
-                    Ok(value) => value,
-                    Err(err) => {
-                        write_failure_marker(&failure_marker);
-                        return Err(err);
+                Err(err) => {
+                    let archive_missing = err.kind() == std::io::ErrorKind::NotFound;
+                    let generation_allowed = archive_policy.allows_generation();
+                    if !generation_allowed || !archive_missing {
+                        // Remove incomplete output, or an empty required-fixture directory that a later call could
+                        // mistake for a valid cached fixture.
+                        std::fs::remove_dir_all(script_result_directory).map_err(|cleanup_err| {
+                            format!(
+                                "Failed to remove incomplete fixture at \"{}\": {cleanup_err}",
+                                script_result_directory.display()
+                            )
+                        })?;
                     }
-                };
-                create_archive_if_we_should(script_result_directory, archive_file_path, script_identity, excludes)
-                    .inspect_err(|_err| {
-                        write_failure_marker(&failure_marker);
-                    })?;
-                Ok(Some(res))
+                    if !generation_allowed {
+                        if archive_missing {
+                            return Ok(None);
+                        }
+                        return Err(err.into());
+                    }
+                    if !archive_missing {
+                        eprintln!("failed to extract \"{}\": {err}", archive_file_path.display());
+                        std::fs::create_dir_all(script_result_directory)?;
+                    } else if !excludes.is_excluded(archive_file_path) {
+                        eprintln!(
+                            "Archive at \"{}\" not found, creating fixture {description}",
+                            archive_file_path.display()
+                        );
+                    }
+                }
             }
         }
+        let res = match make_fixture(FixtureState::Uninitialized(script_result_directory)) {
+            Ok(value) => value,
+            Err(err) => {
+                write_failure_marker(&failure_marker);
+                return Err(err);
+            }
+        };
+        if !force_run {
+            create_archive_if_we_should(script_result_directory, archive_file_path, script_identity, excludes)
+                .inspect_err(|_err| {
+                    write_failure_marker(&failure_marker);
+                })?;
+        }
+        Ok(Some(res))
     } else {
         make_fixture(FixtureState::Fresh(script_result_directory)).map(Some)
     }
@@ -1397,13 +1796,14 @@ where
     let script_location = script_name.as_ref();
     let fixture_base = fixture_base();
     let script_path = fixture_path(script_location);
+    let is_bash_fixture = script_location.extension().is_some_and(|ext| ext == "sh");
 
     // keep this lock to assure we don't return unfinished directories for threaded callers
     let args: Vec<String> = args.into_iter().map(Into::into).collect();
     let post_version = post_process.as_ref().map(|(v, _)| *v);
     let script_identity = {
         let mut map = SCRIPT_IDENTITY.lock();
-        let init = if object_hash == gix_hash::Kind::Sha1 {
+        let init = if is_sha1(object_hash) {
             script_path.clone()
         } else {
             script_path.clone().join(object_hash.to_string())
@@ -1419,13 +1819,18 @@ where
             .or_insert_with(|| {
                 let crc_value = crc::Crc::<u32>::new(&crc::CRC_32_CKSUM);
                 let mut crc_digest = crc_value.digest();
-                crc_digest.update(&std::fs::read(&script_path).unwrap_or_else(|err| {
+                let script = std::fs::read(&script_path).unwrap_or_else(|err| {
                     panic!(
-                        "file {script_path} in CWD '{cwd}' could not be read: {err}",
-                        cwd = env::current_dir().expect("valid cwd").display(),
-                        script_path = script_path.display(),
+                        "file \"{}\" in CWD \"{}\" could not be read: {err}",
+                        script_path.display(),
+                        env::current_dir().expect("valid cwd").display(),
                     )
-                }));
+                });
+                crc_digest.update(&script);
+                // Only fixtures using the preflight need regeneration when its implementation changes.
+                if is_bash_fixture && script.contains_str("gix_testtools_require_symlinks") {
+                    crc_digest.update(BASH_FIXTURE_PRELUDE.as_bytes());
+                }
                 for arg in &args {
                     crc_digest.update(arg.as_bytes());
                 }
@@ -1450,7 +1855,7 @@ where
             }
             ArgsInHash::No => "".into(),
         };
-        let potential_hash_suffix = if object_hash == gix_hash::Kind::Sha1 {
+        let potential_hash_suffix = if is_sha1(object_hash) {
             "".into()
         } else {
             format!("_{object_hash}")
@@ -1469,15 +1874,75 @@ where
         &script_identity,
         archive_policy.cache_variant(),
     );
-    let _marker = marker_if_needed(destination_dir, script_basename)?;
-
     let script_identity_for_archive = match args_in_hash {
         ArgsInHash::Yes => script_identity,
         ArgsInHash::No => 0,
     };
     let script_absolute_path = env::current_dir()?.join(&script_path);
+    let shared_cache = if !force_run
+        && archive_policy == ArchivePolicy::Normal
+        && fixture_cache::Cache::is_requested_from_env()
+        && (env::var_os("GIX_TEST_IGNORE_ARCHIVES").is_some() || !archive_file_path.try_exists()?)
+        && (should_skip_all_archive_creation() || excludes.is_excluded(&archive_file_path))
+    {
+        fixture_cache::Cache::from_env(&script_path, &args, object_hash, script_identity, post_version)?
+    } else {
+        None
+    };
     let post_process_closure = post_process.map(|(_, f)| f);
+    let make_fixture = |fixture_state: FixtureState<'_>| {
+        if let FixtureState::Uninitialized(dir) = fixture_state {
+            // Bash 3.2 loses BASH_SOURCE after calling functions defined by `-c`. Sourcing a
+            // temporary prelude file preserves script context without exporting functions.
+            let prelude_file = if is_bash_fixture {
+                let mut file = tempfile::NamedTempFile::new()?;
+                std::io::Write::write_all(file.as_file_mut(), BASH_FIXTURE_PRELUDE.as_bytes())?;
+                Some(file)
+            } else {
+                None
+            };
+            let mut cmd = if let Some(file) = prelude_file.as_ref() {
+                let mut cmd = command_with_environment_snapshot(bash_program());
+                let prelude_path = gix_path::from_bstring(
+                    gix_path::to_unix_separators_on_windows(gix_path::into_bstr(file.path())?).into_owned(),
+                )?;
+                cmd.arg("-c")
+                    .arg("source \"$1\" || exit; shift; source \"$0\" \"$@\"")
+                    .arg(&script_absolute_path)
+                    .arg(prelude_path);
+                cmd
+            } else {
+                command_with_environment_snapshot(&script_absolute_path)
+            };
+            let output = match configure_command(&mut cmd, object_hash, &args, dir).output() {
+                    Ok(out) => out,
+                    Err(err)
+                        if !is_bash_fixture
+                            && (err.kind() == std::io::ErrorKind::PermissionDenied
+                                || err.raw_os_error() == Some(193)) /* windows */ =>
+                    {
+                        cmd = command_with_environment_snapshot(bash_program());
+                        configure_command(cmd.arg(&script_absolute_path), object_hash, &args, dir).output()?
+                    }
+                    Err(err) => return Err(err.into()),
+                };
+            if !output.status.success() {
+                eprintln!("stdout: {}", output.stdout.as_bstr());
+                eprintln!("stderr: {}", output.stderr.as_bstr());
+                return Err(format!("fixture script of {cmd:?} failed with {}", output.status).into());
+            }
+        }
+        if let Some(mut f) = post_process_closure {
+            f(fixture_state).map(Some)
+        } else {
+            Ok(None)
+        }
+    };
 
+    if let Some(cache) = shared_cache {
+        return Ok(Some(cache.obtain(make_fixture)?));
+    }
+    let _marker = marker_if_needed(destination_dir, script_basename)?;
     let res = run_fixture_generator_with_marker_handling(
         &archive_file_path,
         &script_result_directory,
@@ -1485,33 +1950,8 @@ where
         force_run,
         archive_policy,
         excludes,
-        &format!("using script '{}'", script_location.display()),
-        |fixture_state| {
-            if let FixtureState::Uninitialized(dir) = fixture_state {
-                let mut cmd = std::process::Command::new(&script_absolute_path);
-                let output = match configure_command(&mut cmd, object_hash, &args, dir).output() {
-                    Ok(out) => out,
-                    Err(err)
-                        if err.kind() == std::io::ErrorKind::PermissionDenied
-                            || err.raw_os_error() == Some(193) /* windows */ =>
-                    {
-                        cmd = std::process::Command::new(bash_program());
-                        configure_command(cmd.arg(&script_absolute_path), object_hash, &args, dir).output()?
-                    }
-                    Err(err) => return Err(err.into()),
-                };
-                if !output.status.success() {
-                    eprintln!("stdout: {}", output.stdout.as_bstr());
-                    eprintln!("stderr: {}", output.stderr.as_bstr());
-                    return Err(format!("fixture script of {cmd:?} failed").into());
-                }
-            }
-            if let Some(mut f) = post_process_closure {
-                f(fixture_state).map(Some)
-            } else {
-                Ok(None)
-            }
-        },
+        &format!("using script \"{}\"", script_location.display()),
+        make_fixture,
     )?;
 
     Ok(res.map(|res| (script_result_directory, res)))
@@ -1547,6 +1987,10 @@ pub fn object_hash() -> gix_hash::Kind {
     object_hash_from_env().unwrap_or_default()
 }
 
+fn is_sha1(kind: gix_hash::Kind) -> bool {
+    kind.len_in_bytes() == 20
+}
+
 /// Run `git` in `current_dir` with shell-like whitespace-separated `arguments`, returning stdout as UTF-8.
 ///
 /// Note that Git is run as isolated as possible, just like scripts.
@@ -1555,11 +1999,8 @@ pub fn object_hash() -> gix_hash::Kind {
 /// within an argument, for example `commit -m 'a message with spaces'`.
 pub fn git(current_dir: impl AsRef<Path>, arguments: &str) -> Result<String> {
     let args = split_git_arguments(arguments)?;
-    let cwd = current_dir.as_ref();
-    let mut cmd = std::process::Command::new(GIT_PROGRAM);
-    let output = configure_command(&mut cmd, object_hash(), args.iter().map(String::as_str), cwd)
-        .current_dir(cwd)
-        .output()?;
+    let mut cmd = git_command(current_dir);
+    let output = cmd.args(args).output()?;
     if !output.status.success() {
         return Err(format!(
             "{cmd:?} failed with status {}\nstdout: {}\nstderr: {}",
@@ -1570,6 +2011,109 @@ pub fn git(current_dir: impl AsRef<Path>, arguments: &str) -> Result<String> {
         .into());
     }
     Ok(String::from_utf8(output.stdout)?)
+}
+
+/// Prepare an isolated Git command in `current_dir`, using the same environment as fixture scripts.
+///
+/// The inherited environment is captured at construction, so subsequent process-wide changes
+/// cannot bypass the command's isolation before it is spawned.
+/// Use this when [`git()`] cannot express the arguments, input, or expected exit status. Standard I/O
+/// follows [`std::process::Command`] defaults. Add test-specific environment overrides only after
+/// calling this helper, and point any repository or file overrides at disposable test data.
+pub fn git_command(current_dir: impl AsRef<Path>) -> std::process::Command {
+    let mut cmd = command_with_environment_snapshot(gix_path::env::exe_invocation());
+    configure_git_environment(&mut cmd, current_dir.as_ref()).current_dir(current_dir);
+    cmd
+}
+
+/// Capture inheritance before sanitizing it, rather than inheriting again at spawn time.
+/// Otherwise a serial test could add a new `GIT_*` variable after configuration and redirect a
+/// concurrently prepared fixture command to a different repository.
+fn command_with_environment_snapshot(program: impl AsRef<OsStr>) -> std::process::Command {
+    let mut cmd = std::process::Command::new(program);
+    cmd.env_clear().envs(env::vars_os());
+    cmd
+}
+
+/// Isolate Git's environment in the current process, restoring only the variables it alters on drop.
+///
+/// Uses the same settings as [`configure_git_environment()`], with a temporary XDG configuration
+/// directory kept alive by the returned guard. No subprocess is started and the working directory
+/// is not changed. Chain test-specific overrides onto the returned [`Env`], or use a separate
+/// [`Env`] guard so those changes are restored too.
+///
+/// Use this in `#[serial]` tests instead of [`run_in_isolated_process()`]. The caller must serialize
+/// all access to the process environment for the guard's entire lifetime, including its drop.
+/// A serial test attribute only coordinates tests using the same serialization lock; it does not
+/// protect against other tests or background threads accessing the environment. Use subprocess
+/// isolation when this coordination is not possible.
+///
+/// Nested guards must be dropped in reverse creation order. Only variables set or unset through
+/// the guard are restored, including when unwinding a panic; unrelated changes are left alone.
+/// Working-directory changes still require a separate [`set_current_dir()`] guard.
+pub fn isolate_git_environment() -> Result<Env<'static>> {
+    let config_dir = tempfile::TempDir::new()?;
+    let mut cmd = std::process::Command::new(gix_path::env::exe_invocation());
+    configure_git_environment(&mut cmd, config_dir.path());
+    let mut guard = Env {
+        altered_vars: Vec::new(),
+        _config_dir: Some(config_dir),
+    };
+    for (name, value) in cmd.get_envs() {
+        guard.set_or_unset(Cow::Owned(name.to_owned()), value);
+    }
+    Ok(guard)
+}
+
+/// Rerun the current libtest test in an isolated subprocess, returning `true` in the parent.
+///
+/// Call this at the start of tests that must exercise APIs reading the process environment, and
+/// return immediately when it returns `true`. In the child it returns `false`, allowing the test
+/// body to run with Git configuration sanitized before any test threads start. Only this test is
+/// run in the child, so process-wide environment or working-directory changes cannot race other tests.
+/// Parent-side setup and spawning share the default `serial_test` lock with `#[serial]` tests, so
+/// they cannot capture temporary environment values. The lock is released before waiting for the
+/// child, allowing isolated tests to run concurrently. This must not run in a `#[parallel]` scope.
+/// For serial tests that restore their process-wide changes, prefer [`isolate_git_environment()`].
+pub fn run_in_isolated_process() -> Result<bool> {
+    let Some((child, _config_dir)) = spawn_isolated_test()? else {
+        return Ok(false);
+    };
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        let thread = std::thread::current();
+        let name = thread.name().expect("spawning validated the named libtest thread");
+        return Err(format!(
+            "isolated test {name} failed with {}\nstdout: {}\nstderr: {}",
+            output.status,
+            output.stdout.as_bstr(),
+            output.stderr.as_bstr()
+        )
+        .into());
+    }
+    Ok(true)
+}
+
+#[serial_test::serial]
+fn spawn_isolated_test() -> Result<Option<(std::process::Child, tempfile::TempDir)>> {
+    const MARKER: &str = "GIX_TESTTOOLS_ISOLATED_TEST_NAME";
+    let thread = std::thread::current();
+    let name = thread
+        .name()
+        .ok_or("isolation must be requested from a named libtest thread")?;
+    if env::var_os(MARKER).as_deref() == Some(OsStr::new(name)) {
+        return Ok(None);
+    }
+    let config_dir = tempfile::TempDir::new()?;
+    let mut cmd = command_with_environment_snapshot(env::current_exe()?);
+    let child = configure_git_environment(&mut cmd, config_dir.path())
+        .args(["--exact", name, "--nocapture", "--test-threads=1", "--include-ignored"])
+        .env(MARKER, name)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    Ok(Some((child, config_dir)))
 }
 
 fn split_git_arguments(input: &str) -> Result<Vec<String>> {
@@ -1640,6 +2184,147 @@ fn split_git_arguments(input: &str) -> Result<Vec<String>> {
 /// `result.1[n - 1]`.
 pub fn normalize_debug_snapshot(value: &dyn std::fmt::Debug) -> (String, Vec<gix_hash::ObjectId>) {
     normalize_hashes(&format!("{value:#?}"))
+}
+
+/// Prepare a pretty-debug diagnostic for an `insta::assert_debug_snapshot!` assertion.
+///
+/// Apply literal `replacements` (and their debug-escaped spellings) in the given order, then normalize
+/// object IDs with [`normalize_hashes()`]. Supply unstable path prefixes or port numbers explicitly,
+/// preserving meaningful path suffixes. Windows paths also match without their verbatim prefix or
+/// with forward slashes. Windows path suffixes use forward slashes; backslashes in
+/// other input remain unchanged. Use complete paths for unquoted paths containing whitespace.
+/// Platform-specific I/O messages and pretty-debug OS errors are replaced by their [`std::io::ErrorKind`].
+/// Integer conversion error messages are normalized across Rust versions.
+///
+/// The returned value owns its text and implements both [`std::fmt::Debug`] and [`std::fmt::Display`]
+/// without adding quotes or escaping newlines, so either `insta` snapshot macro can be used.
+/// Use [`redact_display_snapshot()`] to format the input with `Display` instead of pretty-debug.
+pub fn redact_debug_snapshot(
+    value: &dyn std::fmt::Debug,
+    replacements: &[(&str, &str)],
+) -> impl std::fmt::Debug + std::fmt::Display + use<> {
+    redact_snapshot(format!("{value:#?}"), replacements)
+}
+
+/// Prepare a display-formatted value for an `insta::assert_snapshot!` assertion.
+///
+/// Apply the same redactions as [`redact_debug_snapshot()`], but format the input with
+/// [`std::fmt::Display`]. This also accepts already-formatted strings without adding quotes or
+/// escaping newlines. The returned value owns its text and implements both `Display` and `Debug`,
+/// so either `insta` snapshot macro can be used without changing the rendered text.
+///
+/// ```
+/// let snapshot = gix_testtools::redact_display_snapshot(
+///     &"read /tmp/random/repo/config failed",
+///     &[("/tmp/random/repo", "<repo>")],
+/// );
+/// assert_eq!(snapshot.to_string(), "read <repo>/config failed");
+/// ```
+pub fn redact_display_snapshot(
+    value: &dyn std::fmt::Display,
+    replacements: &[(&str, &str)],
+) -> impl std::fmt::Debug + std::fmt::Display + use<> {
+    redact_snapshot(format!("{value}"), replacements)
+}
+
+fn redact_snapshot(
+    mut text: String,
+    replacements: &[(&str, &str)],
+) -> impl std::fmt::Debug + std::fmt::Display + use<> {
+    /// Owned redacted text rendered verbatim by both snapshot macros, without `String`'s debug quoting or escaping.
+    struct Diagnostic(String);
+
+    impl std::fmt::Display for Diagnostic {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.0)
+        }
+    }
+
+    impl std::fmt::Debug for Diagnostic {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            std::fmt::Display::fmt(self, f)
+        }
+    }
+    for (from, to) in replacements {
+        let windows_path = from.contains('\\') || (cfg!(windows) && from.contains('/'));
+        let mut prefixes = vec![(*from).to_owned()];
+        if windows_path {
+            let plain = match from.strip_prefix(r"\\?\") {
+                Some(path) => path
+                    .strip_prefix(r"UNC\")
+                    .map_or_else(|| path.to_owned(), |path| format!(r"\\{path}")),
+                None => (*from).to_owned(),
+            };
+            prefixes.push(plain.replace('\\', "/"));
+            prefixes.push(plain);
+        }
+        prefixes.extend(prefixes.clone().iter().map(|prefix| {
+            let escaped = format!("{prefix:?}");
+            escaped[1..escaped.len() - 1].to_owned()
+        }));
+        prefixes.sort();
+        prefixes.dedup();
+        prefixes.sort_by_key(|prefix| std::cmp::Reverse(prefix.len()));
+        for prefix in &prefixes {
+            if !windows_path {
+                text = text.replace(prefix, to);
+                continue;
+            }
+            let paths: Vec<_> = text
+                .match_indices(prefix.as_str())
+                .map(|(start, _)| {
+                    let suffix_start = start + prefix.len();
+                    let quote = text[..start].chars().next_back().filter(|ch| matches!(ch, '\'' | '"'));
+                    // ponytail: whitespace delimits unquoted paths; supply a complete path if it contains spaces.
+                    let suffix_len = match quote {
+                        Some('"') if text[..start].ends_with(r#"\""#) => text[suffix_start..].find(r#"\""#),
+                        Some('\'') if text[..start].ends_with(r"\'") => text[suffix_start..].find(r"\'"),
+                        Some(quote) => text[suffix_start..].find(quote),
+                        None => text[suffix_start..].find(|ch: char| ch.is_whitespace() || matches!(ch, '\'' | '"')),
+                    }
+                    .unwrap_or(text.len() - suffix_start);
+                    let end = suffix_start + suffix_len;
+                    let suffix = text[suffix_start..end].replace(r"\\", "/").replace('\\', "/");
+                    (start, end, format!("{to}{suffix}"))
+                })
+                .collect();
+            for (start, end, replacement) in paths.into_iter().rev() {
+                text.replace_range(start..end, &replacement);
+            }
+        }
+    }
+    let os_errors: Vec<_> = text
+        .split("(os error ")
+        .skip(1)
+        .filter_map(|tail| tail.split_once(')')?.0.parse::<i32>().ok())
+        .map(std::io::Error::from_raw_os_error)
+        .collect();
+    for err in os_errors {
+        text = text.replace(&err.to_string(), &format!("{:?}", err.kind()));
+    }
+    let os_debug: Vec<_> = text
+        .match_indices("Os {\n")
+        .filter_map(|(start, _)| {
+            let line = text[start + "Os {\n".len()..].lines().next()?;
+            let code = line.trim().strip_prefix("code: ")?.strip_suffix(',')?.parse().ok()?;
+            let err = std::io::Error::from_raw_os_error(code);
+            let indent = " ".repeat((line.len() - line.trim_start().len()).saturating_sub(4));
+            Some((
+                format!("{err:#?}").replace('\n', &format!("\n{indent}")),
+                format!("{:?}", err.kind()),
+            ))
+        })
+        .collect();
+    for (from, to) in os_debug {
+        text = text.replace(&from, &to);
+    }
+    for message in [
+        "number too small to fit in target type",
+        "number too large to fit in target type",
+    ] {
+        text = text.replace(message, "out of range integral type conversion attempted");
+    }
+    Diagnostic(normalize_hashes(&text).0)
 }
 
 /// Normalize 40- and 64-character hexadecimal object IDs in `input`.
@@ -1722,36 +2407,85 @@ const NULL_DEVICE: &str = "nul"; // See `gix_path::env::git::NULL_DEVICE` on why
 #[cfg(not(windows))]
 const NULL_DEVICE: &str = "/dev/null";
 
+/// Ensure fixture scripts resolve `git` to the same executable used by direct helpers and version checks.
+///
+/// Scripts invoke `git` through `PATH`, whereas [`gix_path::env::exe_invocation()`] may select an absolute executable
+/// outside the inherited `PATH`. Without preferring its directory, a version check can inspect a newer Git while the
+/// fixture subsequently runs an older one which lacks the checked feature.
+fn prefer_git_in_path(command: &mut std::process::Command, git: &Path) {
+    let Some(parent) = git.is_absolute().then(|| git.parent()).flatten() else {
+        return;
+    };
+    let inherited_path = env::var_os("PATH").unwrap_or_default();
+    let paths = std::iter::once(parent.to_owned()).chain(env::split_paths(&inherited_path));
+    if let Ok(path) = env::join_paths(paths) {
+        command.env("PATH", path);
+    }
+}
+
 fn configure_command<'a, I: IntoIterator<Item = S>, S: AsRef<OsStr>>(
     cmd: &'a mut std::process::Command,
     object_hash: gix_hash::Kind,
     args: I,
     script_result_directory: &Path,
 ) -> &'a mut std::process::Command {
+    configure_git_environment(cmd, script_result_directory)
+        .args(args)
+        .current_dir(script_result_directory)
+        .env("GIT_DEFAULT_HASH", object_hash.to_string())
+}
+
+/// Isolate the Git environment of a test subprocess, including commands that invoke Git indirectly.
+///
+/// Removes inherited and previously configured `GIT_*` variables, disables external configuration,
+/// and sets deterministic fixture defaults. `current_dir` scopes the replacement XDG configuration
+/// directory, which is made absolute so scripts can change directories without relocating it.
+/// This does not change the command's arguments, working directory, or standard I/O.
+/// Add deliberate test-specific environment overrides after calling this function.
+///
+/// # Panics
+///
+/// If `current_dir` cannot be made absolute.
+pub fn configure_git_environment(
+    cmd: &mut std::process::Command,
+    current_dir: impl AsRef<Path>,
+) -> &mut std::process::Command {
+    let git_vars: Vec<_> = env::vars_os()
+        .map(|(name, _)| name)
+        .chain(cmd.get_envs().map(|(name, _)| name.to_owned()))
+        .filter(|name| name.to_string_lossy().to_ascii_uppercase().starts_with("GIT_"))
+        .collect();
+    for name in git_vars {
+        cmd.env_remove(name);
+    }
     // For simplicity, we extend the `MSYS` variable from our own environment. This disregards
     // state from any prior `cmd.env("MSYS")` or `cmd.env_remove("MSYS")` calls. Such calls should
     // either be avoided, or made after this function returns (but before spawning the command).
     let mut msys_for_git_bash_on_windows = env::var_os("MSYS").unwrap_or_default();
     msys_for_git_bash_on_windows.push(" winsymlinks:nativestrict");
-    cmd.args(args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .current_dir(script_result_directory)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_OBJECT_DIRECTORY")
-        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_ASKPASS")
-        .env_remove("SSH_ASKPASS")
+    prefer_git_in_path(cmd, gix_path::env::exe_invocation());
+    cmd.env_remove("SSH_ASKPASS")
+        .env_remove("BASH_ENV")
+        .env_remove("ENV")
+        .env_remove("CDPATH")
         .env("MSYS", msys_for_git_bash_on_windows)
         .env(
             "XDG_CONFIG_HOME",
-            script_result_directory.join(".gix-testtools-xdg-config"),
+            std::path::absolute(current_dir)
+                .expect("the test working directory can be made absolute")
+                .join(".gix-testtools-xdg-config"),
         )
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", NULL_DEVICE)
+        .env(
+            "GIT_CONFIG_PARAMETERS",
+            ISOLATED_GIT_CONFIG
+                .iter()
+                .map(|(key, value)| format!("'{key}={value}'"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
+        .env("GIT_ATTR_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "false")
         .env("GIT_AUTHOR_DATE", "2000-01-01 00:00:00 +0000")
         .env("GIT_AUTHOR_EMAIL", "author@example.com")
@@ -1759,8 +2493,7 @@ fn configure_command<'a, I: IntoIterator<Item = S>, S: AsRef<OsStr>>(
         .env("GIT_COMMITTER_DATE", "2000-01-02 00:00:00 +0000")
         .env("GIT_COMMITTER_EMAIL", "committer@example.com")
         .env("GIT_COMMITTER_NAME", "committer")
-        .env("GIT_DEFAULT_HASH", object_hash.to_string());
-    apply_git_config_by_environment(cmd, ISOLATED_GIT_CONFIG)
+        .env("GIT_DEFAULT_HASH", object_hash().to_string())
 }
 
 /// Apply command-scoped Git `config` to `cmd`, and return it.
@@ -1949,7 +2682,7 @@ fn extract_archive(
         let mut input_archive = std::fs::File::open(archive)?;
         if !ignore_archive_override && env::var_os("GIX_TEST_IGNORE_ARCHIVES").is_some() {
             return Err(std::io::Error::other(format!(
-                "Ignoring archive at '{}' as GIX_TEST_IGNORE_ARCHIVES is set.",
+                "Ignoring archive at \"{}\" as GIX_TEST_IGNORE_ARCHIVES is set.",
                 archive.display()
             )));
         }
@@ -1985,14 +2718,11 @@ fn extract_archive(
         })
         .ok_or_else(|| std::io::Error::other("BUG: Could not find meta directory in our own archive"))
         .map_err(|err| {
-            std::io::Error::other(format!(
-                "Could not extract archive at '{archive}': {err}",
-                archive = archive.display()
-            ))
+            std::io::Error::other(format!("Could not extract archive at \"{}\": {err}", archive.display()))
         })?;
     if archive_identity != required_script_identity {
         eprintln!(
-            "Ignoring archive at '{}' as its generating script changed",
+            "Ignoring archive at \"{}\" as its generating script changed",
             archive.display()
         );
         return Err(std::io::ErrorKind::NotFound.into());
@@ -2014,18 +2744,25 @@ fn family_name() -> &'static str {
 }
 
 /// A utility to set and unset environment variables, while restoring or removing them on drop.
+///
+/// Each variable's original value is recorded on its first alteration and restored on drop. The
+/// caller must serialize environment access for the guard's entire lifetime, including its drop.
+/// See [`isolate_git_environment()`] for a guard initialized with Git isolation settings.
 #[derive(Default)]
+#[must_use = "dropping the guard immediately restores its environment changes"]
 pub struct Env<'a> {
-    altered_vars: Vec<(&'a str, Option<OsString>)>,
+    altered_vars: Vec<(Cow<'a, OsStr>, Option<OsString>)>,
+    // Dropped after `Env::drop()` restores XDG_CONFIG_HOME, so it never points at a deleted directory.
+    _config_dir: Option<tempfile::TempDir>,
 }
 
-fn set_var(var: &str, value: impl AsRef<OsStr>) {
+fn set_var(var: impl AsRef<OsStr>, value: impl AsRef<OsStr>) {
     // SAFETY: Tests using this helper are responsible for serializing access to
     // process-wide environment variables they mutate.
     unsafe { env::set_var(var, value) };
 }
 
-fn remove_var(var: &str) {
+fn remove_var(var: impl AsRef<OsStr>) {
     // SAFETY: Tests using this helper are responsible for serializing access to
     // process-wide environment variables they mutate.
     unsafe { env::remove_var(var) };
@@ -2034,25 +2771,41 @@ fn remove_var(var: &str) {
 impl<'a> Env<'a> {
     /// Create a new instance.
     pub fn new() -> Self {
-        Env {
-            altered_vars: Vec::new(),
-        }
+        Env::default()
     }
 
     /// Set `var` to `value`.
     pub fn set(mut self, var: &'a str, value: impl Into<String>) -> Self {
-        let prev = env::var_os(var);
-        set_var(var, value.into());
-        self.altered_vars.push((var, prev));
+        self.set_or_unset(Cow::Borrowed(OsStr::new(var)), Some(OsStr::new(&value.into())));
         self
     }
 
     /// Unset `var`.
     pub fn unset(mut self, var: &'a str) -> Self {
-        let prev = env::var_os(var);
-        remove_var(var);
-        self.altered_vars.push((var, prev));
+        self.set_or_unset(Cow::Borrowed(OsStr::new(var)), None);
         self
+    }
+
+    fn set_or_unset(&mut self, var: Cow<'a, OsStr>, value: Option<&OsStr>) {
+        if !self
+            .altered_vars
+            .iter()
+            .any(|(altered, _)| environment_names_equal(altered, &var))
+        {
+            self.altered_vars.push((var.clone(), env::var_os(&var)));
+        }
+        match value {
+            Some(value) => set_var(&var, value),
+            None => remove_var(&var),
+        }
+    }
+}
+
+fn environment_names_equal(left: &OsStr, right: &OsStr) -> bool {
+    if cfg!(windows) {
+        left.as_encoded_bytes().eq_ignore_ascii_case(right.as_encoded_bytes())
+    } else {
+        left == right
     }
 }
 

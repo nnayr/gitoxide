@@ -1,4 +1,9 @@
-use gix::{prelude::ObjectIdExt, revision::Spec};
+use gix::{
+    bstr::ByteSlice,
+    prelude::ObjectIdExt,
+    revision::{Spec, spec::parse::Error},
+};
+use gix_testtools::TestResult;
 pub use util::*;
 
 use crate::util::hex_to_id_sha1_only;
@@ -12,26 +17,181 @@ mod traverse;
 
 mod peel;
 
+fn missing_reference_names(err: &gix::Error) -> Vec<&gix::bstr::BStr> {
+    err.iter_errors()
+        .filter_map(|cause| match cause.downcast_ref::<Error>() {
+            Some(missing_reference @ Error::MissingReference { name }) => {
+                assert!(
+                    gix_error::classify(missing_reference).is_not_found(),
+                    "the missing-reference variant is intrinsically classified as not found"
+                );
+                Some(name.as_bstr())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 mod sibling_branch {
     use crate::{
-        revision::spec::from_bytes::{parse_spec, repo},
+        revision::spec::from_bytes::{missing_reference_names, parse_spec, repo},
         util::hex_to_id_sha1_only,
     };
+    use gix_testtools::TestResult;
 
     #[test]
-    fn push_and_upstream() -> crate::Result {
+    fn explicit_head_uses_the_current_branch() -> gix_testtools::TestResult {
+        let fixture = gix_testtools::scripted_fixture_read_only("make_tracking_branch_revspecs.sh")?;
+        let repo = gix::open_opts(fixture, crate::restricted())?;
+        for op in ["upstream", "u", "push"] {
+            let expected_commit_id = parse_spec(format!("@{{{op}}}"), &repo)?
+                .single()
+                .expect("a tracking selector resolves to a single commit");
+            for branch in ["HEAD", "main"] {
+                let revspec = format!("{branch}@{{{op}}}");
+                assert_eq!(
+                    parse_spec(&revspec, &repo)?.single(),
+                    Some(expected_commit_id),
+                    "{revspec} uses the current branch's tracking configuration"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn tracking_branch_reflog_matches_git() -> TestResult {
+        let fixture = gix_testtools::scripted_fixture_read_only("make_tracking_branch_revspecs.sh")?;
+        let repo = gix::open_opts(fixture, crate::restricted())?;
+        for op in ["upstream", "u", "push"] {
+            for branch in ["", "HEAD", "main"] {
+                for query in ["0", "1", "2000-01-01 12:00:00 +0000", "-1"] {
+                    let spec = format!("{branch}@{{{op}}}@{{{query}}}");
+                    assert_eq!(
+                        parse_spec(&spec, &repo).is_ok(),
+                        query != "-1",
+                        "{spec}: a tracking ref supports reflog lookups, not previous checkouts"
+                    );
+                }
+            }
+            for branch in ["local-a", "local-b"] {
+                for query in ["0", "u", "upstream", "push"] {
+                    let spec = format!("{branch}@{{{op}}}@{{{query}}}");
+                    assert_eq!(
+                        parse_spec(&spec, &repo).is_ok(),
+                        query == "0",
+                        "{spec}: only reflog lookups may follow a tracking selector"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn hex_named_branch_selectors_match_git() -> TestResult {
+        let fixture = gix_testtools::scripted_fixture_read_only("make_tracking_branch_revspecs.sh")?;
+        let repo = gix::open_opts(&fixture, crate::restricted())?;
+        for branch in std::fs::read_to_string(fixture.join("hex-branches"))?.lines() {
+            for suffix in [
+                "",
+                "@{0}",
+                "@{1}",
+                "@{2000-01-01 12:00:00 +0000}",
+                "@{upstream}",
+                "@{push}",
+                "@{u}@{1}",
+            ] {
+                parse_spec(format!("{branch}{suffix}"), &repo)?;
+            }
+        }
+        let prefix = std::fs::read_to_string(fixture.join("unreferenced-prefix"))?;
+        assert!(
+            parse_spec(format!("{}@{{0}}", prefix.trim_end()), &repo).is_err(),
+            "an object prefix without a matching ref has no reflog"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn push_without_branch_remote_matches_git() -> TestResult {
+        push_tracking_matches_git("unconfigured")
+    }
+
+    #[test]
+    fn push_with_separate_upstream_remote_matches_git() -> TestResult {
+        push_tracking_matches_git("triangular")
+    }
+
+    fn push_tracking_matches_git(setup: &str) -> TestResult {
+        let fixture = gix_testtools::scripted_fixture_read_only("make_push_tracking_revspecs.sh")?;
+        for mode in ["upstream", "current", "matching", "simple", "refspec"] {
+            let repo = gix::open_opts(fixture.join(format!("{setup}-{mode}")), crate::restricted())?;
+            let expected = std::fs::read_to_string(repo.workdir().expect("non-bare fixture").join("tracking-ref"))?;
+            let expected = expected.trim_end();
+            for branch in ["", "HEAD", "main"] {
+                let parsed = parse_spec(format!("{branch}@{{push}}"), &repo);
+                assert_eq!(
+                    parsed.is_ok(),
+                    !expected.is_empty(),
+                    "{setup}-{mode}: tracking availability"
+                );
+            }
+            assert_eq!(
+                repo.branch_remote_tracking_ref_name("refs/heads/main".try_into()?, gix::remote::Direction::Push)
+                    .transpose()?
+                    .map(|name| name.to_string()),
+                (!expected.is_empty()).then(|| expected.to_owned()),
+                "{setup}-{mode}: the public tracking API matches Git's symbolic result"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn push_and_upstream() -> TestResult {
         let repo = repo("complex_graph").unwrap();
         for op in ["upstream", "push"] {
             for branch in ["", "main"] {
                 let actual = parse_spec(format!("{branch}@{{{op}}}"), &repo)?;
-                assert_eq!(
-                    actual.first_reference().expect("set").name.as_bstr(),
-                    "refs/remotes/origin/main"
-                );
+                assert_eq!(actual.first_reference().expect("set"), "refs/remotes/origin/main");
                 assert_eq!(actual.second_reference(), None);
                 assert_eq!(
                     actual.single().expect("just one"),
                     hex_to_id_sha1_only("55e825ebe8fd2ff78cad3826afb696b96b576a7e")
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn missing_tracking_references_are_classified() -> TestResult {
+        let fixture = gix_testtools::scripted_fixture_writable("make_rev_spec_parse_repos.sh")?;
+        let repo = gix::open_opts(fixture.path().join("complex_graph"), crate::restricted())?;
+        repo.find_reference("refs/remotes/origin/main")?.delete()?;
+
+        for op in ["upstream", "push"] {
+            for branch in ["", "main"] {
+                let revspec = format!("{branch}@{{{op}}}");
+                let err = repo
+                    .rev_parse(revspec.as_str())
+                    .expect_err("the configured remote-tracking reference is missing");
+                assert!(
+                    err.is_not_found(),
+                    "{revspec} retains the missing tracking reference's classification: {err}"
+                );
+                assert_eq!(
+                    missing_reference_names(&err),
+                    [gix::bstr::BStr::new("refs/remotes/origin/main")],
+                    "{revspec} exposes the mapped tracking reference, not the local branch"
+                );
+                assert_eq!(
+                    err.downcast_any_ref::<gix::refs::file::find::NotFound>()
+                        .expect("the original tracking-reference lookup failure remains available")
+                        .name,
+                    gix::bstr::BStr::new("refs/remotes/origin/main"),
+                    "{revspec} retains the original missing tracking reference name"
                 );
             }
         }
@@ -63,25 +223,28 @@ mod index {
 
         let err = parse_spec(":1:file", &repo).unwrap_err();
         insta::assert_debug_snapshot!(err, @r#"
-        Couldn't find index 'file' stage 1
-        |
-        └─ Path "file" did not exist in index at stage 1. It does exist at stage 0. It exists on disk
+        Couldn't find index "file" stage 1
+
+        Caused by:
+            0: Path "file" did not exist in index at stage 1. It does exist at stage 0. It exists on disk
         "#);
-        assert_eq!(
-            err.probable_cause().to_string(),
-            "Path \"file\" did not exist in index at stage 1. It does exist at stage 0. It exists on disk",
-        );
+        insta::assert_debug_snapshot!(err.probable_cause(), "at stage", @r#"
+        Message {
+            message: "Path \"file\" did not exist in index at stage 1. It does exist at stage 0. It exists on disk",
+        }
+        "#);
 
-        assert_eq!(
-            parse_spec(":5:file", &repo).unwrap_err().probable_cause().to_string(),
-            "Path \"5:file\" did not exist in index at stage 0. It does not exist on disk",
-            "invalid stage ids are interpreted as part of the filename"
-        );
+        insta::assert_debug_snapshot!(parse_spec(":5:file", &repo).expect_err("invalid stage ids are interpreted as part of the filename").probable_cause(), "invalid stage ids are interpreted as part of the filename", @r#"
+        Message {
+            message: "Path \"5:file\" did not exist in index at stage 0. It does not exist on disk",
+        }
+        "#);
 
-        assert_eq!(
-            parse_spec(":foo", &repo).unwrap_err().probable_cause().to_string(),
-            "Path \"foo\" did not exist in index at stage 0. It does not exist on disk",
-        );
+        insta::assert_debug_snapshot!(parse_spec(":foo", &repo).expect_err("at stage").probable_cause(), "at stage", @r#"
+        Message {
+            message: "Path \"foo\" did not exist in index at stage 0. It does not exist on disk",
+        }
+        "#);
     }
 }
 
@@ -110,30 +273,258 @@ fn names_are_made_available_via_references() {
 }
 
 #[test]
-fn missing_revision_keeps_reference_lookup_error_in_error_sources_for_path_fallback() -> crate::Result {
+fn missing_revision_keeps_reference_lookup_error_available_for_path_fallback() -> TestResult {
     let repo = repo("complex_graph")?;
     let err = repo
         .rev_parse("README.md")
         .expect_err("missing revspec must fail before callers can inspect the error chain");
+    insta::assert_debug_snapshot!(err, "rev-parse preserves the reference lookup classification", @r#"
+    couldn't parse revision, input="README.md"
 
+    Caused by:
+        0: Reference "README.md" could not be found
+        1: The ref partially named "README.md" could not be found
+    "#);
+
+    assert!(
+        err.is_not_found(),
+        "rev-parse preserves the reference lookup classification"
+    );
+    assert_eq!(
+        missing_reference_names(&err),
+        [gix::bstr::BStr::new("README.md")],
+        "the parser exposes the unresolved reference name for typed path fallback"
+    );
     let not_found = err
-        .sources()
-        .find_map(|err| err.downcast_ref::<gix::refs::file::find::existing::Error>())
-        .expect("reference lookup failure remains visible in error sources after rev-parse");
+        .downcast_any_ref::<gix::refs::file::find::NotFound>()
+        .expect("reference lookup failure remains available for downcasting after rev-parse");
 
-    match not_found {
-        gix::refs::file::find::existing::Error::NotFound { name } => {
-            assert_eq!(
-                name,
-                std::path::Path::new("README.md"),
-                "the ref lookup error carries the unresolved revspec for path fallback"
-            );
-        }
-        gix::refs::file::find::existing::Error::Find(_) => {
-            panic!("expected a missing ref error, got a lower-level ref lookup failure")
-        }
+    assert_eq!(
+        not_found.name,
+        gix::bstr::BStr::new("README.md"),
+        "the missing reference carries the unresolved revspec for path fallback"
+    );
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_missing_reference_names_are_preserved() -> TestResult {
+    use gix::bstr::ByteSlice;
+
+    let (repo, _keep) = crate::basic_rw_repo()?;
+    std::fs::write(
+        repo.git_dir().join("refs/heads/alias"),
+        b"ref: refs/heads/missing-\xff\n",
+    )?;
+
+    for (revspec, expected_name) in [
+        (b"missing-\xff".as_bstr(), b"missing-\xff".as_slice()),
+        (b"alias".as_bstr(), b"refs/heads/missing-\xff".as_slice()),
+    ] {
+        let err = repo
+            .rev_parse(revspec)
+            .expect_err("the non-UTF-8 reference name is valid but missing");
+        assert!(
+            err.is_not_found(),
+            "non-UTF-8 missing names retain their not-found classification: {err}"
+        );
+        assert_eq!(
+            missing_reference_names(&err),
+            [expected_name.as_bstr()],
+            "the parser preserves the missing name's bytes for direct and symbolic lookups"
+        );
+        assert_eq!(
+            err.downcast_any_ref::<gix::refs::file::find::NotFound>()
+                .expect("the original non-UTF-8 lookup failure remains available")
+                .name
+                .as_slice(),
+            expected_name,
+            "the original lookup failure also preserves the missing name's bytes"
+        );
     }
+    Ok(())
+}
 
+#[test]
+fn missing_symbolic_referents_keep_their_name() -> TestResult {
+    let mut error_snapshots = Vec::new();
+    let (repo, _keep) = crate::basic_rw_repo()?;
+    std::fs::write(repo.git_dir().join("refs/heads/alias"), b"ref: refs/heads/missing\n")?;
+
+    for revspec in ["alias", "alias..HEAD", "HEAD..alias", "alias...HEAD", "HEAD...alias"] {
+        let err = repo.rev_parse(revspec).expect_err("the symbolic referent is missing");
+        error_snapshots.push(gix_testtools::redact_debug_snapshot(&(err), &[]));
+        assert!(
+            err.is_not_found(),
+            "missing symbolic referents are classified as not found: {err:?}"
+        );
+        assert_eq!(
+            missing_reference_names(&err),
+            [gix::bstr::BStr::new("refs/heads/missing")],
+            "{revspec} exposes the missing symbolic referent rather than the input revspec"
+        );
+        assert_eq!(
+            err.downcast_any_ref::<gix::refs::file::find::NotFound>()
+                .expect("the missing referent remains available for path fallback")
+                .name,
+            gix::bstr::BStr::new("refs/heads/missing"),
+            "the missing reference name is not necessarily the input revspec"
+        );
+    }
+    insta::assert_debug_snapshot!(error_snapshots, "missing symbolic referents keep their name", @r#"
+    [
+        The rev-spec is malformed and misses a ref name
+        
+        Caused by:
+            0: Could not peel 'refs/heads/alias' to obtain its target
+            1: Reference "refs/heads/missing" could not be found
+            2: The ref partially named "refs/heads/missing" could not be found,
+        The rev-spec is malformed and misses a ref name
+        
+        Caused by:
+            0: Could not peel 'refs/heads/alias' to obtain its target
+            1: Reference "refs/heads/missing" could not be found
+            2: The ref partially named "refs/heads/missing" could not be found,
+        The rev-spec is malformed and misses a ref name
+        
+        Caused by:
+            0: Could not peel 'refs/heads/alias' to obtain its target
+            1: Reference "refs/heads/missing" could not be found
+            2: The ref partially named "refs/heads/missing" could not be found,
+        The rev-spec is malformed and misses a ref name
+        
+        Caused by:
+            0: Could not peel 'refs/heads/alias' to obtain its target
+            1: Reference "refs/heads/missing" could not be found
+            2: The ref partially named "refs/heads/missing" could not be found,
+        The rev-spec is malformed and misses a ref name
+        
+        Caused by:
+            0: Could not peel 'refs/heads/alias' to obtain its target
+            1: Reference "refs/heads/missing" could not be found
+            2: The ref partially named "refs/heads/missing" could not be found,
+    ]
+    "#);
+    Ok(())
+}
+
+#[test]
+fn both_missing_symbolic_referents_are_retained() -> TestResult {
+    let (repo, _keep) = crate::basic_rw_repo()?;
+    std::fs::write(
+        repo.git_dir().join("refs/heads/first"),
+        b"ref: refs/heads/missing-first\n",
+    )?;
+    std::fs::write(
+        repo.git_dir().join("refs/heads/second"),
+        b"ref: refs/heads/missing-second\n",
+    )?;
+
+    for revspec in ["first..second", "first...second"] {
+        let err = repo
+            .rev_parse(revspec)
+            .expect_err("both symbolic referents are missing");
+        assert!(
+            err.is_not_found(),
+            "both missing referents retain their not-found classification: {err}"
+        );
+        let missing_names: Vec<_> = err
+            .iter_errors()
+            .filter_map(|cause| cause.downcast_ref::<gix::refs::file::find::NotFound>())
+            .map(|cause| cause.name.as_bstr())
+            .collect();
+        assert_eq!(
+            missing_names,
+            [
+                gix::bstr::BStr::new("refs/heads/missing-first"),
+                gix::bstr::BStr::new("refs/heads/missing-second"),
+            ],
+            "final spec conversion preserves both lookup failures"
+        );
+        assert_eq!(
+            missing_reference_names(&err),
+            missing_names,
+            "{revspec} exposes both typed missing-reference payloads in lookup order"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn missing_objects_are_classified_without_a_missing_reference() -> TestResult {
+    let mut error_snapshots = Vec::new();
+    let (repo, _keep) = crate::basic_rw_repo()?;
+    let mut missing_commit_id = repo.object_hash().null();
+    missing_commit_id.as_mut_slice()[0] = 1;
+    repo.reference(
+        "refs/heads/missing-object",
+        missing_commit_id,
+        gix::refs::transaction::PreviousValue::Any,
+        "",
+    )?;
+
+    std::fs::write(
+        repo.git_dir().join("refs/heads/alias"),
+        b"ref: refs/heads/missing-object\n",
+    )?;
+
+    for revspec in ["missing-object^{object}", "missing-object:README.md", "alias"] {
+        let err = repo.rev_parse(revspec).expect_err("the referenced object is missing");
+        error_snapshots.push(gix_testtools::redact_debug_snapshot(&(err), &[]));
+        assert!(
+            err.is_not_found(),
+            "object lookup failures retain their classification: {err}"
+        );
+        assert!(
+            missing_reference_names(&err).is_empty(),
+            "a missing object must not become a typed missing-reference error: {err}"
+        );
+        assert!(
+            err.downcast_any_ref::<gix::refs::file::find::NotFound>().is_none(),
+            "a missing object must not trigger missing-reference path fallback: {err}"
+        );
+    }
+    insta::assert_debug_snapshot!(error_snapshots, "missing objects are classified without a missing reference", @r#"
+    [
+        delegate.peel_until(ValidObject) failed, input="{object}"
+        
+        Caused by:
+            0: An object with id Oid(1) could not be found,
+        delegate.peel_until(Path("README.md")) failed
+        
+        Caused by:
+            0: An object with id Oid(1) could not be found,
+        The rev-spec is malformed and misses a ref name
+        
+        Caused by:
+            0: Could not peel 'refs/heads/alias' to obtain its target
+            1: An object with id Oid(1) could not be found,
+    ]
+    "#);
+    Ok(())
+}
+
+#[test]
+fn missing_tree_and_index_paths_are_not_missing_references() -> TestResult {
+    let repo = repo("complex_graph")?;
+    repo.rev_parse("HEAD:file")?;
+    repo.rev_parse(":file")?;
+
+    for revspec in ["HEAD:missing", ":missing", ":1:file"] {
+        let err = repo
+            .rev_parse(revspec)
+            .expect_err("the requested tree path, index path, or index stage is absent");
+        assert!(
+            missing_reference_names(&err).is_empty(),
+            "{revspec} must not turn a missing path or index stage into a missing reference: {err}"
+        );
+        assert!(
+            err.downcast_any_ref::<gix::refs::file::find::NotFound>().is_none(),
+            "{revspec} must not fabricate a reference lookup failure for path fallback: {err}"
+        );
+    }
     Ok(())
 }
 
@@ -147,19 +538,25 @@ fn bad_objects_are_valid_until_they_are_actually_read_from_the_odb() {
             "we are able to return objects even though they are 'bad' when trying to decode them, like git",
         );
         let err = parse_spec("e328^{object}", &repo).unwrap_err();
+        let cause = err
+            .probable_cause()
+            .downcast_ref::<gix_error::Message>()
+            .expect("invalid object kinds are classified as validation failures");
         assert_eq!(
-            format!("{:?}", err.probable_cause()),
-            r#"InvalidObjectKind { kind: "bad" }"#,
+            (cause.class, cause.values.get("input")),
+            (
+                Some(gix_error::Class::Validation),
+                Some(&gix_error::MetadataValue::Bytes("bad".into()))
+            ),
             "Now we enforce the object to exist and be valid, as ultimately it wants to match with a certain type"
         );
-        insta::assert_debug_snapshot!(err, @r#"
-        delegate.peel_until(ValidObject) failed: "{object}"
-        |
-        └─ An error occurred while obtaining an object from the loose object store
-        |
-        └─ The object header contained an unknown object kind.
-        |
-        └─ Unknown object kind: "bad"
+        insta::assert_snapshot!(normalize_repo_path(&format!("{err:#?}"), &repo), @r#"
+        delegate.peel_until(ValidObject) failed, input="{object}"
+
+        Caused by:
+            0: Could not read loose object, path="$GIT_DIR/objects/e3/2851d29feb48953c6f40b2e06d630a3c49608a"
+            1: The object header contained an unknown object kind.
+            2: Unknown object kind, input="bad"
         "#);
     }
 
@@ -170,27 +567,13 @@ fn bad_objects_are_valid_until_they_are_actually_read_from_the_odb() {
             Spec::from_id(hex_to_id_sha1_only("cafea31147e840161a1860c50af999917ae1536b").attach(&repo))
         );
         let err = parse_spec("cafea^{object}", &repo).unwrap_err();
-        let actual = {
-            let mut actual = format!("{err:#?}").replace('\\', "/").replace("windows", "unix");
-            let marker = "make_rev_spec_parse_repos/";
-            if let Some(start) = actual.find(marker) {
-                let start = start + marker.len();
-                if let Some(end) = actual[start..].find("/blob.corrupt") {
-                    actual.replace_range(start..start + end, "$HASH/$SEED-unix");
-                }
-            }
-            actual
-        };
-        insta::assert_snapshot!(actual, @r#"
-        delegate.peel_until(ValidObject) failed: "{object}"
-        |
-        └─ An error occurred while obtaining an object from the loose object store
-        |
-        └─ decompression of loose object at 'tests/fixtures/generated-do-not-edit/make_rev_spec_parse_repos/$HASH/$SEED-unix/blob.corrupt/objects/ca/fea31147e840161a1860c50af999917ae1536b' failed
-        |
-        └─ Could not decode zip stream, status was 'Invalid input data'
-        |
-        └─ Invalid input data
+        insta::assert_snapshot!(normalize_repo_path(&format!("{err:#?}"), &repo), @r#"
+        delegate.peel_until(ValidObject) failed, input="{object}"
+
+        Caused by:
+            0: Could not read loose object, path="$GIT_DIR/objects/ca/fea31147e840161a1860c50af999917ae1536b"
+            1: Could not decode zip stream
+            2: Invalid input data
         "#);
     }
 }
@@ -212,13 +595,15 @@ fn access_blob_through_tree() {
     let err = parse_spec("0000000000cdc:missing", &repo).unwrap_err();
     insta::assert_debug_snapshot!(err, @r#"
     delegate.peel_until(Path("missing")) failed
-    |
-    └─ Could not find path "missing" in tree 0000000000c of parent object 0000000000c
+
+    Caused by:
+        0: Could not find path "missing" in tree 0000000000c of parent object 0000000000c
     "#);
-    assert_eq!(
-        err.probable_cause().to_string(),
-        "Could not find path \"missing\" in tree 0000000000c of parent object 0000000000c"
-    );
+    insta::assert_debug_snapshot!(err.probable_cause(), "access blob through tree", @r#"
+    Message {
+        message: "Could not find path \"missing\" in tree 0000000000c of parent object 0000000000c",
+    }
+    "#);
 }
 
 #[test]
@@ -227,20 +612,27 @@ fn invalid_head() {
     let err = parse_spec("HEAD:file", &repo).unwrap_err();
     insta::assert_debug_snapshot!(err, @r#"
     delegate.peel_until(Path("file")) failed
-    |
-    └─ Could not peel 'HEAD' to obtain its target
-        |
-        └─ Could not follow a single level of a symbolic reference
-        |   |
-        |   └─ The ref partially named "refs/heads/main" could not be found
-        |
-        └─ Couldn't get object at internal index 0
+
+    Caused by:
+        0: Could not peel 'HEAD' to obtain its target
+        ├─0: Reference "refs/heads/main" could not be found
+        │ └─ The ref partially named "refs/heads/main" could not be found
+        └─1: Couldn't get object at internal index 0
     "#);
 
     let err = parse_spec("HEAD", &repo).unwrap_err();
-    // The head couldn't be peeled, and there is nothing left to consume, but no
-    // object was resolved.
-    insta::assert_debug_snapshot!(err, @"The rev-spec is malformed and misses a ref name");
+    assert!(
+        err.is_not_found(),
+        "final conversion retains the deferred lookup failure"
+    );
+    insta::assert_debug_snapshot!(err, @r#"
+    The rev-spec is malformed and misses a ref name
+
+    Caused by:
+        0: Could not peel 'HEAD' to obtain its target
+        1: Reference "refs/heads/main" could not be found
+        2: The ref partially named "refs/heads/main" could not be found
+    "#);
 }
 
 #[test]

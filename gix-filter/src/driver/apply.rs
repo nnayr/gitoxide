@@ -1,10 +1,11 @@
-use std::{collections::HashMap, io::Read, sync::Arc};
+use gix_error::{Result, bail};
+use std::{io::Read, sync::Arc};
 
-use bstr::{BStr, BString};
+use bstr::BStr;
 
 use crate::{
     Driver, driver,
-    driver::{Operation, Process, State, process, process::client::invoke},
+    driver::{Operation, Process, ProcessMap, State},
 };
 
 /// What to do if delay is supported by a process filter.
@@ -13,36 +14,14 @@ pub enum Delay {
     /// Use delayed processing for this entry.
     ///
     /// Note that it's up to the filter to determine whether or not the processing should be delayed.
+    ///
+    /// This is the default as the return value as the respective callers have to match on an enum that
+    /// makes this possibility (and the special handling involved) obvious.
     #[default]
     Allow,
     /// Do not delay the processing, and force it to happen immediately. In this case, no delayed processing will occur
     /// even if the filter supports it.
-    ///
-    /// This is the default as it requires no special precautions to be taken by the caller as
-    /// outputs will be produced immediately.
     Forbid,
-}
-
-/// The error returned by [State::apply()][super::State::apply()].
-#[derive(Debug, thiserror::Error)]
-#[expect(missing_docs)]
-pub enum Error {
-    #[error(transparent)]
-    Init(#[from] driver::init::Error),
-    #[error("Could not write entire object to driver")]
-    WriteSource(#[from] std::io::Error),
-    #[error("Filter process delayed an entry even though that was not requested")]
-    DelayNotAllowed,
-    #[error("Failed to invoke '{command}' command")]
-    ProcessInvoke {
-        source: process::client::invoke::Error,
-        command: String,
-    },
-    #[error("The invoked command '{command}' in process indicated an error: {status:?}")]
-    ProcessStatus {
-        status: driver::process::Status,
-        command: String,
-    },
 }
 
 /// Additional information for use in the [`State::apply()`] method.
@@ -74,6 +53,12 @@ impl State {
     /// Note that it's not an error if there is no filter process for `operation` or if a long-running process doesn't support
     /// the desired capability.
     ///
+    /// Spawn and handshake errors provide the metadata documented in [`Self::maybe_launch_process()`].
+    /// Failed exits of required single-file drivers are reported by the returned reader as IO errors containing a
+    /// [`gix_error::Message`] whose [metadata](gix_error::Message::values) includes `program` (Path),
+    /// `command` (String, the prepared command's debug representation), `exit_status` (String), and `exit_code` (I64)
+    /// when available. Output streams are not recorded as metadata.
+    ///
     /// ### Deviation
     ///
     /// If a long-running process returns the 'abort' status after receiving the data, it will be removed similarly to how `git` does it.
@@ -86,7 +71,7 @@ impl State {
         src: &mut impl std::io::Read,
         operation: Operation,
         ctx: Context<'_, '_>,
-    ) -> Result<Option<Box<dyn std::io::Read + 'a>>, Error> {
+    ) -> Result<Option<Box<dyn std::io::Read + 'a>>> {
         match self.apply_delayed(driver, src, operation, Delay::Forbid, ctx)? {
             Some(MaybeDelayed::Delayed(_)) => {
                 unreachable!("we forbid delaying the entry")
@@ -107,7 +92,9 @@ impl State {
         operation: Operation,
         delay: Delay,
         ctx: Context<'_, '_>,
-    ) -> Result<Option<MaybeDelayed<'a>>, Error> {
+    ) -> Result<Option<MaybeDelayed<'a>>> {
+        use gix_error::{ErrorExt, ResultExt, corruption, message};
+
         match self.maybe_launch_process(driver, operation, ctx.rela_path)? {
             Some(Process::SingleFile { mut child, command }) => {
                 // To avoid deadlock when the filter immediately echoes input to output (like `cat`),
@@ -128,12 +115,13 @@ impl State {
                 // (`convert.c::filter_buffer_or_fd()`), avoiding an input-sized allocation in that
                 // case. Find a way to similarly pump the borrowed reader concurrently.
                 let mut input_data = Vec::new();
-                std::io::copy(src, &mut input_data)?;
+                std::io::copy(src, &mut input_data).or_raise(|| message("Could not write entire object to driver"))?;
 
                 let stdin = child.stdin.take().expect("configured");
                 let input_data: Arc<[u8]> = input_data.into();
                 let fallback = (!driver.required).then(|| Arc::clone(&input_data));
-                let write_thread = WriterThread::write_all_in_background(input_data, stdin)?;
+                let write_thread = WriterThread::write_all_in_background(input_data, stdin)
+                    .or_raise(|| message("Could not write entire object to driver"))?;
 
                 Ok(Some(MaybeDelayed::Immediate(Box::new(ReadFilterOutput {
                     inner: child.stdout.take(),
@@ -171,25 +159,25 @@ impl State {
                 let status = match invoke_result {
                     Ok(status) => status,
                     Err(err) => {
-                        let invoke::Error::Io(io_err) = &err;
-                        handle_io_err(io_err, &mut self.running, key.0.as_ref());
-                        return Err(Error::ProcessInvoke {
-                            command: command.into(),
-                            source: err,
-                        });
+                        if let Some(io_err) = err.downcast_any_ref::<std::io::Error>() {
+                            handle_io_err(io_err, &mut self.running, key.0.as_ref());
+                        }
+                        bail!(err.and_raise(message!("Failed to invoke '{command}' command")));
                     }
                 };
 
                 if status.is_delayed() {
                     if matches!(delay, Delay::Forbid) {
-                        return Err(Error::DelayNotAllowed);
+                        bail!(corruption(
+                            "Filter process delayed an entry even though that was not requested"
+                        ));
                     }
                     Ok(Some(MaybeDelayed::Delayed(key)))
                 } else if status.is_success() {
                     // TODO: find a way to not have to do the 'borrow-dance'.
-                    let client = self.running.remove(&key.0).expect("present for borrowcheck dance");
-                    self.running.insert(key.0.clone(), client);
-                    let client = self.running.get_mut(&key.0).expect("just inserted");
+                    let running = self.running.remove(&key.0).expect("present for borrowcheck dance");
+                    self.running.insert(key.0.clone(), running);
+                    let client = &mut self.running.get_mut(&key.0).expect("just inserted").client;
 
                     Ok(Some(MaybeDelayed::Immediate(Box::new(client.as_read()))))
                 } else {
@@ -200,14 +188,11 @@ impl State {
                         }
                         "error" => {}
                         _strange => {
-                            let client = self.running.remove(&key.0).expect("we definitely have it");
-                            client.into_child().kill().ok();
+                            let running = self.running.remove(&key.0).expect("we definitely have it");
+                            running.client.into_child().kill().ok();
                         }
                     }
-                    Err(Error::ProcessStatus {
-                        command: command.into(),
-                        status,
-                    })
+                    Err(message!("The invoked command '{command}' in process indicated an error: {status:?}").raise())
                 }
             }
             None => Ok(None),
@@ -239,13 +224,13 @@ impl WriterThread {
         let handle = std::thread::Builder::new()
             .name("gix-filter-stdin-writer".into())
             .stack_size(128 * 1024)
-            .spawn(move || {
+            .spawn(gix_trace::in_thread(move || {
                 use std::io::Write;
                 stdin.write_all(&data)?;
                 // Explicitly drop stdin to close the pipe and signal EOF to the child
                 drop(stdin);
                 Ok(())
-            })?;
+            }))?;
 
         Ok(Self { handle: Some(handle) })
     }
@@ -341,7 +326,7 @@ impl ReadFilterOutput {
     }
 }
 
-pub(crate) fn handle_io_err(err: &std::io::Error, running: &mut HashMap<BString, process::Client>, process: &BStr) {
+pub(super) fn handle_io_err(err: &std::io::Error, running: &mut ProcessMap, process: &BStr) {
     if matches!(
         err.kind(),
         std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::UnexpectedEof
@@ -387,7 +372,10 @@ impl std::io::Read for ReadFilterOutput {
                     if let Some((mut child, cmd)) = self.child.take() {
                         let status = child.wait()?;
                         if !status.success() {
-                            return Err(std::io::Error::other(format!("Driver process {cmd:?} failed")));
+                            let failure = gix_error::message("Driver process failed")
+                                .with_command(&cmd)
+                                .with_exit_status(status);
+                            return Err(std::io::Error::other(failure));
                         }
                     }
 

@@ -9,37 +9,30 @@ function baseline() {
   local spec=${1:?first argument is the spec to test}
   {
     echo "$spec"
-    git rev-parse -q --verify "$spec" 2>/dev/null || echo $?
+    # Revspecs containing `/` must reach Git unchanged when run through Git Bash.
+    MSYS2_ARG_CONV_EXCL='*' git rev-parse -q --verify "$spec" 2>/dev/null || echo $?
   }>> baseline.git
 }
 
 function loose-obj() {
-  # Read content from stdin, compute header and hash, write compressed object
-  script=$(cat <<'EOF'
-import sys
-import hashlib
-import zlib
-import os
-
-type = sys.argv[1]
-objects_dir = sys.argv[2]
-content = sys.stdin.buffer.read()
-header = f"{type} {len(content)}\0".encode()
-full = header + content
-sha1 = hashlib.sha1(full).hexdigest()
-compressed = zlib.compress(full)
-
-bucket = f"{objects_dir}/" + sha1[:2]
-filename = sha1[2:]
-
-os.makedirs(bucket, exist_ok=True)
-with open(f"{bucket}/{filename}", "wb") as f:
-    f.write(compressed)
-
-print(sha1)
-EOF
-)
-  python3 -c "$script" "$@"
+  # Git validates object types even with `hash-object --literally`, so write the
+  # deliberately invalid loose object using Perl, which ships with Git Bash.
+  perl -MDigest::SHA=sha1_hex -MCompress::Zlib=compress -e '
+    use strict;
+    use warnings;
+    binmode STDIN;
+    local $/;
+    my ($type, $objects_dir) = @ARGV;
+    my $content = <STDIN>;
+    my $full = $type . " " . length($content) . "\0" . $content;
+    my $sha1 = sha1_hex($full);
+    my $bucket = $objects_dir . "/" . substr($sha1, 0, 2);
+    mkdir $bucket or die "mkdir $bucket: $!" unless -d $bucket;
+    open my $fh, ">:raw", $bucket . "/" . substr($sha1, 2) or die "open object: $!";
+    print {$fh} compress($full);
+    close $fh or die "close object: $!";
+    print $sha1, "\n";
+  ' "$@"
 }
 
 # The contents of this file is based on https://github.com/git/git/blob/8168d5e9c23ed44ae3d604f392320d66556453c9/t/t1512-rev-parse-disambiguation.sh#L38
@@ -354,7 +347,7 @@ git init complex_graph
   git merge e i --allow-unrelated-histories || :
   { echo g && echo h && echo i && echo j && echo d && echo e && echo f && echo b; } > file
   git add file && git commit -m B
-  git tag -m b-tag b-tag && git branch b
+  git tag -m b-tag b-tag && git tag b-lightweight-tag && git branch b
 
   tick
   git checkout i
@@ -386,6 +379,8 @@ EOF
   baseline ":/!-mes.age" # negated above
   baseline ":/not there" # definitely not in graph
   baseline "@^{/!-B}"    # negation from branch
+  baseline "@^{/}"       # empty pattern matches everything, yielding the anchor peeled to a commit
+  baseline "@^{/!-}"     # negated empty pattern matches nothing and must fail
   baseline ":file"      # index lookup, default stage 0
   baseline ":1:file"    # stage 1
   baseline ":5:file"    # invalid stage
@@ -410,9 +405,22 @@ EOF
   baseline "a~2"
   baseline "e"
   baseline "a^^2"
+  baseline "g"
   baseline "j"
   baseline "b^3^2"
   baseline "a^^3^2"
+
+  # traversal from an annotated tag, which git peels to a commit first.
+  # `b-tag` is annotated and points at `b`, a merge commit with two parents.
+  baseline "b-tag^"
+  baseline "b-tag^1"
+  baseline "b-tag^2"
+  baseline "b-tag~1"
+  baseline "b-tag~2"
+  baseline "b-tag~0"
+  baseline "b-lightweight-tag~0"
+  baseline "b-tag^{/G}"
+  baseline "b-tag^{/}" # empty pattern still peels the tag to a commit
 
   # invalid
   baseline "^^"
@@ -480,6 +488,27 @@ git init deleted_prior_checkout_named_like_object
   # that object id, even when no such object exists in the database.
   baseline "@{-1}"
 )
+
+for storage in loose packed; do
+  git init "prior_checkout_tag_$storage"
+  (
+    cd "prior_checkout_tag_$storage"
+    tick
+    git commit --allow-empty -m initial
+    git checkout -b topic
+    git branch -D main
+    # A prior checkout name may now name an annotated tag, which must stay unpeeled.
+    git tag -a -m main main
+    if test "$storage" = packed; then
+      git tag indirect main
+      git symbolic-ref refs/tags/main refs/tags/indirect
+      git pack-refs --all --prune
+    fi
+    for spec in '@{-1}' '@{-1}^{}' main 'main^{}'; do
+      baseline "$spec"
+    done
+  )
+done
 
 git init new
 (cd new

@@ -162,7 +162,10 @@ pub struct Repository {
     /// A way to access objects.
     pub objects: crate::OdbHandle,
 
+    /// The worktree selected when the repository was opened, or `None` for a bare repository.
     pub(crate) work_tree: Option<PathBuf>,
+    /// The index selected when the repository was opened, including any `gitoxide.core.indexFile` override.
+    pub(crate) index_path: PathBuf,
     /// The path to the resolved common directory if this is a linked worktree repository or it is otherwise set.
     pub(crate) common_dir: Option<PathBuf>,
     /// A free-list of reusable object backing buffers
@@ -194,14 +197,15 @@ pub struct Repository {
 ///
 /// When built with `default-features = false`, this type is **not** `Send`.
 /// The minimal feature set to activate `Send` is `features = ["parallel"]`.
-#[derive(Clone)]
 pub struct ThreadSafeRepository {
     /// A store for references to point at objects
     pub refs: crate::RefStore,
     /// A store for objects that contain data
-    pub objects: gix_features::threading::OwnShared<gix_odb::Store>,
+    pub objects: gix_parallel::OwnShared<gix_odb::Store>,
     /// The path to the worktree at which to find checked out files
     pub work_tree: Option<PathBuf>,
+    /// The path to the index selected when the repository was opened.
+    pub(crate) index_path: PathBuf,
     /// The path to the common directory if this is a linked worktree repository or it is otherwise set.
     pub common_dir: Option<PathBuf>,
     pub(crate) config: crate::config::Cache,

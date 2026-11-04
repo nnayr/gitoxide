@@ -1,30 +1,32 @@
 use std::{path::PathBuf, sync::atomic::AtomicBool};
 
 use gix_hash::ObjectId;
-use gix_object::{Find, FindHeader, Write, WriteTo};
+use gix_object::{Exists, Find, FindHeader, Write, WriteTo};
 
 mod commit;
 mod encode;
 mod object_ref;
+mod signature_format;
 mod tag;
 mod tree;
 
 #[test]
-fn compute_hash() {
+fn compute_hash() -> gix_testtools::TestResult {
     for hk in gix_hash::Kind::all() {
         assert_eq!(
-            gix_object::compute_hash(*hk, gix_object::Kind::Blob, &[]).expect("empty hash doesn’t collide"),
+            gix_object::compute_hash(*hk, gix_object::Kind::Blob, &[])?,
             gix_hash::ObjectId::empty_blob(*hk)
         );
         assert_eq!(
-            gix_object::compute_hash(*hk, gix_object::Kind::Tree, &[]).expect("empty hash doesn’t collide"),
+            gix_object::compute_hash(*hk, gix_object::Kind::Tree, &[])?,
             gix_hash::ObjectId::empty_tree(*hk)
         );
     }
+    Ok(())
 }
 
 #[test]
-fn compute_stream_hash() {
+fn compute_stream_hash() -> gix_testtools::TestResult {
     for hk in gix_hash::Kind::all() {
         assert_eq!(
             gix_object::compute_stream_hash(
@@ -32,10 +34,9 @@ fn compute_stream_hash() {
                 gix_object::Kind::Blob,
                 &mut &[][..],
                 0,
-                &mut gix_features::progress::Discard,
+                &mut gix_utils::progress::Discard,
                 &AtomicBool::default()
-            )
-            .expect("in-memory works"),
+            )?,
             gix_hash::ObjectId::empty_blob(*hk)
         );
         assert_eq!(
@@ -44,17 +45,17 @@ fn compute_stream_hash() {
                 gix_object::Kind::Tree,
                 &mut &[][..],
                 0,
-                &mut gix_features::progress::Discard,
+                &mut gix_utils::progress::Discard,
                 &AtomicBool::default()
-            )
-            .expect("in-memory works"),
+            )?,
             gix_hash::ObjectId::empty_tree(*hk)
         );
     }
+    Ok(())
 }
 
 #[test]
-fn never_writes_to_nowhere_and_finds_nothing() -> Result {
+fn never_writes_to_nowhere_and_finds_nothing() -> gix_testtools::TestResult {
     let db = gix_object::find::Never;
     let data = b"content";
     let expected = gix_object::compute_hash(gix_hash::Kind::default(), gix_object::Kind::Blob, data)?;
@@ -94,8 +95,49 @@ fn never_writes_to_nowhere_and_finds_nothing() -> Result {
         db.try_header(&expected)?.is_none(),
         "discarded writes must not make headers readable"
     );
+    assert!(!db.exists(&expected), "discarded writes must not exist");
 
     Ok(())
+}
+
+#[test]
+fn never_fail_always_panics_on_all_object_access() {
+    let assert_panics = |operation: fn(gix_object::find::PanicAlways, ObjectId)| {
+        assert!(
+            std::panic::catch_unwind(|| {
+                operation(
+                    gix_object::find::Never::panic_on_access(),
+                    ObjectId::empty_blob(gix_hash::Kind::default()),
+                );
+            })
+            .is_err(),
+            "every object-access operation must panic"
+        );
+    };
+    assert_panics(|db, blob_id| {
+        let _ = db.try_find(&blob_id, &mut Vec::new());
+    });
+    assert_panics(|db, blob_id| {
+        let _ = db.try_header(&blob_id);
+    });
+    assert_panics(|db, blob_id| {
+        db.exists(&blob_id);
+    });
+    assert_panics(|db, _| {
+        let _ = db.write(&gix_object::Tree::default());
+    });
+    assert_panics(|db, _| {
+        let _ = db.write_buf(gix_object::Kind::Blob, b"");
+    });
+    assert_panics(|db, blob_id| {
+        let _ = db.write_buf_with_known_id(gix_object::Kind::Blob, b"", blob_id);
+    });
+    assert_panics(|db, _| {
+        let _ = db.write_stream(gix_object::Kind::Blob, 0, &mut std::io::empty());
+    });
+    assert_panics(|db, blob_id| {
+        let _ = db.write_stream_with_known_id(gix_object::Kind::Blob, 0, &mut std::io::empty(), blob_id);
+    });
 }
 
 use gix_testtools::Result;

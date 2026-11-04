@@ -1,4 +1,5 @@
 mod get {
+    use crate::TestResult;
     use bstr::BString;
 
     use crate::file::mutable::value::init_config;
@@ -29,7 +30,7 @@ mod get {
     }
 
     #[test]
-    fn value_is_correct() -> crate::Result {
+    fn value_is_correct() -> TestResult {
         let mut config = init_config();
 
         let value = config.raw_value_mut_by("core", None, "a")?;
@@ -38,7 +39,7 @@ mod get {
     }
 
     #[test]
-    fn value_names_are_case_insensitive() -> crate::Result {
+    fn value_names_are_case_insensitive() -> TestResult {
         let mut config: gix_config::File = "[core]\nMixedCase = value".parse()?;
         assert_eq!(config.raw_value_mut_by("core", None, "mIxEdCaSe")?.get()?, "value");
         Ok(())
@@ -46,6 +47,7 @@ mod get {
 }
 
 mod set_string {
+    use crate::TestResult;
     use crate::file::mutable::value::init_config;
 
     fn assert_set_string(expected: &str) {
@@ -69,9 +71,9 @@ mod set_string {
             let file_string = file.to_string();
             let file: gix_config::File = match file_string.parse() {
                 Ok(f) => f,
-                Err(err) => panic!("{file_string:?} failed with: {err}"),
+                Err(err) => panic!("{file_string} failed with: {err}"),
             };
-            assert_eq!(file.raw_value("a.k").expect("present"), expected, "{file_string:?}");
+            assert_eq!(file.raw_value("a.k").expect("present"), expected, "{file_string}");
         }
     }
 
@@ -125,7 +127,48 @@ mod set_string {
     }
 
     #[test]
-    fn simple_value_and_empty_string() -> crate::Result {
+    fn unquoted_comments_end_continued_values_and_survive_replacement() -> TestResult {
+        for newline in ["\n", "\r\n"] {
+            for comment in ["# comment", "; comment"] {
+                let mut config: gix_config::File =
+                    format!("[a]{newline}k=one\\{newline}{comment}{newline}next=value").parse()?;
+                let mut value = config.raw_value_mut_by("a", None, "k")?;
+                assert_eq!(value.get()?, "one", "an unquoted comment ends the continued value");
+                value.set_string("replacement")?;
+                assert_eq!(
+                    config.to_string(),
+                    format!("[a]{newline}k=replacement{newline}{comment}{newline}next=value{newline}"),
+                    "replacing the value keeps the standalone comment on its own line"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn quoted_comment_markers_in_continued_values_are_value_content() -> TestResult {
+        let mut config: gix_config::File = r#"[a]
+k="one\
+#not;comments"
+next=value"#
+            .parse()?;
+        let mut value = config.raw_value_mut_by("a", None, "k")?;
+        let normalized = value.get()?;
+        assert_eq!(
+            normalized, "one#not;comments",
+            "quoted comment markers remain part of the continued value"
+        );
+        value.set(normalized)?;
+        assert_eq!(
+            config.to_string(),
+            "[a]\nk=\"one#not;comments\"\nnext=value\n",
+            "replacing the value preserves quoted comment markers as value content"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn simple_value_and_empty_string() -> TestResult {
         let mut config = init_config();
 
         let mut value = config.raw_value_mut_by("core", None, "a")?;
@@ -157,9 +200,10 @@ mod set_string {
 
 mod delete {
     use super::init_config;
+    use crate::TestResult;
 
     #[test]
-    fn single_line_value() -> crate::Result {
+    fn single_line_value() -> TestResult {
         let mut config = init_config();
 
         let mut value = config.raw_value_mut_by("core", None, "a")?;
@@ -179,7 +223,7 @@ mod delete {
     }
 
     #[test]
-    fn get_value_after_deleted() -> crate::Result {
+    fn get_value_after_deleted() -> TestResult {
         let mut config = init_config();
 
         let mut value = config.raw_value_mut_by("core", None, "a")?;
@@ -189,7 +233,7 @@ mod delete {
     }
 
     #[test]
-    fn set_string_after_deleted() -> crate::Result {
+    fn set_string_after_deleted() -> TestResult {
         let mut config = init_config();
 
         let mut value = config.raw_value_mut_by("core", None, "a")?;
@@ -208,7 +252,7 @@ mod delete {
     }
 
     #[test]
-    fn idempotency() -> crate::Result {
+    fn idempotency() -> TestResult {
         let mut config = init_config();
 
         let mut value = config.raw_value_mut_by("core", None, "a")?;
@@ -223,7 +267,7 @@ mod delete {
     }
 
     #[test]
-    fn multi_line_value() -> crate::Result {
+    fn multi_line_value() -> TestResult {
         let mut config: gix_config::File = r#"[core]
             a=b"100"\
 c\

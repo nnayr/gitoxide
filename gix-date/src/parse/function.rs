@@ -1,17 +1,23 @@
-use std::{str::FromStr, time::SystemTime};
+use gix_error::{Result, validation};
+use std::str::FromStr;
 
 use jiff::{Zoned, civil::Date, fmt::rfc2822, tz::TimeZone};
 
 use crate::parse::git::parse_git_date_format;
 use crate::parse::raw::parse_raw;
 use crate::{
-    Error, OffsetInSeconds, SecondsSinceUnixEpoch, Time,
+    OffsetInSeconds, SecondsSinceUnixEpoch, Time,
     parse::relative,
     time::format::{DEFAULT, GITOXIDE, ISO8601, ISO8601_STRICT, SHORT},
 };
-use gix_error::{Exn, ResultExt};
+use gix_error::{ResultExt, bail};
+
+/// The widest timezone offset git reads, as `match_tz()` in `date.c` takes the four digits as a
+/// clock time: hours below 24 and minutes below 60, so `+2359` is the last offset it accepts.
+const MAX_OFFSET_IN_SECONDS: i32 = 23 * 3600 + 59 * 60;
 
 /// Parse `input` as any time that Git can parse when inputting a date.
+/// Unknown formats and timezone conversion failures include `input` bytes as [metadata](gix_error::Error::metadata()).
 ///
 /// ## Examples
 ///
@@ -43,9 +49,13 @@ use gix_error::{Exn, ResultExt};
 ///
 /// ### 6. UNIX Timestamp (Seconds Since Epoch)
 ///
+/// Bare numbers must be at least `100000000`, matching Git's epoch threshold. Smaller numbers
+/// like `20080214` are ambiguous with compact dates and are rejected. Prefix smaller or negative
+/// values with `@` to explicitly request epoch seconds.
+///
 /// *   `123456789`
-/// *   `0` (January 1, 1970 UTC)
-/// *   `-1000`
+/// *   `@0` (January 1, 1970 UTC)
+/// *   `@-1000`
 /// *   `1700000000`
 ///
 /// ### 7. Commit Header Format
@@ -53,6 +63,9 @@ use gix_error::{Exn, ResultExt};
 /// *   `1745582210 +0200`
 /// *   `1660874655 +0800`
 /// *   `-1660874655 +0800`
+///
+/// A leading `@` may introduce either of the two forms above, as in `@1745582210 +0200`
+/// or `@1700000000`.
 ///
 /// See also the [`parse_header()`].
 ///
@@ -66,17 +79,44 @@ use gix_error::{Exn, ResultExt};
 /// *   `Thu Sep 4 10:45:06 2022 -0400`
 /// *   `Mon Oct 27 10:30:00 2023 +0000`
 ///
-/// ### 10. Relative Dates (e.g., "2 minutes ago", "1 hour from now")
+/// ### 10. Relative Dates (e.g., "2 minutes ago")
 ///
-/// These dates are parsed *relative to a `now` timestamp*. The examples depend entirely on the value of `now`.
+/// These dates are parsed relative to `now`, whose time zone controls calendar arithmetic.
+/// The examples depend entirely on the value of `now`.
 /// If `now` is October 27, 2023 at 10:00:00 UTC:
 ///     *   `2 minutes ago` (October 27, 2023 at 09:58:00 UTC)
 ///     *   `3 hours ago` (October 27, 2023 at 07:00:00 UTC)
-pub fn parse(input: &str, now: Option<SystemTime>) -> Result<Time, Exn<Error>> {
-    Ok(if let Ok(val) = Date::strptime(SHORT.0, input) {
+///
+/// The forms understood are `now`, `today`, `yesterday`, and one or more `<count> <unit>` pairs,
+/// as in `2 days 3 hours ago`. A count may be spelled out from `one` to `ten`, or be `last`, and
+/// any byte that is neither a digit nor a letter separates the parts, so `1.hour.ago` is the same
+/// as `1 hour ago`. The trailing `ago` is optional.
+///
+/// `<count> <unit>` pairs are applied in input order, the way Git applies them: `second` through `week` each
+/// subtract a fixed number of seconds, while `month` and `year` step down the respective calendar fields,
+/// leaving the day of the month alone.
+/// A day beyond the end of the shorter target month rolls over into the following month: one month before
+/// May 31st is May 1st, not April 30th.
+///
+/// Note that there is no way to name a time in the future: Git has none either, so `1 hour from
+/// now` is an hour in the past to it, and to this function.
+///
+/// In any of these formats, a timezone offset wider than `±23:59` is not a timezone to Git, so it
+/// is not accepted here either.
+pub fn parse(input: &str, now: Option<Zoned>) -> Result<Time> {
+    // A leading `@` explicitly names epoch seconds, including small and negative values.
+    if let Some(rest) = input.strip_prefix('@') {
+        if let Some(val) = parse_raw(rest) {
+            return Ok(val);
+        }
+        if let Ok(seconds) = SecondsSinceUnixEpoch::from_str(rest) {
+            return Ok(Time::new(seconds, 0));
+        }
+    }
+    let time = if let Ok(val) = Date::strptime(SHORT.0, input) {
         let val = val
             .to_zoned(TimeZone::UTC)
-            .or_raise(|| Error::new_with_input("Timezone conversion failed", input))?;
+            .or_raise(|| validation("Timezone conversion failed").with_input(input.as_bytes()))?;
         Time::new(val.timestamp().as_second(), val.offset().seconds())
     } else if let Ok(val) = rfc2822_relaxed(input) {
         Time::new(val.timestamp().as_second(), val.offset().seconds())
@@ -88,18 +128,28 @@ pub fn parse(input: &str, now: Option<SystemTime>) -> Result<Time, Exn<Error>> {
         Time::new(val.timestamp().as_second(), val.offset().seconds())
     } else if let Ok(val) = strptime_relaxed(DEFAULT.0, input) {
         Time::new(val.timestamp().as_second(), val.offset().seconds())
-    } else if let Ok(val) = SecondsSinceUnixEpoch::from_str(input) {
+    } else if let Ok(val) = SecondsSinceUnixEpoch::from_str(input)
+        && val >= 100_000_000
+    {
         Time::new(val, 0)
     } else if let Some(val) = parse_git_date_format(input) {
         val
     } else if let Some(val) = relative::parse(input, now).transpose()? {
-        Time::new(val.timestamp().as_second(), val.offset().seconds())
+        // The offset is inherited from `now`, not parsed from the input, so Git's
+        // textual offset limit does not apply.
+        return Ok(Time::new(val.timestamp().as_second(), val.offset().seconds()));
     } else if let Some(val) = parse_raw(input) {
         // Format::Raw
         val
     } else {
-        return Err(Error::new_with_input("Unknown date format", input))?;
-    })
+        bail!(validation("Unknown date format").with_input(input.as_bytes()));
+    };
+
+    // Jiff parses textual offsets up to 25:59:59, beyond Git's accepted range.
+    if time.offset.abs() > MAX_OFFSET_IN_SECONDS {
+        bail!(validation("Unknown date format").with_input(input.as_bytes()));
+    }
+    Ok(time)
 }
 
 /// Unlike [`parse()`] which handles all kinds of input, this function only parses the commit-header format

@@ -1,9 +1,67 @@
 mod save_to {
 
     use crate::{remote, remote::save::uniformize};
+    use gix_testtools::TestResult;
 
     #[test]
-    fn named_remotes_save_as_is() -> crate::Result {
+    fn legacy_sections_are_cleared_before_saving() -> TestResult {
+        let path = gix_testtools::scripted_fixture_read_only("make_legacy_subsection_repo.sh")?;
+        let repo = gix::open_opts(path, gix::open::Options::isolated())?;
+        let remote = repo.find_remote("origin")?;
+        let mut config = repo.config_snapshot().plumbing().clone();
+        config.section_mut_by_key("remote.origin")?.push("prune", "true")?;
+        config
+            .new_section("remote", "Origin")?
+            .push("url", "https://example.com/modern.git")?;
+
+        remote.save_to(&mut config)?;
+        assert_eq!(
+            config.strings("remote.origin.url").expect("saved URL"),
+            ["https://example.com/legacy.git"],
+            "saving a legacy remote replaces its URL instead of appending a duplicate"
+        );
+        assert_eq!(
+            config.string("remote.Origin.url").expect("modern remote URL"),
+            "https://example.com/modern.git",
+            "the distinct quoted name is left intact"
+        );
+        let generated_core = config.section_by_key("core")?.to_bstring().to_string();
+        let generated_extensions = config
+            .sections_by_name("extensions")
+            .into_iter()
+            .flatten()
+            .map(|section| section.to_bstring().to_string())
+            .collect::<String>();
+        insta::assert_snapshot!(gix_testtools::redact_display_snapshot(&config, &[(&generated_core, ""), (&generated_extensions, "")]), "remote sections retain their spelling and order", @r#"
+        [remote.Origin]
+            prune = true
+            url = https://example.com/legacy.git
+        [branch.Main]
+            remote = origin
+        [remote "Origin"]
+        	url = https://example.com/modern.git
+        "#);
+        assert!(
+            config.to_string().contains("[remote.Origin]"),
+            "retained sections keep their original header spelling"
+        );
+        let origin_config = crate::remote::save::remote_config(&config, "origin");
+        assert!(
+            origin_config.to_string().contains("[remote.Origin]"),
+            "remote config selection includes canonical legacy names"
+        );
+        assert!(
+            !origin_config.to_string().contains("modern.git"),
+            "remote config selection excludes distinct quoted names"
+        );
+        let saved = config.to_bstring();
+        remote.save_to(&mut config)?;
+        assert_eq!(config.to_bstring(), saved, "saving again is idempotent");
+        Ok(())
+    }
+
+    #[test]
+    fn named_remotes_save_as_is() -> TestResult {
         let repo = remote::repo("clone");
         let remote = repo.find_remote("origin")?;
 
@@ -46,20 +104,24 @@ mod save_as_to {
         basic_repo, remote,
         remote::save::{remote_config, uniformize},
     };
+    use gix_testtools::TestResult;
 
     #[test]
-    fn anonymous_remotes_cannot_be_saved_lacking_a_name() -> crate::Result {
+    fn anonymous_remotes_cannot_be_saved_lacking_a_name() -> TestResult {
         let repo = basic_repo()?;
         let remote = repo.remote_at("https://example.com/path")?;
-        assert!(matches!(
-            remote.save_to(&mut gix::config::File::default()).unwrap_err(),
-            gix::remote::save::Error::NameMissing { .. }
-        ));
+        insta::assert_debug_snapshot!(remote
+                .save_to(&mut gix::config::File::default())
+                .expect_err("anonymous remotes cannot be saved lacking a name"), "anonymous remotes cannot be saved lacking a name", @r#"
+        Message {
+            message: "The remote pointing to https://example.com/path is anonymous and can't be saved.",
+        }
+        "#);
         Ok(())
     }
 
     #[test]
-    fn new_anonymous_remote_with_name() -> crate::Result {
+    fn new_anonymous_remote_with_name() -> TestResult {
         let repo = basic_repo()?;
         let mut remote = repo
             .remote_at("https://example.com/path")?
@@ -98,14 +160,12 @@ mod save_as_to {
         );
 
         {
-            let mut new_section = config.section_mut_or_create_new("unrelated", None).expect("works");
+            let mut new_section = config.section_mut_or_create_new("unrelated", None)?;
             new_section.push("a", "value")?;
 
-            config
-                .section_mut_or_create_new("initially-empty-not-removed", "name")
-                .expect("works");
+            config.section_mut_or_create_new("initially-empty-not-removed", "name")?;
 
-            let mut existing_section = config.section_mut_or_create_new("remote", "origin").expect("works");
+            let mut existing_section = config.section_mut_or_create_new("remote", "origin")?;
             existing_section.push("free", "should not be removed")?;
         }
         remote.save_as_to(remote_name, &mut config)?;
@@ -118,7 +178,7 @@ mod save_as_to {
     }
 
     #[test]
-    fn new_remote_in_presence_of_global_section_writes_to_local_file() -> crate::Result {
+    fn new_remote_in_presence_of_global_section_writes_to_local_file() -> TestResult {
         use gix::bstr::ByteSlice;
         // A repo with no remotes, opened so that `remote.origin` exists only as a non-local (`Api`)
         // override, mirroring global configuration like `remote.origin.prune = true` (issue #1951).
@@ -152,7 +212,7 @@ mod save_as_to {
     /// saving another `origin` must clear those inherited values locally, or reopening would merge them
     /// back into the saved URL lists.
     #[test]
-    fn inherited_urls_are_saved_with_reset_markers() -> crate::Result {
+    fn inherited_urls_are_saved_with_reset_markers() -> TestResult {
         use gix::bstr::{BStr, BString};
 
         let repo = gix::open_opts(
@@ -212,7 +272,7 @@ mod save_as_to {
     /// reset-bearing local section after it so reopening clears the included URL before restoring
     /// the remote's effective URL list.
     #[test]
-    fn reset_markers_follow_later_foreign_url_sections() -> crate::Result {
+    fn reset_markers_follow_later_foreign_url_sections() -> TestResult {
         use gix::bstr::{BStr, BString, ByteSlice};
 
         let inherited_url = "https://included.example/path";

@@ -1,0 +1,2 @@
+# Let's not store tar files here to avoid polluting the Git history with often-changing binary files.
+/*.tar

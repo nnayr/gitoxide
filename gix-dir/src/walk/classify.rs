@@ -4,11 +4,12 @@ use std::{
 };
 
 use bstr::{BStr, BString, ByteSlice};
+use gix_error::{Result, ResultExt, message};
 
 use crate::{
     Entry, EntryRef, entry,
     entry::PathspecMatch,
-    walk::{Context, Error, ForDeletionMode, Options},
+    walk::{Context, ForDeletionMode, Options},
 };
 
 /// Classify the `worktree_relative_root` path and return the first `PathKind` that indicates that
@@ -20,7 +21,7 @@ pub fn root(
     worktree_relative_root: &Path,
     options: Options<'_>,
     ctx: &mut Context<'_>,
-) -> Result<(Outcome, bool), Error> {
+) -> Result<(Outcome, bool)> {
     buf.clear();
     let mut last_length = None;
     let mut path_buf = worktree_root.to_owned();
@@ -36,7 +37,7 @@ pub fn root(
             buf.push(b'/');
         }
         path_buf.push(component);
-        buf.extend_from_slice(gix_path::os_str_into_bstr(component.as_os_str()).expect("no illformed UTF8"));
+        buf.extend_from_slice(gix_path::os_str_into_bstr(component.as_os_str())?);
         let file_kind = path_buf.symlink_metadata().ok().map(|m| m.file_type().into());
 
         out = path(
@@ -146,7 +147,7 @@ pub fn path(
         ..
     }: Options<'_>,
     ctx: &mut Context<'_>,
-) -> Result<Outcome, Error> {
+) -> Result<Outcome> {
     let mut out = Outcome {
         status: entry::Status::Pruned,
         property: None,
@@ -163,8 +164,8 @@ pub fn path(
                 ctx.pathspec_attributes,
             )
             .map(Into::into);
-        if for_deletion.is_some() {
-            if let Some(excluded) = ctx
+        if for_deletion.is_some()
+            && let Some(excluded) = ctx
                 .excludes
                 .as_mut()
                 .map_or(Ok(None), |stack| {
@@ -176,11 +177,10 @@ pub fn path(
                         )
                         .map(|platform| platform.excluded_kind())
                 })
-                .map_err(Error::ExcludesAccess)?
+                .or_raise(|| message("Failed to update the excludes stack to see if a path is excluded"))?
                 .filter(|_| filename_start_idx > 0)
-            {
-                out.status = entry::Status::Ignored(excluded);
-            }
+        {
+            out.status = entry::Status::Ignored(excluded);
         }
         out.property = entry::Property::DotGit.into();
         return Ok(out);
@@ -192,12 +192,27 @@ pub fn path(
         return Ok(out.with_status(entry::Status::Pruned));
     }
 
-    let (uptodate_index_kind, index_kind, property) = resolve_file_type_with_index(
+    let (uptodate_index_kind, mut index_kind, property) = resolve_file_type_with_index(
         rela_path,
         ctx.index,
         ctx.ignore_case_index_lookup.filter(|_| ignore_case),
     );
     let mut kind = uptodate_index_kind.or(disk_kind).or_else(on_demand_disk_kind);
+    if kind == Some(entry::Kind::Directory) && index_kind.is_some_and(|kind| !kind.is_dir()) {
+        // A conflict can index both a file and its children; keep the directory tracked.
+        let has_indexed_children = if let Some(lookup) = ctx.ignore_case_index_lookup.filter(|_| ignore_case) {
+            ctx.index
+                .path_is_directory_icase(rela_path.as_bstr(), ignore_case, lookup)
+        } else {
+            rela_path.push(b'/');
+            let has_children = ctx.index.prefixed_entries_range(rela_path.as_bstr()).is_some();
+            rela_path.pop();
+            has_children
+        };
+        if has_indexed_children {
+            index_kind = Some(entry::Kind::Directory);
+        }
+    }
 
     // We always check the pathspec to have the value filled in reliably.
     out.pathspec_match = ctx
@@ -212,7 +227,8 @@ pub fn path(
     }
 
     let maybe_status = if property.is_none() {
-        (index_kind.map(|k| k.is_dir()) == kind.map(|k| k.is_dir())).then_some(entry::Status::Tracked)
+        (index_kind == Some(entry::Kind::Repository) || index_kind.map(|k| k.is_dir()) == kind.map(|k| k.is_dir()))
+            .then_some(entry::Status::Tracked)
     } else {
         out.property = property;
         Some(entry::Status::Pruned)
@@ -238,8 +254,10 @@ pub fn path(
         )
     };
     if let Some(status) = maybe_status {
-        if kind == Some(entry::Kind::Directory) && index_kind == Some(entry::Kind::Repository) {
-            kind = maybe_upgrade_to_repository(kind, false);
+        if kind == Some(entry::Kind::Directory) && index_kind == Some(entry::Kind::Repository) && !recurse_repositories
+        {
+            // A gitlink remains a repository boundary even when its checkout is missing.
+            kind = Some(entry::Kind::Repository);
         }
         return Ok(out.with_status(status).with_kind(kind, index_kind));
     }
@@ -254,7 +272,7 @@ pub fn path(
                 .at_entry(rela_path.as_bstr(), is_dir, ctx.objects)
                 .map(|platform| platform.excluded_kind())
         })
-        .map_err(Error::ExcludesAccess)?
+        .or_raise(|| message("Failed to update the excludes stack to see if a path is excluded"))?
     {
         if emit_ignored.is_some() {
             if matches!(
@@ -420,7 +438,8 @@ fn resolve_file_type_with_index(
             }
         }
     } else {
-        match index.entry_by_path(rela_path.as_bstr()) {
+        // Prefer our side's type, but conflicts without ours are tracked as well.
+        match index.entry_range(rela_path.as_bstr()) {
             None => {
                 rela_path.push(b'/');
                 let res = index.prefixed_entries_range(rela_path.as_bstr());
@@ -456,7 +475,14 @@ fn resolve_file_type_with_index(
                 }
                 (kind, is_tracked.then_some(entry::Kind::Directory))
             }
-            Some(entry) => entry_to_kinds(entry),
+            Some(range) => {
+                let entries = &index.entries()[range];
+                let entry = entries
+                    .iter()
+                    .find(|entry| entry.stage() == gix_index::entry::Stage::Ours)
+                    .unwrap_or_else(|| &entries[entries.len() - 1]);
+                entry_to_kinds(entry)
+            }
         }
     };
     (uptodate_kind, index_kind, special_property)

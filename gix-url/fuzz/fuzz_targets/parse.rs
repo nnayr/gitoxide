@@ -1,11 +1,12 @@
 #![no_main]
-use anyhow::Result;
 use libfuzzer_sys::fuzz_target;
 use std::hint::black_box;
 use std::path::Path;
 
-fn fuzz(data: &[u8]) -> Result<()> {
-    let url = gix_url::parse(data.into())?;
+use gix_error::Result;
+
+fn fuzz(data: &[u8]) -> Result {
+    let url = gix_url::parse(data)?;
     _ = black_box(url.user());
     _ = black_box(url.password());
     _ = black_box(url.password());
@@ -15,6 +16,7 @@ fn fuzz(data: &[u8]) -> Result<()> {
         assert!(!safe_host.starts_with("ssh://-"));
     }
     _ = black_box(url.path_argument_safe());
+    _ = black_box(url.path_query_fragment());
     _ = black_box(url.path_is_root());
     _ = black_box(url.port_or_default());
     _ = black_box(url.canonicalized(Path::new("/cwd")));

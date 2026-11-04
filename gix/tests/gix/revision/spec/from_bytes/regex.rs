@@ -1,9 +1,33 @@
 use gix::prelude::ObjectIdExt;
 
 use crate::{
-    revision::spec::from_bytes::{parse_spec_no_baseline, repo},
+    revision::spec::from_bytes::{parse_spec, parse_spec_no_baseline, repo},
     util::hex_to_id_sha1_only,
 };
+
+#[test]
+fn unresolved_anchors_do_not_search_other_refs() -> gix_testtools::TestResult {
+    let fixture = gix_testtools::scripted_fixture_read_only("make_dangling_revspecs.sh")?;
+    let repo = gix::open_opts(fixture.join("search"), crate::restricted())?;
+    for anchor in ["HEAD", "alias", "cycle"] {
+        for pattern in ["wip", ""] {
+            let spec = format!("{anchor}^{{/{pattern}}}");
+            let err = parse_spec(&spec, &repo).expect_err("the search anchor cannot be resolved");
+            if anchor != "cycle" {
+                assert!(
+                    err.is_not_found(),
+                    "{spec}: the missing anchor's classification is retained"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        parse_spec(":/wip", &repo)?.single(),
+        parse_spec("main^{/wip}", &repo)?.single(),
+        "an unanchored search can still find the commit on another branch"
+    );
+    Ok(())
+}
 
 mod with_known_revision {
     use gix::revision::Spec;
@@ -23,14 +47,15 @@ mod with_known_revision {
         let err = parse_spec_no_baseline("@^{/.*x}", &repo).unwrap_err();
         insta::assert_debug_snapshot!(err, @r#"
         Delegate couldn't find '.*x' (negated: false)
-        |
-        └─ None of 1 commits from 0000000000e matched text ".*x"
+
+        Caused by:
+            0: None of 1 commits from 0000000000e matched text ".*x"
         "#);
-        assert_eq!(
-            err.probable_cause().to_string(),
-            "None of 1 commits from 0000000000e matched text \".*x\"",
-            "regexes are not actually available for us, but git could do that"
-        );
+        insta::assert_debug_snapshot!(err.probable_cause(), "regexes are not actually available for us, but git could do that", @r#"
+        Message {
+            message: "None of 1 commits from 0000000000e matched text \".*x\"",
+        }
+        "#);
     }
 
     #[test]
@@ -58,13 +83,55 @@ mod with_known_revision {
         let err = parse_spec_no_baseline("@^{/^x}", &repo).unwrap_err();
         insta::assert_debug_snapshot!(err, @r#"
         Delegate couldn't find '^x' (negated: false)
-        |
-        └─ None of 1 commits from 0000000000e matched regex "^x"
+
+        Caused by:
+            0: None of 1 commits from 0000000000e matched regex "^x"
         "#);
+        insta::assert_debug_snapshot!(err.probable_cause(), "contained string matches in unanchored regex and disambiguates automatically", @r#"
+        Message {
+            message: "None of 1 commits from 0000000000e matched regex \"^x\"",
+        }
+        "#);
+    }
+}
+
+mod empty_pattern {
+    use super::*;
+    use crate::revision::spec::from_bytes::{parse_spec, repo};
+    use gix_testtools::TestResult;
+
+    #[test]
+    fn matches_everything_and_peels_to_a_commit() -> TestResult {
+        let repo = repo("complex_graph")?;
+
         assert_eq!(
-            err.probable_cause().to_string(),
-            "None of 1 commits from 0000000000e matched regex \"^x\"",
+            parse_spec("@^{/}", &repo)?,
+            parse_spec_no_baseline("@^{commit}", &repo)?,
+            "an empty pattern matches the first commit reachable from the anchor, i.e. the anchor peeled to a commit"
         );
+        assert_eq!(
+            parse_spec("b-tag^{/}", &repo)?,
+            parse_spec("b", &repo)?,
+            "the annotated tag is peeled to its commit first, just like Git"
+        );
+
+        let err = parse_spec("@^{/!-}", &repo).unwrap_err();
+        if cfg!(feature = "revparse-regex") {
+            insta::assert_debug_snapshot!(gix_testtools::redact_debug_snapshot(&err, &[]), "a negated empty pattern matches nothing and fails like Git", @r#"
+            Delegate couldn't find '' (negated: true)
+
+            Caused by:
+                0: None of 10 commits from 55e825e matched regex ""
+            "#);
+        } else {
+            insta::assert_debug_snapshot!(gix_testtools::redact_debug_snapshot(&err, &[]), "a negated empty pattern matches nothing and fails like Git", @r#"
+            Delegate couldn't find '' (negated: true)
+
+            Caused by:
+                0: None of 10 commits from 55e825e matched text ""
+            "#);
+        }
+        Ok(())
     }
 }
 
@@ -100,14 +167,15 @@ mod find_youngest_matching_commit {
         let err = parse_spec_no_baseline(":/messa.e", &repo).unwrap_err();
         insta::assert_debug_snapshot!(err, @r#"
         Delegate couldn't find 'messa.e' (negated: false)
-        |
-        └─ None of 10 commits reached from all references matched text "messa.e"
+
+        Caused by:
+            0: None of 10 commits reached from all references matched text "messa.e"
         "#);
-        assert_eq!(
-            err.probable_cause().to_string(),
-            "None of 10 commits reached from all references matched text \"messa.e\"",
-            "regex definitely don't work as it's not compiled in"
-        );
+        insta::assert_debug_snapshot!(err.probable_cause(), "regex definitely don't work as it's not compiled in", @r#"
+        Message {
+            message: "None of 10 commits reached from all references matched text \"messa.e\"",
+        }
+        "#);
     }
 
     #[test]
@@ -125,13 +193,15 @@ mod find_youngest_matching_commit {
         let err = parse_spec(":/not there", &repo).unwrap_err();
         insta::assert_debug_snapshot!(err, @r#"
         Delegate couldn't find 'not there' (negated: false)
-        |
-        └─ None of 10 commits reached from all references matched regex "not there"
+
+        Caused by:
+            0: None of 10 commits reached from all references matched regex "not there"
         "#);
-        assert_eq!(
-            err.probable_cause().to_string(),
-            "None of 10 commits reached from all references matched regex \"not there\""
-        );
+        insta::assert_debug_snapshot!(err.probable_cause(), "regex matches", @r#"
+        Message {
+            message: "None of 10 commits reached from all references matched regex \"not there\"",
+        }
+        "#);
 
         assert_eq!(
             parse_spec(":/!-message", &repo).unwrap(),

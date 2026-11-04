@@ -1,11 +1,13 @@
 pub(super) mod function {
-    pub fn env() -> anyhow::Result<()> {
+    use gix::Result;
+    pub fn env() -> Result<()> {
         for (name, value) in std::env::vars_os() {
             println!("{}={}", repr(&name), repr(&value));
         }
         Ok(())
     }
 
+    #[allow(clippy::unnecessary_debug_formatting, reason = "preserve non-UTF-8 bytes")]
     fn repr(text: &std::ffi::OsStr) -> String {
         text.to_str()
             .filter(|s| !s.chars().any(|c| c == '"' || c == '\n'))

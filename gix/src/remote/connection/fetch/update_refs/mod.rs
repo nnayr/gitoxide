@@ -1,14 +1,12 @@
-#![allow(clippy::result_large_err)]
-use std::{collections::BTreeMap, path::PathBuf};
-
+use gix_error::ResultExt;
 use gix_object::Exists;
 use gix_ref::{
     Target, TargetRef,
-    transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog},
+    transaction::{Change, PreviousValue, RefEdit},
 };
 
 use crate::{
-    Repository,
+    Repository, Result,
     ext::ObjectIdExt,
     remote::{
         fetch,
@@ -70,13 +68,13 @@ pub(crate) fn update(
     fetch_tags: fetch::Tags,
     dry_run: fetch::DryRun,
     write_packed_refs: fetch::WritePackedRefs,
-) -> Result<update::Outcome, update::Error> {
+) -> Result<update::Outcome> {
     let _span = gix_trace::detail!("update_refs()", mappings = mappings.len());
     let mut edits = Vec::new();
     let mut updates = Vec::new();
     let mut edit_indices_to_validate = Vec::new();
 
-    let mut checked_out_branches = worktree_branches(repo)?;
+    let mut checked_out_branches = repo.checked_out_branches()?;
     let implicit_tag_refspec = fetch_tags
         .to_refspec()
         .filter(|_| matches!(fetch_tags, crate::remote::fetch::Tags::Included));
@@ -98,18 +96,19 @@ pub(crate) fn update(
     ) {
         // `None` only if unborn.
         let remote_id = remote.as_id();
-        if matches!(dry_run, fetch::DryRun::No) && !remote_id.is_none_or(|id| repo.objects.exists(id)) {
-            if let Some(remote_id) = remote_id.filter(|id| !repo.objects.exists(id)) {
-                let update = if is_implicit_tag {
-                    Mode::ImplicitTagNotSentByRemote.into()
-                } else {
-                    // Assure the ODB is not to blame for the missing object.
-                    repo.try_find_object(remote_id)?;
-                    Mode::RejectedSourceObjectNotFound { id: remote_id.into() }.into()
-                };
-                updates.push(update);
-                continue;
-            }
+        if matches!(dry_run, fetch::DryRun::No)
+            && !remote_id.is_none_or(|id| repo.objects.exists(id))
+            && let Some(remote_id) = remote_id.filter(|id| !repo.objects.exists(id))
+        {
+            let update = if is_implicit_tag {
+                Mode::ImplicitTagNotSentByRemote.into()
+            } else {
+                // Assure the ODB is not to blame for the missing object.
+                repo.try_find_object(remote_id)?;
+                Mode::RejectedSourceObjectNotFound { id: remote_id.into() }.into()
+            };
+            updates.push(update);
+            continue;
         }
         let (mode, edit_index, type_change) = match local {
             Some(name) => {
@@ -128,6 +127,7 @@ pub(crate) fn update(
                         match existing
                             .try_id()
                             .map_or_else(|| existing.clone().peel_to_id(), Ok)
+                            .or_raise(|| gix_error::message("Could not peel symbolic local reference to its ID"))
                             .map(crate::Id::detach)
                         {
                             Ok(local_id) => {
@@ -153,31 +153,28 @@ pub(crate) fn update(
                                     let mut force = spec.allow_non_fast_forward();
                                     let is_fast_forward = match dry_run {
                                         fetch::DryRun::No => {
-                                            let ancestors = repo
-                                                .find_object(local_id)?
-                                                .try_into_commit()
-                                                .map_err(|_| ())
-                                                .and_then(|c| c.committer().map(|a| a.seconds()).map_err(|_| ()))
-                                                .and_then(|local_commit_time| {
-                                                    remote_id
-                                                        .to_owned()
-                                                        .ancestors(&repo.objects)
-                                                        .sorting(
-                                                            gix_traverse::commit::simple::Sorting::ByCommitTimeCutoff {
-                                                                order: Default::default(),
-                                                                seconds: local_commit_time,
-                                                            },
-                                                        )
-                                                        .map_err(|_| ())
-                                                });
-                                            match ancestors {
-                                                Ok(mut ancestors) => {
-                                                    ancestors.any(|cid| cid.is_ok_and(|c| c.id == local_id))
-                                                }
-                                                Err(_) => {
-                                                    force = true;
-                                                    false
-                                                }
+                                            let local = repo.find_object(local_id)?;
+                                            if local.kind == gix_object::Kind::Commit
+                                                && repo.find_header(remote_id)?.kind() == gix_object::Kind::Commit
+                                            {
+                                                let local_commit_time = local.into_commit().committer()?.seconds();
+                                                let mut ancestors =
+                                                    remote_id.to_owned().ancestors(&repo.objects).sorting(
+                                                        gix_traverse::commit::simple::Sorting::ByCommitTimeCutoff {
+                                                            order: Default::default(),
+                                                            seconds: local_commit_time,
+                                                        },
+                                                    )?;
+                                                // Stop at either a matching ancestor or the first traversal error.
+                                                ancestors
+                                                    .find(|entry| {
+                                                        entry.as_ref().map_or(true, |entry| entry.id == local_id)
+                                                    })
+                                                    .transpose()?
+                                                    .is_some()
+                                            } else {
+                                                force = true;
+                                                false
                                             }
                                         }
                                         fetch::DryRun::Yes => true,
@@ -203,9 +200,7 @@ pub(crate) fn update(
                                     PreviousValue::MustExistAndMatch(existing.target().into_owned()),
                                 )
                             }
-                            Err(crate::reference::peel::Error::ToId(gix_ref::peel::to_id::Error::FollowToObject(
-                                gix_ref::peel::to_object::Error::Follow(_),
-                            ))) => {
+                            Err(err) if err.downcast_any_ref::<gix_ref::file::find::NotFound>().is_some() => {
                                 // An unborn reference, always allow it to be changed to whatever the remote wants.
                                 (
                                     if existing.target().try_name().map(gix_ref::FullNameRef::as_bstr)
@@ -220,11 +215,16 @@ pub(crate) fn update(
                                     PreviousValue::MustExistAndMatch(existing.target().into_owned()),
                                 )
                             }
-                            Err(err) => return Err(err.into()),
+                            Err(err) => return Err(err),
                         }
                     }
                     None => {
-                        let name: gix_ref::FullName = name.try_into()?;
+                        let name = gix_ref::FullName::try_from(name).or_raise(|| {
+                            gix_error::message(
+                                "A remote reference had a name that wasn't considered valid. \
+                                 Corrupt remote repo or insufficient checks on remote?",
+                            )
+                        })?;
                         let reflog_msg = match name.category() {
                             Some(gix_ref::Category::Tag) => "storing tag",
                             Some(gix_ref::Category::LocalBranch) => "storing head",
@@ -262,21 +262,9 @@ pub(crate) fn update(
                     let anticipated_update_index = updates.len();
                     edit_indices_to_validate.push((anticipated_update_index, edit_index));
                 }
-                let edit = RefEdit {
-                    change: Change::Update {
-                        log: LogChange {
-                            mode: RefLog::AndReference,
-                            force_create_reflog: false,
-                            message: message.compose(reflog_message),
-                        },
-                        expected: previous_value,
-                        new,
-                    },
-                    name,
-                    // We must not deref symrefs or we will overwrite their destination, which might be checked out
-                    // and we don't check for that case.
-                    deref: false,
-                };
+                // We must not deref symrefs or we will overwrite their destination, which might be checked out
+                // and we don't check for that case.
+                let edit = RefEdit::update(name, new, previous_value, message.compose(reflog_message));
                 edits.push(edit);
                 (mode, Some(edit_index), type_change)
             }
@@ -321,10 +309,9 @@ pub(crate) fn update(
     let edits = match dry_run {
         fetch::DryRun::No => {
             let _span = gix_trace::detail!("apply", edits = edits.len());
-            let (file_lock_fail, packed_refs_lock_fail) = repo
-                .config
-                .lock_timeout()
-                .map_err(crate::reference::edit::Error::from)?;
+            let (file_lock_fail, packed_refs_lock_fail) = repo.config.lock_timeout().or_raise(|| {
+                gix_error::message("Failed to update references to their new position to match their remote locations")
+            })?;
             repo.refs
                 .transaction()
                 .packed_refs(
@@ -335,9 +322,25 @@ pub(crate) fn update(
                     }
                 )
                 .prepare(edits, file_lock_fail, packed_refs_lock_fail)
-                .map_err(crate::reference::edit::Error::from)?
-                .commit(repo.committer().transpose().map_err(|err| update::Error::EditReferences(crate::reference::edit::Error::ParseCommitterTime(err)))?)
-                .map_err(crate::reference::edit::Error::from)?
+                .or_raise(|| {
+                    gix_error::message(
+                        "Failed to update references to their new position to match their remote locations",
+                    )
+                })?
+                .commit(
+                    repo.committer()
+                        .transpose()
+                        .or_raise(|| {
+                            gix_error::message(
+                                "Failed to update references to their new position to match their remote locations",
+                            )
+                        })?,
+                )
+                .or_raise(|| {
+                    gix_error::message(
+                        "Failed to update references to their new position to match their remote locations",
+                    )
+                })?
         }
         fetch::DryRun::Yes => edits,
     };
@@ -392,7 +395,7 @@ fn update_needs_adjustment_as_edits_symbolic_target_is_missing(
 ///
 /// Born symbolic remote refs are written as direct refs to the advertised target object id.
 /// Unborn remote refs remain symbolic as there is no object id to write.
-fn new_value_by_remote(remote: &Source) -> Result<Target, update::Error> {
+fn new_value_by_remote(remote: &Source) -> Result<Target> {
     let remote_id = remote.as_id();
     Ok(
         if let Source::Ref(
@@ -402,43 +405,17 @@ fn new_value_by_remote(remote: &Source) -> Result<Target, update::Error> {
             match remote_id {
                 Some(desired_id) => Target::Object(desired_id.to_owned()),
                 // Unborn branches we create as such, with the location they point to on the remote which helps mirroring.
-                None => Target::Symbolic(target.try_into()?),
+                None => Target::Symbolic(gix_ref::FullName::try_from(target).or_raise(|| {
+                    gix_error::message(
+                        "A remote reference had a name that wasn't considered valid. \
+                         Corrupt remote repo or insufficient checks on remote?",
+                    )
+                })?),
             }
         } else {
             Target::Object(remote_id.expect("unborn case handled earlier").to_owned())
         },
     )
-}
-
-fn insert_head(
-    head: Option<crate::Head<'_>>,
-    out: &mut BTreeMap<gix_ref::FullName, Vec<PathBuf>>,
-) -> Result<(), update::Error> {
-    if let Some((head, wd)) = head.and_then(|head| head.repo.workdir().map(|wd| (head, wd))) {
-        out.entry("HEAD".try_into().expect("valid"))
-            .or_default()
-            .push(wd.to_owned());
-        let mut ref_chain = Vec::new();
-        let mut cursor = head.try_into_referent();
-        while let Some(ref_) = cursor {
-            ref_chain.push(ref_.name().to_owned());
-            cursor = ref_.follow().transpose()?;
-        }
-        for name in ref_chain {
-            out.entry(name).or_default().push(wd.to_owned());
-        }
-    }
-    Ok(())
-}
-
-fn worktree_branches(repo: &Repository) -> Result<BTreeMap<gix_ref::FullName, Vec<PathBuf>>, update::Error> {
-    let mut map = BTreeMap::new();
-    insert_head(repo.head().ok(), &mut map)?;
-    for proxy in repo.worktrees()? {
-        let repo = proxy.into_repo_with_possibly_inaccessible_worktree()?;
-        insert_head(repo.head().ok(), &mut map)?;
-    }
-    Ok(map)
 }
 
 #[cfg(test)]

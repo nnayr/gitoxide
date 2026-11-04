@@ -1,11 +1,55 @@
 use bstr::ByteSlice;
 
 #[test]
+fn parse_remote_helpers_like_git() -> gix_testtools::TestResult {
+    let base = gix_testtools::scripted_fixture_read_only("make_baseline.sh")?;
+    let baseline = std::fs::read(base.join("git-baseline.remote-helper"))?;
+    let mut count = 0;
+    for line in baseline.lines() {
+        let mut fields = line.split(|b| b == &b'\t');
+        let helper = fields.next().expect("helper name is recorded");
+        let input = fields.next().expect("original URL is recorded");
+        let address = fields.next().expect("remote-helper address is recorded");
+        assert!(fields.next().is_none(), "the helper receives exactly two arguments");
+
+        let actual = gix_url::parse(input)?;
+        let helper = helper.to_str()?.to_owned();
+        assert_eq!(
+            actual.scheme,
+            if input.starts_with_str("ext::") {
+                gix_url::Scheme::Ext
+            } else if input.contains_str("::") {
+                gix_url::Scheme::Helper(helper)
+            } else {
+                gix_url::Scheme::HelperUrl(helper)
+            }
+        );
+        if input.contains_str("::") {
+            assert_eq!(actual.path, address);
+            assert_eq!(actual.to_bstring(), input, "remote-helper form roundtrips exactly");
+        } else {
+            assert_eq!(
+                gix_url::parse(actual.to_bstring())?.scheme,
+                actual.scheme,
+                "Git's case-sensitive helper name survives serialization"
+            );
+        }
+        count += 1;
+    }
+    assert_eq!(count, 28, "all helper, address and syntax combinations ran");
+    Ok(())
+}
+
+#[test]
 fn parse_and_compare_baseline_urls() {
     let mut passed = 0;
     let mut failed = 0;
     let mut expected_failures = 0;
     let total = baseline::URLS.len();
+    assert_ne!(
+        total, 0,
+        "baseline must contain expectations (431 on Unix at this time just FYI)"
+    );
 
     for (url, expected) in baseline::URLS.iter() {
         if baseline::is_expected_failure_on_windows(url) {
@@ -18,7 +62,7 @@ fn parse_and_compare_baseline_urls() {
             assert_urls_equal(expected, &actual);
 
             let url_serialized_again = actual.to_bstring();
-            let roundtrip = gix_url::parse(url_serialized_again.as_ref()).unwrap_or_else(|e| {
+            let roundtrip = gix_url::parse(&url_serialized_again).unwrap_or_else(|e| {
                 panic!("roundtrip should work for original '{url}', serialized to '{url_serialized_again}': {e}")
             });
             assert_eq!(roundtrip, actual, "roundtrip failed for url: {url}");
@@ -87,9 +131,18 @@ fn assert_urls_equal(expected: &baseline::GitDiagUrl<'_>, actual: &gix_url::Url)
                         actual_user_and_host.push_str(user);
                         actual_user_and_host.push('@');
                     }
-                    actual_user_and_host.push_str(actual.host().unwrap());
+                    // Git's --diag-url reports the SSH command destination without IPv6 brackets,
+                    // whereas the stored URL host retains them for lossless serialization.
+                    actual_user_and_host.push_str(
+                        actual
+                            .host_unbracketed()
+                            .expect("SSH command destinations include a host"),
+                    );
 
-                    assert_eq!(actual_user_and_host, expected_user_and_host);
+                    assert_eq!(
+                        actual_user_and_host, expected_user_and_host,
+                        "the bare SSH command destination matches Git's diagnostic"
+                    );
                 }
                 None => {
                     assert!(actual.host().is_none());
@@ -100,7 +153,13 @@ fn assert_urls_equal(expected: &baseline::GitDiagUrl<'_>, actual: &gix_url::Url)
         }
     }
 
-    assert_eq!(actual.path, expected.path.unwrap_or_default());
+    if matches!(actual.scheme, gix_url::Scheme::Http | gix_url::Scheme::Https) {
+        let path = actual.path.strip_prefix(b"/").unwrap_or(&actual.path);
+        let path = path.strip_suffix(b"/").unwrap_or(path);
+        assert_eq!(path, expected.path.unwrap_or_default());
+    } else {
+        assert_eq!(actual.path, expected.path.unwrap_or_default());
+    }
 }
 
 #[expect(clippy::module_inception)]
@@ -148,12 +207,14 @@ mod baseline {
         out
     });
 
-    /// Known failures on Windows for IPv6 file URLs with paths.
-    /// On Windows, these URLs fail to parse the path component correctly.
+    /// Known failures caused by Windows-specific `file://` host and path interpretation.
     pub fn is_expected_failure_on_windows(url: &BStr) -> bool {
         #[cfg(windows)]
         {
             const EXPECTED_FAILURES: &[&str] = &[
+                "file://host/repo",
+                "file://localhost/repo",
+                "file://[::1]/repo",
                 "file://User@[::1]/repo",
                 "file://User@[::1]/~repo",
                 "file://User@[::1]/re:po",

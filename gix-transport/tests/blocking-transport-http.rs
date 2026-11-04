@@ -1,11 +1,13 @@
 extern crate core;
 
-pub use ::bisync::synchronous as bisync;
+pub mod bisync {
+    pub use gix_macros::{discard as only_async, keep as only_sync, sync as bisync};
+}
 
 use std::path::PathBuf;
 
-pub type Error = Box<dyn std::error::Error>;
-pub type Result<T = ()> = std::result::Result<T, Error>;
+pub type Error = Box<dyn std::error::Error + Send + Sync>;
+pub use gix_testtools::TestResult;
 
 pub fn fixture_bytes(path: &str) -> Vec<u8> {
     fn fixture_path(path: &str) -> PathBuf {

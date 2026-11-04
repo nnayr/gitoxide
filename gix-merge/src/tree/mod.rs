@@ -1,28 +1,33 @@
 use bstr::BString;
 use gix_diff::{Rewrites, tree_with_rewrites::Change};
+use gix_error::ClassificationMarker;
 
-/// The error returned by [`tree()`](crate::tree()).
-#[derive(Debug, thiserror::Error)]
-#[expect(missing_docs)]
+/// A recoverable failure of [`tree()`](crate::tree()).
+/// Other failures retain their original causes in the returned exception.
+#[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
-    #[error("Could not find ancestor, our or their tree to get started")]
-    FindTree(#[from] gix_object::find::existing_object::Error),
-    #[error("Could not find ancestor, our or their tree iterator to get started")]
-    FindTreeIter(#[from] gix_object::find::existing_iter::Error),
-    #[error("Failed to diff our side or their side")]
-    DiffTree(#[from] gix_diff::tree_with_rewrites::Error),
-    #[error("Could not apply merge result to base tree")]
-    TreeEdit(#[from] gix_object::tree::editor::Error),
-    #[error("Failed to load resource to prepare for blob merge")]
-    BlobMergeSetResource(#[from] crate::blob::platform::set_resource::Error),
-    #[error(transparent)]
-    BlobMergePrepare(#[from] crate::blob::platform::prepare_merge::Error),
-    #[error(transparent)]
-    BlobMerge(#[from] crate::blob::platform::merge::Error),
-    #[error("Failed to write merged blob content as blob to the object database")]
-    WriteBlobToOdb(Box<dyn std::error::Error + Send + Sync + 'static>),
-    #[error("The merge was performed, but the binary merge result couldn't be selected as it wasn't found")]
-    MergeResourceNotFound,
+    /// The selected binary merge resource is absent, such as the ancestor of an add/add conflict.
+    /// Classified as [`gix_error::Class::NotFound`].
+    MissingBinaryMergeResult,
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingBinaryMergeResult => f.write_str(
+                "The merge was performed, but the binary merge result couldn't be selected as it wasn't found",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::MissingBinaryMergeResult => Some(const { &ClassificationMarker::NOT_FOUND }),
+        }
+    }
 }
 
 /// The outcome produced by [`tree()`](crate::tree()).
@@ -244,11 +249,9 @@ impl Conflict {
                                     .content_merge()
                                     .is_some_and(|merged_blob| content_merge_unresolved(&merged_blob))
                         }
-                        Resolution::OursModifiedTheirsRenamedAndChangedThenRename {
-                            merged_blob,
-                            final_location,
-                            ..
-                        } => final_location.is_some() || merged_blob.as_ref().is_some_and(content_merge_unresolved),
+                        Resolution::OursModifiedTheirsRenamedAndChangedThenRename { merged_blob, .. } => {
+                            merged_blob.as_ref().is_some_and(content_merge_unresolved)
+                        }
                         Resolution::OursModifiedTheirsModifiedThenBlobContentMerge { merged_blob } => {
                             content_merge_unresolved(merged_blob)
                         }
@@ -292,8 +295,12 @@ impl Conflict {
     pub fn content_merge(&self) -> Option<ContentMerge> {
         fn failure_merged_blob(failure: &ResolutionFailure) -> Option<ContentMerge> {
             match failure {
-                ResolutionFailure::OursRenamedTheirsRenamedDifferently { merged_blob } => *merged_blob,
+                ResolutionFailure::OursRenamedTheirsRenamedDifferently { merged_blob }
+                | ResolutionFailure::DirectoryRename { merged_blob, .. } => *merged_blob,
                 ResolutionFailure::Unknown
+                | ResolutionFailure::SubmoduleMerge
+                | ResolutionFailure::SubmoduleAddAdd
+                | ResolutionFailure::OursRenamedTheirsRenamedToSameLocation
                 | ResolutionFailure::OursDirectoryTheirsNonDirectoryTheirsRenamed { .. }
                 | ResolutionFailure::OursModifiedTheirsDeleted
                 | ResolutionFailure::OursModifiedTheirsRenamedTypeMismatch
@@ -301,6 +308,7 @@ impl Conflict {
                     renamed_unique_path_to_modified_blob: _,
                 }
                 | ResolutionFailure::OursAddedTheirsAddedTypeMismatch { .. }
+                | ResolutionFailure::DistinctTypes { .. }
                 | ResolutionFailure::OursDeletedTheirsRenamed => None,
             }
         }
@@ -357,6 +365,29 @@ pub enum Resolution {
 /// Describes of a conflict involving *our* change and *their* failed to be resolved.
 #[derive(Debug, Clone)]
 pub enum ResolutionFailure {
+    /// A new path was relocated through a directory renamed on the other side, but its location needs confirmation.
+    DirectoryRename {
+        /// The suggested repository-relative path, used in the provisional tree and unmerged index.
+        final_location: BString,
+        /// The content merge, if the relocated path also met a change at its destination.
+        merged_blob: Option<ContentMerge>,
+    },
+    /// Both sides produced different non-tree types at one path. Both versions are retained,
+    /// moving regular files aside, or moving both entries if neither is a regular file.
+    DistinctTypes {
+        /// The resulting location of our entry.
+        our_location: BString,
+        /// The resulting location of their entry.
+        their_location: BString,
+    },
+    /// *ours* and *theirs* produced conflicting commits for a submodule, but submodule history isn't available to this
+    /// tree merge to determine whether either commit contains the other.
+    SubmoduleMerge,
+    /// *ours* and *theirs* added different submodule commits at the same path, possibly by renaming one into place.
+    /// There is no common gitlink at this path, so this is not a candidate for three-way reachability resolution.
+    SubmoduleAddAdd,
+    /// *ours* and *theirs* renamed different source entries to the same destination.
+    OursRenamedTheirsRenamedToSameLocation,
     /// *ours* was renamed, but *theirs* was renamed differently. Both versions will be present in the tree,
     OursRenamedTheirsRenamedDifferently {
         /// If `Some(…)`, the content of the involved blob had to be merged.
@@ -411,6 +442,14 @@ pub struct ContentMerge {
 /// A way to configure [`tree()`](crate::tree()).
 #[derive(Default, Debug, Clone)]
 pub struct Options {
+    /// How to handle new paths inside a directory renamed on the other side, defaulting to [`DirectoryRenames::Conflict`].
+    ///
+    /// When [`rewrites`](Self::rewrites) is `None`, file-rename detection is disabled, so directory renames cannot
+    /// be inferred. Every value of this field then behaves like [`DirectoryRenames::Disabled`]: new paths stay
+    /// at their explicit locations, without relocation or file-location conflicts from inferred directory renames.
+    /// With rewrite tracking enabled, this field only controls inferred directory relocation; selecting
+    /// [`DirectoryRenames::Disabled`] does not disable explicit file-rename detection.
+    pub directory_renames: DirectoryRenames,
     /// If *not* `None`, rename tracking will be performed when determining the changes of each side of the merge.
     ///
     /// Note that [empty blobs](Rewrites::track_empty) should not be tracked for best results.
@@ -440,6 +479,20 @@ pub struct Options {
     /// the entries what would fit the index if no forced resolution was performed.
     /// It's up to the caller to handle that information mindfully.
     pub tree_conflicts: Option<ResolveWith>,
+}
+
+/// Control inferred relocation of additions and rename destinations through directory renames.
+///
+/// This corresponds to Git's `merge.directoryRenames` and defaults to [`Conflict`](Self::Conflict), like Git.
+#[derive(Default, Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum DirectoryRenames {
+    /// Leave new paths at their explicit locations, without disabling file-rename detection.
+    Disabled,
+    /// Relocate new paths, but report a file-location conflict even if their contents merge cleanly.
+    #[default]
+    Conflict,
+    /// Relocate new paths automatically, only reporting other conflicts encountered at the destination.
+    Enabled,
 }
 
 /// Decide how to resolve tree-related conflicts, but only those that have [no way of being correct](ResolutionFailure).
@@ -526,6 +579,13 @@ pub mod apply_index_entries {
                         }
                     },
                     Err(failure) => match failure {
+                        ResolutionFailure::DirectoryRename { final_location, .. } => {
+                            (Some(final_location.as_bstr()), final_location.as_bstr())
+                        }
+                        ResolutionFailure::DistinctTypes {
+                            our_location,
+                            their_location,
+                        } => (Some(their_location.as_bstr()), our_location.as_bstr()),
                         ResolutionFailure::OursDirectoryTheirsNonDirectoryTheirsRenamed {
                             renamed_unique_path_of_theirs,
                         } => (Some(renamed_unique_path_of_theirs.as_bstr()), conflict.ours.location()),
@@ -533,6 +593,9 @@ pub mod apply_index_entries {
                             (Some(conflict.theirs.location()), conflict.ours.location())
                         }
                         ResolutionFailure::OursModifiedTheirsRenamedTypeMismatch
+                        | ResolutionFailure::SubmoduleMerge
+                        | ResolutionFailure::SubmoduleAddAdd
+                        | ResolutionFailure::OursRenamedTheirsRenamedToSameLocation
                         | ResolutionFailure::OursDeletedTheirsRenamed
                         | ResolutionFailure::OursModifiedTheirsDeleted
                         | ResolutionFailure::Unknown => (None, conflict.ours.location()),

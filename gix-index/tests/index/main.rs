@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use gix_hash::ObjectId;
 use gix_testtools::size_ok;
 
-pub use gix_testtools::{Result, scripted_fixture_read_only};
+pub use gix_testtools::Result;
 
 mod access;
 mod entry;
@@ -52,20 +52,25 @@ pub fn hex_to_id(hex: &str) -> ObjectId {
 
 /// Get an object database handle for `objects_dir`, respecting the hash kind configured for tests.
 pub fn odb_at(objects_dir: impl Into<PathBuf>) -> Result<gix_odb::Handle> {
-    Ok(gix_odb::at_opts(
-        objects_dir,
-        Vec::new(),
-        gix_odb::store::init::Options {
-            object_hash: gix_testtools::object_hash(),
-            ..Default::default()
-        },
-    )?)
+    Ok(gix_odb::at(objects_dir, gix_testtools::object_hash())?)
 }
 
 pub fn fixture_index_path(name: &str) -> PathBuf {
-    let dir = gix_testtools::scripted_fixture_read_only(Path::new("make_index").join(name).with_extension("sh"))
-        .expect("script works");
+    let script = Path::new("make_index").join(name).with_extension("sh");
+    let dir = scripted_fixture_read_only(script).expect("script works");
     dir.join(".git").join("index")
+}
+
+pub fn scripted_fixture_read_only(script: impl AsRef<Path>) -> gix_testtools::Result<PathBuf> {
+    let script = script.as_ref();
+    // This index stores filesystem mtimes which are asserted in a snapshot. A normal caller with
+    // GIX_TEST_IGNORE_ARCHIVES would regenerate and, when CI archive creation is enabled, overwrite
+    // the frozen archive with current mtimes before the snapshot test can extract it.
+    if script == Path::new("make_index/v2_more_files.sh") {
+        gix_testtools::scripted_fixture_read_only_needs_archive(script)
+    } else {
+        gix_testtools::scripted_fixture_read_only(script)
+    }
 }
 
 pub fn fixture_index_path_needs_archive(name: &str) -> PathBuf {

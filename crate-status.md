@@ -84,7 +84,7 @@ The top-level crate that acts as hub to all functionality provided by the `gix-*
         * [x] support for `GIT_CEILING_DIRECTORIES` environment variable
         * [ ] handle other non-discovery modes and provide control over environment variable usage required in applications
     * [x] rev-parse
-       - [ ] handle relative paths as relative to working directory
+       - [x] handle relative paths as relative to working directory
        - [x] handle `upstream` and `push` resolution.
     * [x] rev-walk
         * [x] include tips
@@ -98,7 +98,7 @@ The top-level crate that acts as hub to all functionality provided by the `gix-*
         * [x] use credential helper configuration and to obtain credentials with `gix_credentials::helper::Cascade`
     * **traverse**
         * [x] commit graphs
-        * [ ] make [git-notes](https://git-scm.com/docs/git-notes) accessible
+        * [x] make [git-notes](https://git-scm.com/docs/git-notes) accessible
         * [x] tree entries
     * **diffs/changes**
         * [x] tree with other tree
@@ -189,7 +189,8 @@ The top-level crate that acts as hub to all functionality provided by the `gix-*
             * [ ] obtain 'prunable' information
         * [x] proper handling of worktree related refs
         * [x] create a byte stream and create archives for such a stream, including worktree filters and conversions
-        * [ ] create, move, remove, and repair
+        * [x] create linked worktrees
+        * [ ] move, remove, and repair linked worktrees
         * [x] access exclude information
         * [x] access attribute information
         * [x] respect `core.worktree` configuration
@@ -239,19 +240,22 @@ The top-level crate that acts as hub to all functionality provided by the `gix-*
 * [x] hashset
 
 ### gix-utils
-* **filesystem**
-   * [x] probe capabilities
-   * [x] symlink creation and removal
-   * [x] file snapshots
+* Shared progress, interruption, decoding, iterator, and cache diagnostic utilities.
+* Optional **progress**, **interrupt**, and **io-pipe** features enable their dependencies.
+* Optional progress unit features select human-readable number and byte formatting.
 * [ ] **BString Interner with Arena-Backing and arbitrary value association**
     - probably based on [`internment`](https://docs.rs/internment/latest/internment/struct.Arena.html#),
       but needs `bumpalo` support to avoid item allocations/boxing, and avoid internal `Mutex`. (key type is pointer based).
 
 ### gix-fs
-* [x] probe capabilities
-* [x] symlink creation and removal
-* [x] file snapshots
-* [x] stack abstraction
+* Stable API limited to race-proof creation, public retry configuration, boundary cleanup, and permission application for tempfiles and locks.
+* Other filesystem APIs, including `serde` and `walkdir` support, require `unstable`.
+* [x] race-proof directory creation with public retry configuration and shared-repository permissions
+* [x] empty-directory cleanup with a boundary
+* [x] probe capabilities (experimental, requires `unstable`)
+* [x] symlink creation and removal (experimental, requires `unstable`)
+* [x] file snapshots (experimental, requires `unstable`)
+* [x] stack abstraction (experimental, requires `unstable`)
 
 ### gix-object
 * *decode (zero-copy)* borrowed objects
@@ -619,7 +623,7 @@ Provide a native SSH transport and authentication backend so `gix` users can shi
 
 A mechanism to associate metadata with any object, and keep revisions of it using git itself.
 
-* [ ] CRUD for git notes
+* [x] CRUD for git notes
 
 ### gix-negotiate
 * **algorithms**
@@ -804,6 +808,7 @@ Make it the best-performing implementation and the most convenient one.
 
 ### gix-worktree
 * [x] A stack to to efficiently generate attribute lists for matching paths against.
+* [x] Transactionally prepare linked-worktree administration and roll it back on failure.
 
 ### gix-revision
 * [x] `describe()` (similar to `git name-rev`)
@@ -1057,9 +1062,8 @@ Provide a reftable backend for refs and reflogs as part of Git 3.0 compatibility
 [quarantine]: https://github.com/git/git/blob/master/Documentation/git-receive-pack.txt#L223:L223
 
 
-### gix-features
-* **io-pipe** feature toggle
-    * a unix like pipeline for bytes
+### gix-parallel
+* Shared ownership and mutation primitives switch between `Rc`/`RefCell` and `Arc`/locks.
 * **parallel** feature toggle
     * _When on…_
         * `in_parallel`

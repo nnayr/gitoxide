@@ -5,14 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## 0.70.0 (2026-04-28)
+## 0.77.0 (2026-10-22)
 
 ### Commit Statistics
 
 <csr-read-only-do-not-edit/>
 
- - 2 commits contributed to the release over the course of 2 calendar days.
- - 3 days passed between releases.
+ - 4 commits contributed to the release over the course of 14 calendar days.
+ - 14 days passed between releases.
  - 0 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -23,6 +23,818 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <details><summary>view details</summary>
 
  * **Uncategorized**
+    - Merge pull request #3065 from srijs/claude/project-thread-kr3hdl ([`0a49d46`](https://github.com/GitoxideLabs/gitoxide/commit/0a49d46f6a0b08943930d5247693992b89e98c1b))
+    - Merge pull request #3053 from GitoxideLabs/various-improvements ([`2d8dcc4`](https://github.com/GitoxideLabs/gitoxide/commit/2d8dcc466750e474e6c51ac636c24259563a26cf))
+    - Release gix-error v0.5.1, gix-utils v0.5.1 ([`6d1b686`](https://github.com/GitoxideLabs/gitoxide/commit/6d1b68632cec55fa5d3f752ca97daca4e5485b6c))
+    - Merge pull request #3048 from GitoxideLabs/new-release ([`5fccccf`](https://github.com/GitoxideLabs/gitoxide/commit/5fccccfdedd17f7d4b0cc57039d118a3496aa8aa))
+</details>
+
+## 0.76.0 (2026-10-08)
+
+### Bug Fixes
+
+ - <csr-id-781b6061ee8bb1c25e952ea0de57697029c0ff79/> reject incomplete delta traversals and overlapping offsets
+   <!-- agent -->
+   A Report describes indexed delta components that cannot be reached from
+   any base object yet pass delta-tree verification. Require every indexed item
+   to have been inspected before returning success, using the existing object
+   counter. Legitimate forward references remain supported.
+   
+   Return corruption errors for duplicate or overlapping index offsets and for
+   an entry at or past the pack end, instead of panicking. The reported decoder
+   cycle and allocation problem is handled by the fix.
+   
+   Three regressions failed before the fix: an unresolved cycle was accepted,
+   while duplicate offsets and an invalid pack end panicked. Coverage includes
+   self and multi-node components with and without a valid root, plus a valid
+   forward delta base.
+   
+   Git reference: `builtin/index-pack.c::conclude_pack()` at
+   `d38352cd43ab9745686d697872408bc3249a153f` rejects unresolved deltas.
+ - <csr-id-89a12d4a2558627524ae55151c39950e1b92973f/> reject cyclic delta chains and bound chain allocations
+   <!-- agent -->
+   A report describes delta base cycles that never terminate in header
+   lookups and keep allocating during object decoding. Track a constant-space
+   cycle checkpoint in both loops, without relying on the untrusted pack
+   object count or rejecting valid forward references.
+   
+   Account for heap-backed delta-chain metadata in the existing per-allocation
+   limit and reserve it fallibly, including when delta payloads are empty.
+   The regressions failed before the fix and cover self, multi-entry, mixed
+   REF/OFS cycles, empty deltas, and valid forward chains.
+   
+   Git reference: `t/t5309-pack-delta-cycles.sh` at
+   `d38352cd43ab9745686d697872408bc3249a153f` rejects cycles while allowing
+   forward delta bases.
+ - <csr-id-b41b1a5267cbe7ed31b1600391aedc90c39941ee/> map packs read-only on Windows so large ones can be opened
+   On Windows if you memory map with copyonwrite (which is what map_copy_read_only does) it charges against the commit limit for that. As such, when opening extremely large packs, i.e. 40GB, This can fail with an out of memory error: `ERROR_COMMITMENT_LIMIT` (os error 1455, "The paging file is too small for this operation to complete")
+   
+   The fix is to memory map it plainly. Which is otherwise pretty much the same as it is on other operating systems for read-only memory mapping.
+
+### Bug Fixes (BREAKING)
+
+ - <csr-id-5b6522a8c8e5cc1cfe692ba65e87b8a6fad392ce/> validate multi-pack-index references on access
+   <!-- Byron -->
+   
+   Looked at everything in detail and added error handling in callbacks
+   that didn't have them. Reduced the scope of this commit to not overlap
+   with `odb-parallelism` branch which makes many changes additionally.
+   
+   Many of the newly added tests are very specific about error handling,
+   one might call them overkill, but I left them in for good measure.
+   Further, errors.rs in `gix-odb` I just skimmed the test titles off
+   as everything else would be too time consuming - better have them than
+   not have them I thought, particularly to support `odb-paralellism`.
+   
+   <!-- agent -->
+   A report describes object lookup panics caused by unchecked pack IDs
+   and large-offset ordinals in otherwise structurally valid MIDX files.
+   
+   Validate these references when reading an object entry, before indexing
+   pack arrays or dereferencing the optional LOFF (Large Offsets) table.
+   Bound LOFF ordinals by the chunk itself, not by the remaining file.
+   Keep MIDX loading limited to structural validation: an eager scan of
+   every offset entry adds linear startup work and faults in memory-mapped
+   pages even when a command needs only a handful of objects. Git likewise
+   checks these references on access.
+   
+   Make `pack_id_and_pack_offset_at_index()` return `gix_error::Result`
+   and `iter()` yield fallible entries. Propagate corruption errors through
+   object and header lookup, delta-base resolution, integrity verification,
+   and CLI entry listing. ID-only iteration remains available without valid
+   offset references. Preserve literal high-bit 32-bit offsets when LOFF
+   is absent.
+   
+   Return `Result<Option<_>>` from `Find::location_by_oid()` and
+   `Find::pack_offsets_and_oid()`: absence and lookup failure are different
+   outcomes, and callers must be able to distinguish them. Propagate errors
+   through forwarding implementations, object counting, pack-entry iterator
+   construction, and thin-pack base lookup rather than treating corruption
+   as a missing object or a reason to recompress. Report a pack that becomes
+   unavailable during construction as an error instead of panicking.
+   
+   Retain failed index loads separately from missing files so repeated
+   lookups cannot silently turn corruption into absence. Load pending
+   indices before retrying failures, retry all failed slots, and reconcile
+   disk state when refreshing. This keeps independent valid packs usable
+   and permits recovery after repair or removal without endless refresh
+   loops on persistent failures.
+   
+   Regressions cover boundary and extreme invalid references, lazy loading,
+   valid LOFF ordinals and literal offsets, integrity verification,
+   corruption propagation through object lookup and pack generation, and
+   repeated, shared, concurrent, repaired, and removed index-load failures.
+   
+   Git reference: `d38352cd43ab9745686d697872408bc3249a153f`,
+   `midx.c::midx_for_pack()` and `nth_midxed_offset()`.
+
+### Commit Statistics
+
+<csr-read-only-do-not-edit/>
+
+ - 16 commits contributed to the release over the course of 13 calendar days.
+ - 13 days passed between releases.
+ - 4 commits were understood as [conventional](https://www.conventionalcommits.org).
+ - 0 issues like '(#ID)' were seen in commit messages
+
+### Commit Details
+
+<csr-read-only-do-not-edit/>
+
+<details><summary>view details</summary>
+
+ * **Uncategorized**
+    - Release gix-error v0.5.0, gix-date v0.18.0, gix-actor v0.44.0, gix-trace v0.3.0, gix-validate v0.13.0, gix-path v0.14.0, gix-utils v0.5.0, gix-quote v0.10.0, gix-command v0.12.0, gix-hash v0.28.0, gix-hashtable v0.18.0, gix-parallel v0.50.0, gix-fs v0.24.0, gix-tempfile v26.0.0, gix-object v0.66.0, gix-glob v0.29.0, gix-attributes v0.37.0, gix-packetline v0.24.0, gix-filter v0.36.0, gix-chunk v0.10.0, gix-commitgraph v0.41.0, gix-revwalk v0.37.0, gix-traverse v0.63.0, gix-worktree-stream v0.38.0, gix-archive v0.38.0, gix-bitmap v0.6.0, gix-lock v26.0.0, gix-index v0.57.0, gix-config-value v0.21.0, gix-pathspec v0.22.0, gix-ignore v0.24.0, gix-worktree v0.58.0, gix-imara-diff v0.3.1, gix-diff v0.69.0, gix-blame v0.19.0, gix-ref v0.69.0, gix-sec v0.16.0, gix-config v0.62.0, gix-prompt v0.19.0, gix-url v0.40.0, gix-credentials v0.42.0, gix-discover v0.57.0, gix-dir v0.31.0, gix-mailmap v0.36.0, gix-revision v0.51.0, gix-merge v0.22.0, gix-negotiate v0.37.0, gix-note v0.3.0, gix-zlib v0.3.0, gix-pack v0.76.0, gix-odb v0.86.0, gix-refspec v0.47.0, gix-shallow v0.15.0, gix-transport v0.61.0, gix-protocol v0.67.0, gix-status v0.36.0, gix-submodule v0.36.0, gix-worktree-state v0.36.0, gix v0.89.0, gix-fsck v0.27.0, gitoxide-core v0.63.0, gix-tix v0.5.0, gitoxide v0.60.0, safety bump 62 crates ([`0115e90`](https://github.com/GitoxideLabs/gitoxide/commit/0115e902fd0334b8f370766993eb17babed3157f))
+    - Prepare changelogs prior to release ([`794eeef`](https://github.com/GitoxideLabs/gitoxide/commit/794eeef835f8dde0fc8f4fd1d215f304d28d7f77))
+    - Merge pull request #3032 from GitoxideLabs/sec-audit ([`1d7bac7`](https://github.com/GitoxideLabs/gitoxide/commit/1d7bac742f70b72ddda0c7294f4a97566b8db596))
+    - Validate multi-pack-index references on access ([`5b6522a`](https://github.com/GitoxideLabs/gitoxide/commit/5b6522a8c8e5cc1cfe692ba65e87b8a6fad392ce))
+    - Reject incomplete delta traversals and overlapping offsets ([`781b606`](https://github.com/GitoxideLabs/gitoxide/commit/781b6061ee8bb1c25e952ea0de57697029c0ff79))
+    - Reject cyclic delta chains and bound chain allocations ([`89a12d4`](https://github.com/GitoxideLabs/gitoxide/commit/89a12d4a2558627524ae55151c39950e1b92973f))
+    - Merge pull request #3044 from special-bread/bread/pack-readonly-mmap-windows ([`9d5d934`](https://github.com/GitoxideLabs/gitoxide/commit/9d5d9346ab8c10eebf9540cf6aad18f218d6505c))
+    - Review ([`4ddbe11`](https://github.com/GitoxideLabs/gitoxide/commit/4ddbe11e8567a94ebf6b91bb684fb168d314f9bf))
+    - Merge pull request #3033 from GitoxideLabs/gix-cli-progress-cleanup ([`80f4b03`](https://github.com/GitoxideLabs/gitoxide/commit/80f4b03257da9a664468e7b75247023187565a34))
+    - Map packs read-only on Windows so large ones can be opened ([`b41b1a5`](https://github.com/GitoxideLabs/gitoxide/commit/b41b1a5267cbe7ed31b1600391aedc90c39941ee))
+    - Merge pull request #3035 from any-victor/fix/clone-ignores-caller-repository-env ([`d2d078f`](https://github.com/GitoxideLabs/gitoxide/commit/d2d078f25ec2abb18a28a0e635c21d082ef5a830))
+    - Review ([`95043b9`](https://github.com/GitoxideLabs/gitoxide/commit/95043b9895c760fb2cf1f9d7bd8c0d7f84c3e619))
+    - Merge pull request #3022 from GitoxideLabs/release-testtools ([`f819565`](https://github.com/GitoxideLabs/gitoxide/commit/f819565c2c4c56619c4888acef6cf3b8144cbccb))
+    - Use existing error helpers for guards and conversions ([`1c25831`](https://github.com/GitoxideLabs/gitoxide/commit/1c25831152a4ea5a1a016c9b7670a5d1abe25878))
+    - Use `or_error()` at public exception boundaries ([`535672e`](https://github.com/GitoxideLabs/gitoxide/commit/535672e333c28485795718fc1313f1f4aad30873))
+    - Merge pull request #3020 from GitoxideLabs/report-september ([`5fb3dcf`](https://github.com/GitoxideLabs/gitoxide/commit/5fb3dcf6a86ac0c403776c8820bf5d23f187f7e1))
+</details>
+
+## 0.75.0 (2026-09-25)
+
+### New Features
+
+ - <csr-id-e0825df6b3ab83b4f5897002074b0111c9fcb822/> expose the pack header size
+   <!-- agent -->
+   The 12-byte pack header length was repeated in readers, offset validation,
+   and tests, leaving the first-entry boundary expressed as a magic number.
+   
+   Expose `data::header::SIZE`, derive it from the fixed header fields, and use
+   it wherever code needs the first valid pack-entry offset.
+
+### Bug Fixes
+
+ - <csr-id-e79baac854f818b717d9500373e30c3525cfc137/> reject delta instructions that exceed the result size
+   <!-- Byron -->
+   
+   rubber stamp, looked at diff
+   
+   <!-- agent -->
+   Writing to a byte slice may succeed with a short write. Delta application
+   ignored that byte count, so oversized copy and insert instructions silently
+   truncated their output instead of reporting corrupt data.
+   
+   Split off an output slice of exactly the required size before copying.
+   This also removes two mappings of I/O failures that slice writes cannot
+   produce. A regression covers both copy and insert instructions; all
+   `gix-pack` tests pass.
+ - <csr-id-0805bb66782176ab2b24fc25b9e7a111d5c185b0/> avoid aborts in remaining capacity hints
+   <!-- agent -->
+   A follow-up audit for GHSA-x862-c2wj-4mwr found that the shared `exact_vec()`
+   optimization still used infallible reservation at four other call sites,
+   multi-index writing reserved from index counts infallibly, and doubled thin-pack
+   size hints could overflow on 32-bit targets.
+   
+   Treat exact preallocation as best-effort, propagate multi-index reservation
+   failure, and saturate the thin-pack upper bound. Regression tests cover failed
+   exact preallocation and size-hint overflow without making large allocations.
+ - <csr-id-31d1e21f5373338d47dcfe3aea76c57ff626daf3/> make delta-tree allocation fallible
+   <!-- agent -->
+   GHSA-x862-c2wj-4mwr identified that delta-tree capacity derived from pack
+   metadata used an infallible exact reservation. A rejected allocation could
+   therefore terminate the process instead of returning through the existing
+   indexing error path.
+   
+   Use fallible exact reservations, reject capacity arithmetic overflow, and apply
+   the existing per-allocation limit to both initial tree vectors. The regression
+   covers allocator rejection and explicit zero limits; bundle and index tests
+   verify the propagated error.
+   
+   Git reference: `builtin/index-pack.c` reads the advertised object count in
+   `parse_pack_header()` and allocates its object tables with `CALLOC_ARRAY`. This
+   change retains gitoxide's eager sizing while making failure recoverable and
+   configurable.
+ - <csr-id-8d73d3c9a8eccaaed1a1190ace5a0998ec991a68/> reject delta bases in the pack header
+   <!-- agent -->
+   `OFS_DELTA` bases must refer to an earlier pack entry, but the shared offset
+   helper accepted offsets within the 12-byte pack header. This let all new
+   consumers treat these malformed distances as valid.
+   
+   Require the computed base offset to start at or beyond the first entry, matching
+   `git index-pack`, and cover both the shared boundary and pack-copy error path.
+ - <csr-id-fd318d887dd867c304daea0c3212157d22cf651d/> reject invalid delta offsets in pack consumers
+   <!-- agent -->
+   An audit for the same unchecked `OFS_DELTA` subtraction found two further
+   pack-data consumers that trusted raw base distances: delta-tree construction
+   during verification and entry reuse during pack generation.
+   
+   Use `Header::verified_base_pack_offset()` in both paths. Verification now
+   reports corrupt input through its existing invalid-data error, while pack
+   generation declines to copy the malformed entry and uses its existing
+   decode/recompress fallback.
+   
+   This matches Git at `f78ce2f7b6df702f93d40b85d6bda92a3f65da79`, where pack
+   readers reject delta base offsets outside the pack prefix.
+ - <csr-id-e000edb0c7c3e9d2eb6bfc4fd7d74af0537b09a3/> reject invalid thin-pack delta offsets
+   <!-- agent -->
+   GHSA-mpf5-465h-mr53 identifies a panic while thin-pack base insertion rewrites
+   later `OFS_DELTA` entries. Zero or out-of-bounds base distances reached
+   `checked_sub().expect()` instead of being treated as malformed input.
+   
+   Reuse `Header::verified_base_pack_offset()` and propagate a typed input
+   error. This matches Git at `f78ce2f7b6df702f93d40b85d6bda92a3f65da79`, where
+   `builtin/index-pack.c` rejects delta base offsets outside the pack prefix.
+ - <csr-id-e390bc88a3de1d5817c779fe10b36b7c7754a8b9/> support version 3 across pack writers
+   <!-- agent -->
+   An audit following GHSA-633h-mqjc-8rwg found four more assertions that rejected
+   version 3 in pack-writing paths even though versions 2 and 3 share their entry
+   encoding.
+   
+   Remove the stale assertions so thin-pack repair and the general pack-generation
+   pipeline consistently preserve supported input versions. Extend the bundle
+   regression through the thin-pack lookup path that previously still panicked.
+   
+   Git baseline: `pack_version_ok_native()` in `pack.h` at f78ce2f7b6 accepts
+   versions 2 and 3.
+ - <csr-id-b851c0f144036f8a122a15a2f52475b95802da9a/> accept version 3 in streaming pack input
+   <!-- agent -->
+   `BytesToEntriesIter` asserted that every decoded pack used version 2 even though
+   the shared header decoder and file reader accept version 3. This made streaming
+   input disagree with the rest of the crate and with Git.
+   
+   Remove the contradictory assertion and exercise a complete version 3 fixture
+   through the streaming iterator. This addresses GHSA-633h-mqjc-8rwg without
+   adding another version gate.
+   
+   Git baseline: `pack_version_ok_native()` in `pack.h` at f78ce2f7b6 accepts
+   versions 2 and 3 with the same entry layout.
+
+### Changed (BREAKING)
+
+ - <csr-id-f28f7df44c88e4dc6e7892856cfd454dbcbd36bc/> migrate errors to gix-error
+   <!-- Byron -->
+   rubberstamp
+ - <csr-id-4b42e0ce80ae934cae4f102f44c392581758608f/> raise MSRV to Rust 1.88
+   <!-- agent -->
+   The newly published `dua-core` 3.3 release used by linked-worktree removal
+   requires Rust 1.88, so raise every workspace crate and the advertised badge
+   together.
+   
+   Keep the MSRV checks buildable by selecting the latest `sysinfo` and `rusqlite`
+   release lines that support Rust 1.88.
+
+### Commit Statistics
+
+<csr-read-only-do-not-edit/>
+
+ - 23 commits contributed to the release over the course of 31 calendar days.
+ - 32 days passed between releases.
+ - 11 commits were understood as [conventional](https://www.conventionalcommits.org).
+ - 0 issues like '(#ID)' were seen in commit messages
+
+### Commit Details
+
+<csr-read-only-do-not-edit/>
+
+<details><summary>view details</summary>
+
+ * **Uncategorized**
+    - Release gix-error v0.4.0, gix-date v0.17.0, gix-actor v0.43.0, gix-trace v0.2.0, gix-validate v0.12.0, gix-path v0.13.0, gix-utils v0.4.0, gix-quote v0.9.0, gix-command v0.11.0, gix-features v0.50.0, gix-hash v0.27.0, gix-hashtable v0.17.0, gix-fs v0.23.0, gix-tempfile v25.0.0, gix-object v0.65.0, gix-glob v0.28.0, gix-attributes v0.36.0, gix-packetline v0.23.0, gix-filter v0.35.0, gix-chunk v0.9.0, gix-commitgraph v0.40.0, gix-revwalk v0.36.0, gix-traverse v0.62.0, gix-worktree-stream v0.37.0, gix-archive v0.37.0, gix-bitmap v0.5.0, gix-lock v25.0.0, gix-index v0.56.0, gix-config-value v0.20.0, gix-pathspec v0.21.0, gix-ignore v0.23.0, gix-worktree v0.57.0, gix-imara-diff v0.3.0, gix-diff v0.68.0, gix-blame v0.18.0, gix-ref v0.68.0, gix-sec v0.15.0, gix-config v0.61.0, gix-prompt v0.18.0, gix-url v0.39.0, gix-credentials v0.41.0, gix-discover v0.56.0, gix-dir v0.30.0, gix-mailmap v0.35.0, gix-revision v0.50.0, gix-merge v0.21.0, gix-negotiate v0.36.0, gix-note v0.2.0, gix-zlib v0.2.0, gix-pack v0.75.0, gix-odb v0.85.0, gix-macros v0.2.0, gix-refspec v0.46.0, gix-shallow v0.14.0, gix-transport v0.60.0, gix-protocol v0.66.0, gix-status v0.35.0, gix-submodule v0.35.0, gix-worktree-state v0.35.0, gix v0.88.0, gix-fsck v0.26.0, gitoxide-core v0.62.0, gix-tix v0.4.0, gitoxide v0.59.0, safety bump 60 crates ([`37860b3`](https://github.com/GitoxideLabs/gitoxide/commit/37860b34db26096c8187ef55bdf4b76705142733))
+    - Merge pull request #2847 from GitoxideLabs/gix-error-completion ([`6356013`](https://github.com/GitoxideLabs/gitoxide/commit/6356013bca0987c6c97ad7ba9d5347271979b51e))
+    - Reject delta instructions that exceed the result size ([`e79baac`](https://github.com/GitoxideLabs/gitoxide/commit/e79baac854f818b717d9500373e30c3525cfc137))
+    - Add error context without preliminary erasure ([`9d0329a`](https://github.com/GitoxideLabs/gitoxide/commit/9d0329af119874c7441bafeac950166a1e13d899))
+    - Use borrowed error inspection throughout the workspace ([`daf73b5`](https://github.com/GitoxideLabs/gitoxide/commit/daf73b5fe5a21e3ddcc58f0882c2d880f48b7860))
+    - Migrate errors to gix-error ([`f28f7df`](https://github.com/GitoxideLabs/gitoxide/commit/f28f7df44c88e4dc6e7892856cfd454dbcbd36bc))
+    - Merge pull request #2989 from GitoxideLabs/error-conversion-review ([`4b9ff51`](https://github.com/GitoxideLabs/gitoxide/commit/4b9ff511a49f7963e97a669ca82c6f6e833d8ea2))
+    - Merge pull request #2949 from GitoxideLabs/error-conversion-review ([`a095334`](https://github.com/GitoxideLabs/gitoxide/commit/a0953348e4d27f59222c1782119d2539a778cd4d))
+    - Raise MSRV to Rust 1.88 ([`4b42e0c`](https://github.com/GitoxideLabs/gitoxide/commit/4b42e0ce80ae934cae4f102f44c392581758608f))
+    - Merge pull request #2955 from GitoxideLabs/transport-url-encoding ([`7e35849`](https://github.com/GitoxideLabs/gitoxide/commit/7e35849b36646cff9722f6906a4527d64818a374))
+    - Release gix-path v0.12.6, gix-error v0.3.2, gix-command v0.10.1, gix-transport v0.59.2 ([`888677a`](https://github.com/GitoxideLabs/gitoxide/commit/888677ad2d63a2e3930a02add2de0b4b667a5581))
+    - Merge pull request #2951 from GitoxideLabs/fix-reserve-exact ([`ec98152`](https://github.com/GitoxideLabs/gitoxide/commit/ec9815225218068f603d63c973d1f8e145b3ba37))
+    - Merge pull request #2952 from GitoxideLabs/fix-expect ([`a938f52`](https://github.com/GitoxideLabs/gitoxide/commit/a938f528717e580c79aeff1d4a4aea8fef1bd2be))
+    - Expose the pack header size ([`e0825df`](https://github.com/GitoxideLabs/gitoxide/commit/e0825df6b3ab83b4f5897002074b0111c9fcb822))
+    - Avoid aborts in remaining capacity hints ([`0805bb6`](https://github.com/GitoxideLabs/gitoxide/commit/0805bb66782176ab2b24fc25b9e7a111d5c185b0))
+    - Make delta-tree allocation fallible ([`31d1e21`](https://github.com/GitoxideLabs/gitoxide/commit/31d1e21f5373338d47dcfe3aea76c57ff626daf3))
+    - Reject delta bases in the pack header ([`8d73d3c`](https://github.com/GitoxideLabs/gitoxide/commit/8d73d3c9a8eccaaed1a1190ace5a0998ec991a68))
+    - Reject invalid delta offsets in pack consumers ([`fd318d8`](https://github.com/GitoxideLabs/gitoxide/commit/fd318d887dd867c304daea0c3212157d22cf651d))
+    - Reject invalid thin-pack delta offsets ([`e000edb`](https://github.com/GitoxideLabs/gitoxide/commit/e000edb0c7c3e9d2eb6bfc4fd7d74af0537b09a3))
+    - Merge pull request #2953 from GitoxideLabs/fix-header-assertions ([`2ec4de7`](https://github.com/GitoxideLabs/gitoxide/commit/2ec4de782441d58cac5b6c6acff30660190684f6))
+    - Support version 3 across pack writers ([`e390bc8`](https://github.com/GitoxideLabs/gitoxide/commit/e390bc88a3de1d5817c779fe10b36b7c7754a8b9))
+    - Accept version 3 in streaming pack input ([`b851c0f`](https://github.com/GitoxideLabs/gitoxide/commit/b851c0f144036f8a122a15a2f52475b95802da9a))
+    - Merge pull request #2940 from GitoxideLabs/vendor-bisync ([`dda600d`](https://github.com/GitoxideLabs/gitoxide/commit/dda600d7ee29a6bda4cf1047d0d1782e76b16f98))
+</details>
+
+## 0.74.2 (2026-08-24)
+
+### Bug Fixes
+
+ - <csr-id-4009a9afca003e339d73ef38eaeccd036b32e3dc/> retain additions from all merge parents
+   <!-- agent -->
+   `TreeAdditionsComparedToAncestor` cleared its collected changes before every
+   parent diff. For merge commits, objects added relative to an earlier parent were
+   marked seen and then discarded, producing incomplete packs.
+   
+   Add a regression graph whose merge tree matches its second parent and verify
+   that the blob found only against the first parent is counted. Clear the delegate
+   once before the parent loop so each parent’s additions accumulate.
+   
+   Expose a read-only `gix_pack::testing::Memory` adapter for loose in-memory objects.
+   Use it with `gix_odb::memory::Proxy` in the regression and deduplicate the
+   equivalent benchmark adapter.
+   
+   Git baseline: 15c6308cf7ad276b306aa5b3ababfbdebfb1a917;
+   list-objects.c:add_edge_parents accounts for every merge parent tree during
+   object traversal.
+
+### Commit Statistics
+
+<csr-read-only-do-not-edit/>
+
+ - 4 commits contributed to the release over the course of 1 calendar day.
+ - 1 day passed between releases.
+ - 1 commit was understood as [conventional](https://www.conventionalcommits.org).
+ - 1 unique issue was worked on: [#2935](https://github.com/GitoxideLabs/gitoxide/issues/2935)
+
+### Commit Details
+
+<csr-read-only-do-not-edit/>
+
+<details><summary>view details</summary>
+
+ * **[#2935](https://github.com/GitoxideLabs/gitoxide/issues/2935)**
+    - Retain additions from all merge parents ([`4009a9a`](https://github.com/GitoxideLabs/gitoxide/commit/4009a9afca003e339d73ef38eaeccd036b32e3dc))
+ * **Uncategorized**
+    - Release gix-packetline v0.22.2, gix-worktree-stream v0.36.1, gix-archive v0.36.1, gix-diff v0.67.1, gix-blame v0.17.1, gix-dir v0.29.1, gix-mailmap v0.34.1, gix-revision v0.49.1, gix-merge v0.20.1, gix-negotiate v0.35.1, gix-note v0.1.1, gix-pack v0.74.2, gix-macros v0.1.6, gix-refspec v0.45.1, gix-transport v0.59.1, gix-protocol v0.65.1, gix-status v0.34.1, gix-worktree-state v0.34.1, gix v0.87.1, gix-fsck v0.25.1, gitoxide-core v0.61.1, gix-tix v0.3.0, gitoxide v0.58.0, safety bump gitoxide v0.58.0 ([`3ebca8b`](https://github.com/GitoxideLabs/gitoxide/commit/3ebca8b66017ab2dd02a38f75f78f485bee1ded8))
+    - Merge pull request #2936 from GitoxideLabs/fixup-pack-creation ([`4fa211d`](https://github.com/GitoxideLabs/gitoxide/commit/4fa211d534ec6c09cb2d5f6cc830bc3fbdee0f92))
+    - Merge pull request #2932 from GitoxideLabs/fundamental-types-comp ([`6704303`](https://github.com/GitoxideLabs/gitoxide/commit/6704303ed5ef3403b129e2b6cc4a9214432ffd03))
+</details>
+
+## 0.74.1 (2026-08-23)
+
+### Commit Statistics
+
+<csr-read-only-do-not-edit/>
+
+ - 3 commits contributed to the release.
+ - 1 day passed between releases.
+ - 0 commits were understood as [conventional](https://www.conventionalcommits.org).
+ - 0 issues like '(#ID)' were seen in commit messages
+
+### Commit Details
+
+<csr-read-only-do-not-edit/>
+
+<details><summary>view details</summary>
+
+ * **Uncategorized**
+    - Release gix-error v0.3.1, gix-hash v0.26.2, gix-object v0.64.1, gix-ref v0.67.1, gix-packetline v0.22.1, gix-pack v0.74.1, gix-testtools v0.20.0 ([`e52fe9d`](https://github.com/GitoxideLabs/gitoxide/commit/e52fe9d03e82437a25bdfb1098e7046ec7e1b558))
+    - Use fundamental-type comparisons throughout tests ([`47536a5`](https://github.com/GitoxideLabs/gitoxide/commit/47536a5c2b22da3a9f4892c8af5e460c2d5bda0a))
+    - Merge pull request #2933 from GitoxideLabs/report-august ([`b8914ff`](https://github.com/GitoxideLabs/gitoxide/commit/b8914ffda5bc8f6ea851aaf1f720140acfe96dbb))
+</details>
+
+## 0.74.0 (2026-08-22)
+
+### New Features
+
+ - <csr-id-40a4ca7d1802361850a6a4a6aef91c8c2c5d730f/> expose index-less parallel pack traversal (cache Tree, Context, Options)
+   Re-export `cache::delta::{Tree, traverse::{Context, Options}}` at `cache` so
+   external callers can build a delta `Tree` directly from a pack header scan and
+   resolve all of its objects in parallel via `Tree::traverse` -- without a
+   pre-built `.idx`. This is the index-less companion to the already-public,
+   idx-verified `index::File::traverse_with_index`.
+   
+   Minimal surface by design: the `delta` module stays `pub(crate)`, so only the
+   three already-documented items a caller names become public -- `pub mod delta`
+   would instead expose the module's internal error types and constructors and fail
+   `#![deny(missing_docs)]`. `Tree::from_offsets_in_pack` (already public) builds the
+   tree straight from the pack; `with_capacity`/`add_root`/`add_child` remain for
+   callers who assemble it by ascending pack offset themselves.
+   
+   Additive and non-breaking; `cargo doc` is clean under `-D warnings`, and a
+   doc-test anchors the index-less path (`Tree::from_offsets_in_pack`). Shape
+   approved in #2922.
+
+### Bug Fixes
+
+ - <csr-id-916f5d8c32deb0a03bb6a01c8d8e9c4b6c69d186/> validate delta base sizes during entry decoding
+   <!-- agent -->
+   Reject delta instruction streams whose declared base size differs from the
+   resolved base object. The regression demonstrates that a REF_DELTA could
+   previously reconstruct successfully despite lying about its base size.
+   
+   Git reference: patch_delta() compares the decoded source size with src_size
+   before applying instructions, observed at cf5497b14c5a.
+ - <csr-id-d7bbb8e053c3ce9c24fe0a4bf1aaaca7b7a58270/> resolve delta trees lazily in a lock-free pool
+   <!-- agent -->
+   --- Summary of findings
+   
+   The lazy, stealable resolver fixes the pathological phpstan pack without
+   regressing the Linux best case. At 16 threads, phpstan falls from the
+   98.38-second baseline resolver time to 22.70 seconds, while the Linux
+   best-case resolver improves slightly from 11.81 to 11.33 seconds. Charged
+   peak memory on phpstan falls from 13.14 GB to 2.16 GB, and the Linux best
+   case falls from 1.96 GB to 1.76 GB.
+   
+   Across the measured packs, gix resolver speedup at 16 threads ranges from
+   10.80x to 12.48x over its new serial path. On phpstan, gix is 1.07x faster
+   than Git at one thread and 2.31x faster at 16 threads. On the identical
+   10.9M-object Linux payload, gix's SHA-256 resolver is 2.72x to 2.99x faster
+   than its SHA-1 resolver, confirming that the slow SHA-1 implementation
+   dominates much of the remaining absolute cost.
+   
+   The Git SHA-256 comparison was initially unfair: the local Git build used
+   the portable SHA256_BLK backend while RustCrypto selected ARMv8 SHA-2
+   instructions. Rebuilding Git with OpenSSL reduced its eight-thread wall
+   time from 144.15 to 40.45 seconds and user CPU time from 471.94 to
+   99.81 seconds. All final Git SHA-256 comparisons use that faster backend.
+   
+   --- Pathological phpstan pack
+   
+   The pack contains 100.7k objects but expands to 174.6 GB because one root
+   ends in a deep, expensive delta tree. The previous resolver takes
+   98.53 seconds wall clock and has a 13.14 GB peak memory footprint.
+   
+   The new resolver takes 283.41, 71.94, 36.42, and 22.83 seconds wall clock
+   at 1, 4, 8, and 16 threads. Its resolver speedups are 3.94x, 7.81x, and
+   12.48x relative to one thread, remaining nearly linear through eight
+   threads. Peak memory footprint is 0.68, 0.75, 1.17, and 2.16 GB
+   respectively. Thus the fastest run is 4.31x faster than the old wall time
+   while using 84% less charged peak memory.
+   
+   Git was measured at 1, 2, 4, 8, and 16 threads while keeping its aggregate
+   delta-base cache allowance at least as large as the default eight-thread
+   allowance of 8 times 96 MiB. Git takes 304.51, 168.06, 98.80, 65.41, and
+   52.79 seconds, for 5.77x one-to-sixteen-thread scaling. At equal thread
+   counts, gix is 1.07x, 1.37x, 1.80x, and 2.31x faster at 1, 4, 8, and
+   16 threads.
+   
+   At the nearest wall-time operating points, gix at four threads takes
+   71.94 seconds with a 0.75 GB peak footprint, while Git at eight threads
+   takes 65.41 seconds with a 1.90 GB peak footprint. gix therefore uses
+   61% less charged working memory near Git-matching throughput.
+   
+   --- Linux best-case pack
+   
+   The 7.6M-object fixture expands to 95.6 GB and guards the already-friendly
+   case. The old implementation takes 13.68 seconds wall clock and
+   11.81 seconds in the resolver. The new implementation takes 137.48,
+   36.75, 19.81, and 13.16 seconds wall clock at 1, 4, 8, and 16 threads;
+   resolver scaling reaches 11.97x at 16 threads.
+   
+   The 16-thread result is slightly faster than the old implementation, with
+   11.33 seconds in the resolver, and lowers peak footprint from 1.96 to
+   1.76 GB. Peak footprint remains effectively constant from one through
+   16 threads. Git takes 156.65, 60.48, 45.48, and 42.97 seconds at the same
+   thread counts, so gix's advantage grows from 1.14x to 3.27x.
+   
+   --- SHA-1 and SHA-256 sibling packs
+   
+   The sibling packs contain 10.9M objects, expand to 146.7 GB, and preserve
+   the same compressed payload and delta topology. This isolates hashing from
+   work distribution.
+   
+   For SHA-1, gix takes 212.57, 56.58, 30.60, and 20.74 seconds wall clock at
+   1, 4, 8, and 16 threads. Resolver scaling reaches 11.36x at 16 threads.
+   The default eight-thread Git run takes 125.11 seconds, while gix takes
+   30.60 seconds at eight threads and 20.74 seconds at 16.
+   
+   For SHA-256, gix takes 72.47, 21.83, 12.58, and 8.67 seconds wall clock.
+   Resolver scaling reaches 10.80x at 16 threads. Against OpenSSL-backed Git,
+   gix is 1.21x, 2.02x, 3.22x, and 5.61x faster at equal thread counts.
+   Git improves from 87.85 seconds at one thread to 40.45 seconds at eight,
+   then regresses to 48.68 seconds at 16 with 204.81 seconds of system CPU.
+   
+   --- Hasher and scheduler interpretation
+   
+   On identical pack data, gix SHA-256 resolver time is 70.31 seconds at one
+   thread versus 210.35 seconds for SHA-1, and 6.51 seconds at 16 threads
+   versus 18.51 seconds for SHA-1. SHA-256 is therefore 2.99x faster
+   serially and 2.84x faster at 16 threads, with a 2.72x to 2.99x advantage
+   throughout the measured range.
+   
+   The similar 10.80x to 12.48x gix scaling across pathological, best-case,
+   SHA-1, and SHA-256 packs argues against lock contention being the main
+   high-thread limitation. The remaining flattening is consistent with
+   finite parallel work, scheduling overhead, memory bandwidth, and hashing
+   cost.
+   
+   --- Memory interpretation
+   
+   The resolver no longer materializes the unresolved internal-node frontier.
+   It resolves a child only when a worker starts it, shares immutable bases
+   between sibling tasks, and recycles the final base reference. A linear
+   chain therefore needs roughly two object buffers per active worker instead
+   of retaining every intermediate base.
+   
+   macOS max RSS includes clean file-backed pages. gix maps the pack, so its
+   reported RSS can include most of a multi-gigabyte pack even when those
+   pages are reclaimable; Git reads through bounded pread buffers. Peak memory
+   footprint better represents charged working memory here. On phpstan, gix
+   max RSS grows from 7.20 to 8.90 GB across 1 to 16 threads, but charged
+   footprint grows from only 0.68 to 2.16 GB. On the Linux best case,
+   footprint stays at 1.76 GB across the same range.
+   
+   --- Implementation
+   
+   Use lock-free local deques and a shared root injector so idle workers can
+   steal branches from the last expensive root without every worker hoarding
+   roots. Enable this resolver through the gix parallel feature.
+   
+   Regression tests prove that internal siblings are not all materialized
+   before descent and that two workers can concurrently resolve children from
+   one remaining root. The scheduler follows the proven Git index-pack
+   principles of bounded live delta bases and keeping independent delta work
+   available, informed by builtin/index-pack.c at cf5497b14c.
+ - <csr-id-64b9efefb9a538a0c40f3413d6c758a17bbc2daf/> resolve in-pack ref deltas while indexing
+   Valid packs may encode a base inside the same pack with REF_DELTA and may
+   place the delta before that base. The streaming lookup previously treated an
+   object-database miss as fatal, while index construction rejected every remaining
+   ref delta.
+   
+   Keep lookup misses in the stream and park ref-delta children by base object ID
+   until traversal resolves the matching object. This preserves external thin-pack
+   injection and reuses the existing delta tree for forward and chained references.
+   
+   Git reference: a23bace963d508bd96983cc637131392d3face18, builtin/index-pack.c and t/t5300-pack-object.sh.
+
+### Refactor (BREAKING)
+
+ - <csr-id-c055803f6412e15ed9470b6427508fd89f235212/> remove `object_hash` from `Options`
+   This forces callers to explicitly choose a hash, eliminating the risk
+   that `Sha1` is implicitly chosen for them in SHA-1/SHA-256 builds
+   through `Default::default()` without them being aware of it or noticing.
+   This comes at the cost of callers having to always pass the hash, but
+   that seems like a reasonable trade-off.
+
+### Commit Statistics
+
+<csr-read-only-do-not-edit/>
+
+ - 19 commits contributed to the release over the course of 30 calendar days.
+ - 30 days passed between releases.
+ - 5 commits were understood as [conventional](https://www.conventionalcommits.org).
+ - 3 unique issues were worked on: [#1025](https://github.com/GitoxideLabs/gitoxide/issues/1025), [#2424](https://github.com/GitoxideLabs/gitoxide/issues/2424), [#2868](https://github.com/GitoxideLabs/gitoxide/issues/2868)
+
+### Commit Details
+
+<csr-read-only-do-not-edit/>
+
+<details><summary>view details</summary>
+
+ * **[#1025](https://github.com/GitoxideLabs/gitoxide/issues/1025)**
+    - Resolve in-pack ref deltas while indexing ([`64b9efe`](https://github.com/GitoxideLabs/gitoxide/commit/64b9efefb9a538a0c40f3413d6c758a17bbc2daf))
+ * **[#2424](https://github.com/GitoxideLabs/gitoxide/issues/2424)**
+    - Resolve delta trees lazily in a lock-free pool ([`d7bbb8e`](https://github.com/GitoxideLabs/gitoxide/commit/d7bbb8e053c3ce9c24fe0a4bf1aaaca7b7a58270))
+ * **[#2868](https://github.com/GitoxideLabs/gitoxide/issues/2868)**
+    - Validate delta base sizes during entry decoding ([`916f5d8`](https://github.com/GitoxideLabs/gitoxide/commit/916f5d8c32deb0a03bb6a01c8d8e9c4b6c69d186))
+ * **Uncategorized**
+    - Update manifests prior to release ([`ebe9095`](https://github.com/GitoxideLabs/gitoxide/commit/ebe9095f2888d3c12447ea5eed9d0afdb0fd5aeb))
+    - Merge pull request #2926 from cruessler/remove-object-hash-from-options ([`b2d919a`](https://github.com/GitoxideLabs/gitoxide/commit/b2d919a11655fdab5c47001ec1b21d7bbebe24c0))
+    - Remove `object_hash` from `Options` ([`c055803`](https://github.com/GitoxideLabs/gitoxide/commit/c055803f6412e15ed9470b6427508fd89f235212))
+    - Merge pull request #2905 from GitoxideLabs/various-improvements ([`f3bbfad`](https://github.com/GitoxideLabs/gitoxide/commit/f3bbfadd4b4f1d72c85c62eb3d7ae337c922f945))
+    - Adapt to changes in `gix-testtools` ([`0cbe539`](https://github.com/GitoxideLabs/gitoxide/commit/0cbe53971687fb3b1959925aa9d8dc89deb5b474))
+    - Merge pull request #2923 from rdicosmo/swh-expose-delta-tree-main ([`c4426f0`](https://github.com/GitoxideLabs/gitoxide/commit/c4426f034d5423c66cc5c15725587d9688deada3))
+    - Review ([`dcb8ccd`](https://github.com/GitoxideLabs/gitoxide/commit/dcb8ccd96dad396042c9db217085fdf15293a19f))
+    - Expose index-less parallel pack traversal (cache Tree, Context, Options) ([`40a4ca7`](https://github.com/GitoxideLabs/gitoxide/commit/40a4ca7d1802361850a6a4a6aef91c8c2c5d730f))
+    - Merge pull request #2916 from cruessler/require-object-hash-in-store-at ([`dd8c759`](https://github.com/GitoxideLabs/gitoxide/commit/dd8c759e0343c2b5c9776c948d109e9d1ea5943b))
+    - Adapt to changes in `gix-odb` ([`1dc741f`](https://github.com/GitoxideLabs/gitoxide/commit/1dc741fedb08f167e652c31bfa6c4016d3b0a192))
+    - Merge pull request #2869 from GitoxideLabs/validate-delta-base-size ([`9c12c2d`](https://github.com/GitoxideLabs/gitoxide/commit/9c12c2d45cbfdaee65bdbb26df2d41063d3b39f1))
+    - Merge pull request #2867 from GitoxideLabs/fix-url-authority-parsing ([`cc3ee80`](https://github.com/GitoxideLabs/gitoxide/commit/cc3ee8060ad7a32ee8d2eb9139854be7f7561b70))
+    - Release gix-path v0.12.4, gix-command v0.9.2, gix-config-value v0.19.1, gix-url v0.37.1, gix-credentials v0.39.1, gix-transport v0.58.1 ([`ab4fcb0`](https://github.com/GitoxideLabs/gitoxide/commit/ab4fcb0364ec4d01115595198f383b1ad9c29808))
+    - Merge pull request #2852 from GitoxideLabs/delta-tree-parallelism ([`4a6cf9d`](https://github.com/GitoxideLabs/gitoxide/commit/4a6cf9d53da4490590d7a92f03775246fa905cb9))
+    - Merge pull request #2825 from GitoxideLabs/azure-compatibility ([`9b787f6`](https://github.com/GitoxideLabs/gitoxide/commit/9b787f68dfdb2855c1570e4abe9387d9247a7051))
+    - Merge pull request #2812 from GitoxideLabs/report-july ([`ae8845a`](https://github.com/GitoxideLabs/gitoxide/commit/ae8845a47c4c87e0996a119822106cf09036340b))
+</details>
+
+## 0.73.0 (2026-07-23)
+
+### Bug Fixes
+
+ - <csr-id-ace687ce6803fc761a75344d0aa7dea64c54f2cb/> cap remaining gix-pack allocations
+ - <csr-id-5850141ee122e10b3ff1f4fe40b81837cb8d32af/> reject invalid pack entry header metadata
+   The pack entry decoder stored the consumed header length with an infallible u16
+   conversion and accepted ref-delta hash lengths through panic-capable slice and
+   ObjectId conversions. Malformed or unsupported metadata should become decode
+   errors instead of process panics.
+
+### New Features (BREAKING)
+
+ - <csr-id-f26c18a947252e5edf4c05671691da0a81465a33/> make pack compression levels configurable
+   Require explicit compression levels when creating pack entries and expose compression in bundle-writing options. Defaults match git: the zlib default for pack entries and the fastest level when completing thin packs with loose-object data.
+
+### Bug Fixes (BREAKING)
+
+ - <csr-id-b69f0a6a6abf208ccc4fa622574c48e75df6e933/> prevent panics when decoding malformed pack entry headers
+   Represent the pack entry object hash as `gix_hash::Kind` in
+   `Entry::from_bytes()` instead of accepting a raw hash length. This keeps callers
+   from passing unsupported or inconsistent hash lengths and lets the decoder derive
+   the ref-delta base id length from the selected object format.
+
+### Commit Statistics
+
+<csr-read-only-do-not-edit/>
+
+ - 27 commits contributed to the release.
+ - 31 days passed between releases.
+ - 4 commits were understood as [conventional](https://www.conventionalcommits.org).
+ - 3 unique issues were worked on: [#2611](https://github.com/GitoxideLabs/gitoxide/issues/2611), [#2676](https://github.com/GitoxideLabs/gitoxide/issues/2676), [#2690](https://github.com/GitoxideLabs/gitoxide/issues/2690)
+
+### Commit Details
+
+<csr-read-only-do-not-edit/>
+
+<details><summary>view details</summary>
+
+ * **[#2611](https://github.com/GitoxideLabs/gitoxide/issues/2611)**
+    - Add a benchmark for pack generation from loose objects ([`0ba5af4`](https://github.com/GitoxideLabs/gitoxide/commit/0ba5af4e2e369029ead0fb002c22db1526c46daa))
+ * **[#2676](https://github.com/GitoxideLabs/gitoxide/issues/2676)**
+    - Reject invalid pack entry header metadata ([`5850141`](https://github.com/GitoxideLabs/gitoxide/commit/5850141ee122e10b3ff1f4fe40b81837cb8d32af))
+ * **[#2690](https://github.com/GitoxideLabs/gitoxide/issues/2690)**
+    - Cap remaining gix-pack allocations ([`ace687c`](https://github.com/GitoxideLabs/gitoxide/commit/ace687ce6803fc761a75344d0aa7dea64c54f2cb))
+ * **Uncategorized**
+    - Release gix-actor v0.41.2, gix-features v0.49.0, gix-hash v0.26.0, gix-hashtable v0.16.0, gix-object v0.63.0, gix-glob v0.27.0, gix-attributes v0.34.0, gix-packetline v0.22.0, gix-filter v0.33.0, gix-fs v0.22.0, gix-chunk v0.7.3, gix-commitgraph v0.38.0, gix-revwalk v0.34.0, gix-traverse v0.60.0, gix-worktree-stream v0.35.0, gix-archive v0.35.0, gix-bitmap v0.3.3, gix-tempfile v24.0.0, gix-lock v24.0.0, gix-index v0.54.0, gix-pathspec v0.19.0, gix-ignore v0.22.0, gix-worktree v0.55.0, gix-imara-diff v0.2.4, gix-diff v0.66.0, gix-blame v0.16.0, gix-ref v0.66.0, gix-config v0.59.0, gix-discover v0.54.0, gix-dir v0.28.0, gix-mailmap v0.33.2, gix-revision v0.48.0, gix-merge v0.19.0, gix-negotiate v0.34.0, gix-zlib v0.1.0, gix-pack v0.73.0, gix-odb v0.83.0, gix-refspec v0.44.0, gix-shallow v0.13.0, gix-transport v0.58.0, gix-protocol v0.64.0, gix-status v0.33.0, gix-submodule v0.33.0, gix-worktree-state v0.33.0, gix v0.86.0, gix-fsck v0.24.0, gitoxide-core v0.60.0, gix-tix v0.1.0, gitoxide v0.56.0, safety bump 40 crates ([`842bc44`](https://github.com/GitoxideLabs/gitoxide/commit/842bc447e3aeacf5d9d36f7f8a01068eda4b7999))
+    - Update changelogs prior to release ([`cb6ec7d`](https://github.com/GitoxideLabs/gitoxide/commit/cb6ec7dce283943d811b1600b577f586d7a13e1f))
+    - Release gix-trace v0.1.21, gix-validate v0.11.3, gix-path v0.12.3, gix-utils v0.3.5, gix-config-value v0.19.0, gix-prompt v0.16.0, gix-sec v0.14.2, gix-url v0.37.0, gix-credentials v0.39.0, safety bump 18 crates ([`f0ec710`](https://github.com/GitoxideLabs/gitoxide/commit/f0ec71076aa1cef3181b77946ee556a89c651b8e))
+    - Merge pull request #2722 from GitoxideLabs/reasons ([`c16b5a1`](https://github.com/GitoxideLabs/gitoxide/commit/c16b5a1892704b7c72a253bdd74a6848dd61032a))
+    - Replace lint allowances with expectations ([`43ff87a`](https://github.com/GitoxideLabs/gitoxide/commit/43ff87a73897b70313e3a58e7de82231be5b59ad))
+    - Merge pull request #2714 from GitoxideLabs/fix-credentials-parsing ([`cf3053a`](https://github.com/GitoxideLabs/gitoxide/commit/cf3053a3c18e2de788cdaa9f41b5bd343bdc0091))
+    - Release gix-path v0.12.2, gix-error v0.2.5, gix-utils v0.3.4, gix-date v0.15.6, gix-url v0.36.2, gix-credentials v0.38.2 ([`27aec47`](https://github.com/GitoxideLabs/gitoxide/commit/27aec474c113cc885d44631b329454dc1ad0fed2))
+    - Merge pull request #2695 from ameyypawar/fix/2024-compression-level ([`6e1c4a2`](https://github.com/GitoxideLabs/gitoxide/commit/6e1c4a24813d99ad0bbfb231618210ffe6a5cd6a))
+    - Review ([`f1ac335`](https://github.com/GitoxideLabs/gitoxide/commit/f1ac3359c3d88f550219116f1f3e8cb107f5f86f))
+    - Make pack compression levels configurable ([`f26c18a`](https://github.com/GitoxideLabs/gitoxide/commit/f26c18a947252e5edf4c05671691da0a81465a33))
+    - Merge pull request #2707 from ameyypawar/fix/2703-inflate-error ([`6d95da6`](https://github.com/GitoxideLabs/gitoxide/commit/6d95da6e7082e19a03123ad765b3d5f117731621))
+    - Adapt to changes in `gix-features`, use `gix-zlib` accordingly. ([`9c2977a`](https://github.com/GitoxideLabs/gitoxide/commit/9c2977a3b6d540690a1a263a037c8d54c316a020))
+    - Merge pull request #2691 from GitoxideLabs/gix-pack-missing-cap ([`0052e42`](https://github.com/GitoxideLabs/gitoxide/commit/0052e4256803a9905eacf80eb27be23cbffe7359))
+    - Merge pull request #2675 from ameyypawar/bench/2611-pack-generation ([`09642c6`](https://github.com/GitoxideLabs/gitoxide/commit/09642c6c0aab915a4f67a69848d10a225cce1405))
+    - Review ([`223f673`](https://github.com/GitoxideLabs/gitoxide/commit/223f673e9a1b946952ced2003ff62f4e31c26d91))
+    - Measure the discovery walk and state the benchmark's limits ([`6391b3e`](https://github.com/GitoxideLabs/gitoxide/commit/6391b3e2bb2ec1fd3fa27a43c11fbb7a8003907f))
+    - Merge pull request #2678 from GitoxideLabs/pack-entry-header-safety ([`938506b`](https://github.com/GitoxideLabs/gitoxide/commit/938506bf12c920a6f815425600075d387b5a603b))
+    - Remove redundant pack data hash length field ([`5d4c52b`](https://github.com/GitoxideLabs/gitoxide/commit/5d4c52b56a04b0deb6a4b93dbddb62346acaac8c))
+    - Prevent panics when decoding malformed pack entry headers ([`b69f0a6`](https://github.com/GitoxideLabs/gitoxide/commit/b69f0a6a6abf208ccc4fa622574c48e75df6e933))
+    - Merge pull request #2616 from 0WD0/wd/pack ([`b2a0fd6`](https://github.com/GitoxideLabs/gitoxide/commit/b2a0fd66fc0e2dd84b7abed513ac20d907b5fcb7))
+    - Review ([`3d511c3`](https://github.com/GitoxideLabs/gitoxide/commit/3d511c3e3d116a65031b9d056715c144555216db))
+    - Merge pull request #2670 from GitoxideLabs/fix-ci ([`d785bbc`](https://github.com/GitoxideLabs/gitoxide/commit/d785bbca609c287973f35c0e07ac9e0ade4d0f72))
+    - Update `mmap2` to avoid potential for unsoundness ([`eda41b1`](https://github.com/GitoxideLabs/gitoxide/commit/eda41b12df5d028a847d873736df1f1e973d1946))
+    - Merge pull request #2646 from GitoxideLabs/report ([`1b1541e`](https://github.com/GitoxideLabs/gitoxide/commit/1b1541ed7a457afd48385c1ee39113949a9f5263))
+</details>
+
+## 0.72.0 (2026-06-22)
+
+### Bug Fixes
+
+ - <csr-id-6de909bec54270cf2433eb944af20ed0e7bd7467/> cap aggregate delta data allocation in gix-pack
+   A ClusterFuzz data_file testcase could build a malformed delta chain whose
+   individual entry sizes stayed below the configured fuzz allocation cap, but
+   whose aggregate decompressed delta payload size reached multi-gigabyte scale.
+   The fuzz harness then attempted to reserve that aggregate buffer and aborted
+   with libFuzzer out-of-memory.
+   
+   Reject aggregate delta payload sizes once they exceed
+   File::with_alloc_limit_bytes(), matching the existing protection for individual
+   decoded object sizes. Add the minimized ClusterFuzz testcase to the data_file
+   artefacts so the known input remains available to the fuzz target and artifact
+   smoke test.
+
+### Bug Fixes (BREAKING)
+
+ - <csr-id-ee91e314010fa53c839de199ffd504d72110b507/> remove unused `index::Version::hash()` method.
+   It's not useful either as there is no relationship between the Version
+   of the index file and the hash to use.
+
+### Commit Statistics
+
+<csr-read-only-do-not-edit/>
+
+ - 11 commits contributed to the release over the course of 27 calendar days.
+ - 27 days passed between releases.
+ - 2 commits were understood as [conventional](https://www.conventionalcommits.org).
+ - 0 issues like '(#ID)' were seen in commit messages
+
+### Commit Details
+
+<csr-read-only-do-not-edit/>
+
+<details><summary>view details</summary>
+
+ * **Uncategorized**
+    - Release gix-date v0.15.5, gix-hashtable v0.15.2, gix-object v0.62.0, gix-attributes v0.33.2, gix-filter v0.32.0, gix-revwalk v0.33.0, gix-traverse v0.59.0, gix-worktree-stream v0.34.0, gix-archive v0.34.0, gix-tempfile v23.0.2, gix-index v0.53.0, gix-worktree v0.54.0, gix-imara-diff v0.2.3, gix-diff v0.65.0, gix-blame v0.15.0, gix-ref v0.65.0, gix-config v0.58.0, gix-discover v0.53.0, gix-dir v0.27.0, gix-revision v0.47.0, gix-merge v0.18.0, gix-negotiate v0.33.0, gix-pack v0.72.0, gix-odb v0.82.0, gix-refspec v0.43.0, gix-transport v0.57.2, gix-protocol v0.63.0, gix-status v0.32.0, gix-submodule v0.32.0, gix-worktree-state v0.32.0, gix v0.85.0, gix-fsck v0.23.0, gitoxide-core v0.59.0, gitoxide v0.55.0, safety bump 28 crates ([`6428edc`](https://github.com/GitoxideLabs/gitoxide/commit/6428edc82fc8a16d5ef34ca2d49aa6fdff3645fe))
+    - Merge pull request #2657 from GitoxideLabs/dev/aratiu/sha256-pack ([`cdafa6a`](https://github.com/GitoxideLabs/gitoxide/commit/cdafa6a3c9cb0a77bc28512be4025b6bc90c4a72))
+    - Review ([`14025af`](https://github.com/GitoxideLabs/gitoxide/commit/14025afb5df8a049ace3e1fbbda9ce499dd1efa8))
+    - Cover multi-index write under SHA-256 ([`bbf6fe3`](https://github.com/GitoxideLabs/gitoxide/commit/bbf6fe3cd5c5e2c6ceb583aa8296d4a8ff142748))
+    - Correct the index-verification progress label for non-SHA-1 hashes ([`aa319aa`](https://github.com/GitoxideLabs/gitoxide/commit/aa319aa2e1ab15094c6ef9e782f20e94ff99b91d))
+    - Merge pull request #2632 from GitoxideLabs/fix-fuzz-failure ([`70d38bf`](https://github.com/GitoxideLabs/gitoxide/commit/70d38bf8721c9e3a3d5efd241f5d8f64d84e6b6b))
+    - Cap aggregate delta data allocation in gix-pack ([`6de909b`](https://github.com/GitoxideLabs/gitoxide/commit/6de909bec54270cf2433eb944af20ed0e7bd7467))
+    - Merge pull request #2602 from cruessler/run-gix-pack-tests-with-sha-256 ([`4f862a5`](https://github.com/GitoxideLabs/gitoxide/commit/4f862a59b504de91c8a1a14a21667579ba3e450d))
+    - Remove unused `index::Version::hash()` method. ([`ee91e31`](https://github.com/GitoxideLabs/gitoxide/commit/ee91e314010fa53c839de199ffd504d72110b507))
+    - Add generated archives for SHA-256 in `gix-pack` ([`4f1bb83`](https://github.com/GitoxideLabs/gitoxide/commit/4f1bb832963b3c798b89708debf68a280031f322))
+    - Merge pull request #2618 from GitoxideLabs/report ([`f7d4f33`](https://github.com/GitoxideLabs/gitoxide/commit/f7d4f33b58503996ae90497b69ce4c3a757982ac))
+</details>
+
+## 0.71.0 (2026-05-26)
+
+### New Features
+
+ - <csr-id-04c894e6e9de1ef9b4e2e654a9f3da85df2788f6/> Add SHA-256 support
+   This means that if compiled in, SHA-256 packs can now be read and used.
+
+### Other
+
+ - <csr-id-3e389020600415ad9fd0de38835534bfe4889ba0/> reject truncated delta headers within their own data range
+   ClusterFuzz reported a panic in gix-pack's data_file fuzz target for testcase
+   clusterfuzz-testcase-minimized-gix-pack-data_file-6499869547364352. The
+   minimized pack could reach File::decode_entry() and panic while applying a
+   relocated delta instruction range with the slice error 'slice index starts at 11
+   but ends at 9'.
+   
+   The first delta decoding pass stored all decompressed delta instructions
+   contiguously, but decoded each delta's base and result size headers from the
+   remaining combined instruction buffer. If a malformed delta header continued
+   past that delta's declared decompressed size, header parsing could consume
+   bytes from the following delta and produce an invalid instruction range for the
+   current delta.
+   
+   Limit delta size-header parsing to the current delta's decompressed instruction
+   range so truncated malformed headers become delta corruption errors instead of
+   cross-delta ranges. Add the ClusterFuzz artifact and a regression that exercises
+   the same offsets as the data_file fuzz target.
+   
+   It's notable that it doesn't reproduce when run in debug mode or with the test-suite,
+   but it does reproduce with the fuzzer, and it's fixed now (hence does not reproduce).
+   To keep the suite simple, I removed the extra test.
+
+### Bug Fixes (BREAKING)
+
+ - <csr-id-176d07b9bd00bc83d310f0034452a1448414c55f/> accept non-canonical pack entry size headers
+   C Git accepts overlong pack entry size encodings, and real servers can send
+   them when reusing existing pack data. Accept these headers while recording
+   the actual header length consumed from the pack.
+   
+   Keeping the actual header length avoids recomputing a canonical length from
+   the decoded size, which would break pack offset reconstruction and
+   ofs-delta base offset calculations for non-canonical entries.
+
+### Commit Statistics
+
+<csr-read-only-do-not-edit/>
+
+ - 23 commits contributed to the release over the course of 28 calendar days.
+ - 28 days passed between releases.
+ - 3 commits were understood as [conventional](https://www.conventionalcommits.org).
+ - 0 issues like '(#ID)' were seen in commit messages
+
+### Commit Details
+
+<csr-read-only-do-not-edit/>
+
+<details><summary>view details</summary>
+
+ * **Uncategorized**
+    - Release gix-error v0.2.4, gix-date v0.15.4, gix-actor v0.41.1, gix-trace v0.1.20, gix-validate v0.11.2, gix-path v0.12.1, gix-utils v0.3.3, gix-features v0.48.1, gix-hash v0.25.1, gix-hashtable v0.15.1, gix-object v0.61.0, gix-glob v0.26.1, gix-quote v0.7.2, gix-attributes v0.33.1, gix-command v0.9.1, gix-packetline v0.21.4, gix-filter v0.31.0, gix-fs v0.21.2, gix-chunk v0.7.2, gix-commitgraph v0.37.1, gix-revwalk v0.32.0, gix-traverse v0.58.0, gix-worktree-stream v0.33.0, gix-archive v0.33.0, gix-bitmap v0.3.2, gix-tempfile v23.0.1, gix-lock v23.0.1, gix-index v0.52.0, gix-config-value v0.18.1, gix-pathspec v0.18.1, gix-ignore v0.21.1, gix-worktree v0.53.0, gix-imara-diff v0.2.2, gix-diff v0.64.0, gix-blame v0.14.0, gix-ref v0.64.0, gix-sec v0.14.1, gix-config v0.57.0, gix-prompt v0.15.1, gix-url v0.36.1, gix-credentials v0.38.1, gix-discover v0.52.0, gix-dir v0.26.0, gix-mailmap v0.33.1, gix-revision v0.46.0, gix-merge v0.17.0, gix-negotiate v0.32.0, gix-pack v0.71.0, gix-odb v0.81.0, gix-refspec v0.42.0, gix-shallow v0.12.1, gix-transport v0.57.1, gix-protocol v0.62.0, gix-status v0.31.0, gix-submodule v0.31.0, gix-worktree-state v0.31.0, gix v0.84.0, gix-fsck v0.22.0, gitoxide-core v0.58.0, gitoxide v0.54.0, safety bump 27 crates ([`10c58bb`](https://github.com/GitoxideLabs/gitoxide/commit/10c58bb56597d9335611da121aac21f9b09b6e5b))
+    - Accept non-canonical pack entry size headers ([`176d07b`](https://github.com/GitoxideLabs/gitoxide/commit/176d07b9bd00bc83d310f0034452a1448414c55f))
+    - Merge pull request #2590 from GitoxideLabs/independent-testtools ([`575113d`](https://github.com/GitoxideLabs/gitoxide/commit/575113dfb10b3ba12eb57f57a81b241e773968bd))
+    - Adapt to changes in `gix-testtools` ([`ce9e6bd`](https://github.com/GitoxideLabs/gitoxide/commit/ce9e6bded2cb47cc9b995f8882d98c09ba5c2c8b))
+    - Merge pull request #2581 from GitoxideLabs/improvements ([`8af2691`](https://github.com/GitoxideLabs/gitoxide/commit/8af2691270a72c711bbec8100ce07273de29f52a))
+    - Add SHA-256 support ([`04c894e`](https://github.com/GitoxideLabs/gitoxide/commit/04c894e6e9de1ef9b4e2e654a9f3da85df2788f6))
+    - Merge pull request #2573 from cruessler/run-gix-traverse-tests-with-sha-256 ([`278d7ec`](https://github.com/GitoxideLabs/gitoxide/commit/278d7ec395124b3ce00db6f3e029265bfec8ccd1))
+    - Address auto-review ([`0ec3bb7`](https://github.com/GitoxideLabs/gitoxide/commit/0ec3bb7f516c6ac17a91cb2a5452643d4d5576fb))
+    - Cleanup the `justfile` and automate feature tests ([`db7b97b`](https://github.com/GitoxideLabs/gitoxide/commit/db7b97b6e3858c44f1ab8c42af2017e8259c64d7))
+    - Merge pull request #2571 from GitoxideLabs/fix/avoid-pack-delta-panic ([`24cdbb0`](https://github.com/GitoxideLabs/gitoxide/commit/24cdbb04152d6fa88e4e9f0b7a780141ce90e7eb))
+    - Address auto-review ([`c5db356`](https://github.com/GitoxideLabs/gitoxide/commit/c5db35694680c5d19945ab80d04a66abf03a45a9))
+    - Address review comment about large delta header probes ([`af84752`](https://github.com/GitoxideLabs/gitoxide/commit/af847521987f44ed20726515a67911b28d0d9be3))
+    - Address review comments about decompression bounds ([`89a27bf`](https://github.com/GitoxideLabs/gitoxide/commit/89a27bf86fa68043b30ff2d4c208b6b2ce18ada0))
+    - Address review comment about produced delta bytes ([`8e562c7`](https://github.com/GitoxideLabs/gitoxide/commit/8e562c727c3de49ab494e55db7d039db530ddfc8))
+    - Reject truncated delta headers within their own data range ([`3e38902`](https://github.com/GitoxideLabs/gitoxide/commit/3e389020600415ad9fd0de38835534bfe4889ba0))
+    - Merge pull request #2568 from GitoxideLabs/dependabot/cargo/cargo-56d6b174d8 ([`ab2fee1`](https://github.com/GitoxideLabs/gitoxide/commit/ab2fee14651202fcb7b3d8178932090c73492014))
+    - Update crates to Rust 2024 edition ([`2cb17b2`](https://github.com/GitoxideLabs/gitoxide/commit/2cb17b2e7f6009693a55af907614f705a29d8c29))
+    - Remove rust_2018_idioms lint declarations ([`e10d5f6`](https://github.com/GitoxideLabs/gitoxide/commit/e10d5f662df2ee05f973a3167ad215a330ee74e1))
+    - Raise MSRV for hash dependency updates ([`3675a8d`](https://github.com/GitoxideLabs/gitoxide/commit/3675a8d61b17845a783bc27912a3f52ac273a4af))
+    - Merge pull request #2543 from cruessler/run-gix-worktree-stream-tests-with-sha-256 ([`23af41a`](https://github.com/GitoxideLabs/gitoxide/commit/23af41ab13d4fa894c2c2774a096fef5438bef7d))
+    - Adapt to changes in `gix_object::Data` ([`4309fa4`](https://github.com/GitoxideLabs/gitoxide/commit/4309fa4a98fd613f8e346ed0274d0edec8dfab1f))
+    - Adapt to changes in `gix-testtools`and rename `hash_kind` -> `object_hash` ([`d9648e8`](https://github.com/GitoxideLabs/gitoxide/commit/d9648e85c53616fe2fb79e19ee0a42967127cc2f))
+    - Merge pull request #2546 from GitoxideLabs/fix-2545 ([`adb8328`](https://github.com/GitoxideLabs/gitoxide/commit/adb8328952478c443ead5f5a8c6851928b377b37))
+</details>
+
+## 0.70.0 (2026-04-28)
+
+### Commit Statistics
+
+<csr-read-only-do-not-edit/>
+
+ - 3 commits contributed to the release over the course of 2 calendar days.
+ - 4 days passed between releases.
+ - 0 commits were understood as [conventional](https://www.conventionalcommits.org).
+ - 0 issues like '(#ID)' were seen in commit messages
+
+### Commit Details
+
+<csr-read-only-do-not-edit/>
+
+<details><summary>view details</summary>
+
+ * **Uncategorized**
+    - Release gix-error v0.2.3, gix-date v0.15.3, gix-actor v0.41.0, gix-path v0.12.0, gix-features v0.48.0, gix-hash v0.25.0, gix-hashtable v0.15.0, gix-object v0.60.0, gix-glob v0.26.0, gix-attributes v0.33.0, gix-command v0.9.0, gix-filter v0.30.0, gix-fs v0.21.0, gix-commitgraph v0.37.0, gix-revwalk v0.31.0, gix-traverse v0.57.0, gix-worktree-stream v0.32.0, gix-archive v0.32.0, gix-tempfile v23.0.0, gix-lock v23.0.0, gix-index v0.51.0, gix-config-value v0.18.0, gix-pathspec v0.18.0, gix-ignore v0.21.0, gix-worktree v0.52.0, gix-imara-diff v0.2.1, gix-diff v0.63.0, gix-blame v0.13.0, gix-ref v0.63.0, gix-sec v0.14.0, gix-config v0.56.0, gix-prompt v0.15.0, gix-url v0.36.0, gix-credentials v0.38.0, gix-discover v0.51.0, gix-dir v0.25.0, gix-mailmap v0.33.0, gix-revision v0.45.0, gix-merge v0.16.0, gix-negotiate v0.31.0, gix-pack v0.70.0, gix-odb v0.80.0, gix-refspec v0.41.0, gix-shallow v0.12.0, gix-transport v0.57.0, gix-protocol v0.61.0, gix-status v0.30.0, gix-submodule v0.30.0, gix-worktree-state v0.30.0, gix v0.83.0, gix-fsck v0.21.0, gitoxide-core v0.57.0, gitoxide v0.53.0, safety bump 48 crates ([`53f880c`](https://github.com/GitoxideLabs/gitoxide/commit/53f880c7604232c367870088176e42efd8a5b783))
     - Adapt to changes in `gix-object` ([`91bfab0`](https://github.com/GitoxideLabs/gitoxide/commit/91bfab0694673b3234b52f30fa9c8ec4322ddb9d))
     - Merge pull request #2540 from GitoxideLabs/reporting ([`4d5ba23`](https://github.com/GitoxideLabs/gitoxide/commit/4d5ba231685e8ff36195603c57193aa1cd21fa8e))
 </details>
@@ -61,7 +873,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <csr-read-only-do-not-edit/>
 
  - 20 commits contributed to the release over the course of 32 calendar days.
- - 32 days passed between releases.
+ - 33 days passed between releases.
  - 6 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -113,6 +925,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <csr-read-only-do-not-edit/>
 
  - 7 commits contributed to the release.
+ - 28 days passed between releases.
  - 1 commit was understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -234,22 +1047,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <csr-id-d99352bd3b7c75791826b40df20afdd4b0d8b26e/>
 
-### Other
-
- - <csr-id-d99352bd3b7c75791826b40df20afdd4b0d8b26e/> Don't decompress the delta when decompressing base objects.
-   It was already decompressed on line 285, so attempting to decompress it
-   again turns the delta stream into garbage.
-   
-   Unfortunately I don't know enough about the git file format to make a
-   test, the best I was able to do was to compare it to a reference
-   implementation and see what was going wrong.
-
 ### Commit Statistics
 
 <csr-read-only-do-not-edit/>
 
  - 4 commits contributed to the release over the course of 5 calendar days.
- - 5 days passed between releases.
+ - 6 days passed between releases.
  - 1 commit was understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -295,7 +1098,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <csr-read-only-do-not-edit/>
 
  - 1 commit contributed to the release.
- - 29 days passed between releases.
+ - 30 days passed between releases.
  - 0 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -316,6 +1119,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <csr-read-only-do-not-edit/>
 
  - 2 commits contributed to the release.
+ - 30 days passed between releases.
  - 0 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -333,13 +1137,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## 0.61.1 (2025-10-23)
 
 <csr-id-6f469a6fea59c88e6c69a5f94b0bc8a5977cb75b/>
-
-### Other
-
- - <csr-id-6f469a6fea59c88e6c69a5f94b0bc8a5977cb75b/> Remove `doc_auto_cfg` feature to fix docs.rs documentation.
-   It is part of `doc_cfg` feature since https://github.com/rust-lang/rust/pull/138907
-   
-   This fixes the docs.rs build
 
 ### Commit Statistics
 
@@ -402,16 +1199,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <csr-id-fce70950006892f51b32af233656be6fe5de9df3/>
 
-### Other
-
- - <csr-id-fce70950006892f51b32af233656be6fe5de9df3/> delta application is a fallible operation
-
 ### Commit Statistics
 
 <csr-read-only-do-not-edit/>
 
  - 14 commits contributed to the release over the course of 79 calendar days.
- - 79 days passed between releases.
+ - 80 days passed between releases.
  - 1 commit was understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -445,6 +1238,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <csr-read-only-do-not-edit/>
 
  - 3 commits contributed to the release.
+ - 1 day passed between releases.
  - 0 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -469,6 +1263,7 @@ A maintenance release without user-facing changes.
 <csr-read-only-do-not-edit/>
 
  - 13 commits contributed to the release.
+ - 21 days passed between releases.
  - 0 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -517,6 +1312,7 @@ A maintenance release without user-facing changes.
 <csr-read-only-do-not-edit/>
 
  - 19 commits contributed to the release.
+ - 76 days passed between releases.
  - 4 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -557,12 +1353,6 @@ A maintenance release without user-facing changes.
 ## 0.57.0 (2025-01-18)
 
 <csr-id-17835bccb066bbc47cc137e8ec5d9fe7d5665af0/>
-
-### Chore
-
- - <csr-id-17835bccb066bbc47cc137e8ec5d9fe7d5665af0/> bump `rust-version` to 1.70
-   That way clippy will allow to use the fantastic `Option::is_some_and()`
-   and friends.
 
 ### Commit Statistics
 
@@ -632,6 +1422,7 @@ A maintenance release without user-facing changes.
 <csr-read-only-do-not-edit/>
 
  - 13 commits contributed to the release.
+ - 33 days passed between releases.
  - 0 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -661,47 +1452,12 @@ A maintenance release without user-facing changes.
 
 <csr-id-64ff0a77062d35add1a2dd422bb61075647d1a36/>
 
-### Other
-
- - <csr-id-64ff0a77062d35add1a2dd422bb61075647d1a36/> Update gitoxide repository URLs
-   This updates `Byron/gitoxide` URLs to `GitoxideLabs/gitoxide` in:
-   
-   - Markdown documentation, except changelogs and other such files
-     where such changes should not be made.
-   
-   - Documentation comments (in .rs files).
-   
-   - Manifest (.toml) files, for the value of the `repository` key.
-   
-   - The comments appearing at the top of a sample hook that contains
-     a repository URL as an example.
-   
-   When making these changes, I also allowed my editor to remove
-   trailing whitespace in any lines in files already being edited
-   (since, in this case, there was no disadvantage to allowing this).
-   
-   The gitoxide repository URL changed when the repository was moved
-   into the recently created GitHub organization `GitoxideLabs`, as
-   detailed in #1406. Please note that, although I believe updating
-   the URLs to their new canonical values is useful, this is not
-   needed to fix any broken links, since `Byron/gitoxide` URLs
-   redirect (and hopefully will always redirect) to the coresponding
-   `GitoxideLabs/gitoxide` URLs.
-   
-   While this change should not break any URLs, some affected URLs
-   were already broken. This updates them, but they are still broken.
-   They will be fixed in a subsequent commit.
-   
-   This also does not update `Byron/gitoxide` URLs in test fixtures
-   or test cases, nor in the `Makefile`. (It may make sense to change
-   some of those too, but it is not really a documentation change.)
-
 ### Commit Statistics
 
 <csr-read-only-do-not-edit/>
 
  - 22 commits contributed to the release.
- - 60 days passed between releases.
+ - 61 days passed between releases.
  - 1 commit was understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -812,10 +1568,6 @@ A maintenance release without user-facing changes.
    
    Now packs or indices aren't written anymore if they are empty.
 
-### Other
-
- - <csr-id-a2da5373fada6c1a90d139bba6db7b238ae6504c/> gate few deps
-
 ### Commit Statistics
 
 <csr-read-only-do-not-edit/>
@@ -882,7 +1634,7 @@ A maintenance release without user-facing changes.
 <csr-read-only-do-not-edit/>
 
  - 5 commits contributed to the release over the course of 9 calendar days.
- - 38 days passed between releases.
+ - 39 days passed between releases.
  - 1 commit was understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -911,6 +1663,7 @@ A maintenance release without user-facing changes.
 <csr-read-only-do-not-edit/>
 
  - 7 commits contributed to the release over the course of 5 calendar days.
+ - 30 days passed between releases.
  - 1 commit was understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -939,10 +1692,6 @@ A maintenance release without user-facing changes.
 ## 0.49.0 (2024-03-14)
 
 <csr-id-39879af6eaf2bf4fe159a5c6371c98d516c4febe/>
-
-### Chore
-
- - <csr-id-39879af6eaf2bf4fe159a5c6371c98d516c4febe/> remove repetitive words
 
 ### Bug Fixes
 
@@ -1024,7 +1773,7 @@ A maintenance release without user-facing changes.
 <csr-read-only-do-not-edit/>
 
  - 11 commits contributed to the release over the course of 16 calendar days.
- - 20 days passed between releases.
+ - 21 days passed between releases.
  - 0 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 1 unique issue was worked on: [#1231](https://github.com/GitoxideLabs/gitoxide/issues/1231)
 
@@ -1053,20 +1802,12 @@ A maintenance release without user-facing changes.
 
 <csr-id-3bd09ef120945a9669321ea856db4079a5dab930/>
 
-### Chore
-
-- <csr-id-3bd09ef120945a9669321ea856db4079a5dab930/> change `rust-version` manifest field back to 1.65.
-  They didn't actually need to be higher to work, and changing them
-  unecessarily can break downstream CI.
-
-  Let's keep this value as low as possible, and only increase it when
-  more recent features are actually used.
-
 ### Commit Statistics
 
 <csr-read-only-do-not-edit/>
 
  - 3 commits contributed to the release.
+ - 1 day passed between releases.
  - 1 commit was understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -1086,17 +1827,12 @@ A maintenance release without user-facing changes.
 
 <csr-id-aea89c3ad52f1a800abb620e9a4701bdf904ff7d/>
 
-### Chore
-
-- <csr-id-aea89c3ad52f1a800abb620e9a4701bdf904ff7d/> upgrade MSRV to v1.70
-  Our MSRV follows the one of `helix`, which in turn follows Firefox.
-
 ### Commit Statistics
 
 <csr-read-only-do-not-edit/>
 
  - 9 commits contributed to the release over the course of 19 calendar days.
- - 22 days passed between releases.
+ - 23 days passed between releases.
  - 1 commit was understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -1129,6 +1865,7 @@ A maintenance release without user-facing changes.
 <csr-read-only-do-not-edit/>
 
  - 29 commits contributed to the release.
+ - 55 days passed between releases.
  - 1 commit was understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -1185,7 +1922,7 @@ A maintenance release without user-facing changes.
 <csr-read-only-do-not-edit/>
 
  - 5 commits contributed to the release over the course of 13 calendar days.
- - 17 days passed between releases.
+ - 18 days passed between releases.
  - 0 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -1251,12 +1988,6 @@ A maintenance release without user-facing changes.
    
    As the buffer is re-used, it's not actually zeroing that much memory either.
 
-### Chore (BREAKING)
-
-- <csr-id-ed327f6163f54756e58c20f86a563a97efb256ca/> update to the latest `prodash`
-  It makes proper usage of `Progress` types easier and allows them to be used
-  as `dyn` traits as well.
-
 ### New Features (BREAKING)
 
  - <csr-id-24dd870919ba444aa8099c63a78ea120d47ec28e/> use `prodash::Count` to indicate that nothing more than counting is performed, in place of `prodash::Progress`
@@ -1306,13 +2037,6 @@ A maintenance release without user-facing changes.
 
 <csr-id-93feea269eebd114e866e6f29f4a73c0096df9e0/>
 
-### Chore
-
-- <csr-id-93feea269eebd114e866e6f29f4a73c0096df9e0/> split tests off into their own crate to allow feature toggles.
-  That way we can test with the `parallel` feature and won't have to
-  create bogus feature toggles that are only used for testing, yet visbible
-  to users.
-
 ### Commit Statistics
 
 <csr-read-only-do-not-edit/>
@@ -1347,7 +2071,7 @@ A maintenance release without user-facing changes.
 <csr-read-only-do-not-edit/>
 
  - 3 commits contributed to the release.
- - 1 day passed between releases.
+ - 2 days passed between releases.
  - 0 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -1401,7 +2125,7 @@ A maintenance release without user-facing changes.
 <csr-read-only-do-not-edit/>
 
  - 9 commits contributed to the release over the course of 10 calendar days.
- - 19 days passed between releases.
+ - 20 days passed between releases.
  - 0 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -1462,7 +2186,7 @@ A maintenance release without user-facing changes.
 <csr-read-only-do-not-edit/>
 
  - 3 commits contributed to the release over the course of 6 calendar days.
- - 6 days passed between releases.
+ - 7 days passed between releases.
  - 0 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -1481,10 +2205,6 @@ A maintenance release without user-facing changes.
 ## 0.38.0 (2023-06-22)
 
 <csr-id-bcad5c22049d56a25ef69d6c7a3344e78f9a1d4d/>
-
-### Chore
-
-- <csr-id-bcad5c22049d56a25ef69d6c7a3344e78f9a1d4d/> Add `clippy::redundant-closure-for-method-calls` lint
 
 ### New Features
 
@@ -1545,7 +2265,7 @@ A maintenance release without user-facing changes.
 <csr-read-only-do-not-edit/>
 
  - 4 commits contributed to the release.
- - 3 days passed between releases.
+ - 4 days passed between releases.
  - 0 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -1681,6 +2401,7 @@ A maintenance release without user-facing changes.
 <csr-read-only-do-not-edit/>
 
  - 3 commits contributed to the release.
+ - 1 day passed between releases.
  - 0 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -1755,6 +2476,7 @@ A maintenance release without any user-facing changes.
 <csr-read-only-do-not-edit/>
 
  - 3 commits contributed to the release.
+ - 12 days passed between releases.
  - 0 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -1779,7 +2501,7 @@ A maintenance release without any user-facing changes.
 <csr-read-only-do-not-edit/>
 
  - 4 commits contributed to the release over the course of 3 calendar days.
- - 3 days passed between releases.
+ - 4 days passed between releases.
  - 0 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -1858,51 +2580,12 @@ A maintenance release without user-facing changes.
 
 <csr-id-3ba25202240d13fdda998581297616afe06422ca/>
 
-### Chore
-
-- <csr-id-3ba25202240d13fdda998581297616afe06422ca/> remove `dashmap` in favor of own sharded concurrent hashmap.
-  This speeds up multi-threaded counting greatly, and despite it
-  using shared memory which makes it quite wasteful, it is possible to
-  outperform `git` with it if enough cores are thrown at the problem.
-
-  Single-threaded performance is still lacking though, ultimately it needs
-  caches to accelerate the counting stage to hopefully be competitive.
-
-### New Features
-
- - <csr-id-f0e40ecddaf1211f76ed60ef30cf03dcfd53a7ab/> add `wasm` feature toggle to allow compilation to wasm32-unknown-unknown
- - <csr-id-3ba25202240d13fdda998581297616afe06422ca/> remove `dashmap` in favor of own sharded concurrent hashmap.
-   This speeds up multi-threaded counting greatly, and despite it
-   using shared memory which makes it quite wasteful, it is possible to
-   outperform `git` with it if enough cores are thrown at the problem.
-   
-   Single-threaded performance is still lacking though, ultimately it needs
-   caches to accelerate the counting stage to hopefully be competitive.
-
-### Bug Fixes
-
- - <csr-id-e14dc7d475373d2c266e84ff8f1826c68a34ab92/> note that crates have been renamed from `git-*` to `gix-*`.
-   This also means that the `git-*` prefixed crates of the `gitoxide` project
-   are effectively unmaintained.
-   Use the crates with the `gix-*` prefix instead.
-   
-   If you were using `git-repository`, then `gix` is its substitute.
-
-### New Features (BREAKING)
-
- - <csr-id-6c4c196c9bc6c2171dc4dc58b69bd5ef53226e29/> add `wasm` feature toggle to let parts of `git-pack` build on wasm32.
-   It's a breaking change because we also start using the `dep:` syntax for declaring
-   references to optional dependencies, which will prevent them from being automatically
-   available as features.
-   
-   Besides that, it adds the `wasm` feature toggle to allow compiling to `wasm32` targets.
-
 ### Commit Statistics
 
 <csr-read-only-do-not-edit/>
 
  - 11 commits contributed to the release over the course of 2 calendar days.
- - 8 days passed between releases.
+ - 9 days passed between releases.
  - 1 commit was understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -1972,22 +2655,6 @@ A maintenance release without user-facing changes.
 <csr-id-f7f136dbe4f86e7dee1d54835c420ec07c96cd78/>
 <csr-id-25209454d3f7e27e12e8ddca92e43b1ff01d58aa/>
 <csr-id-c800fdd331e6d7a0b8d756ba822915259f26e9e8/>
-
-### Refactor (BREAKING)
-
-- <csr-id-ebc7f47708a63c3df4415ba0e702660d976dfb3e/> remove pack-cache from `Find::try_find(…)`
-  With the new architecture this can be an implementation detail without
-  forcing it to be Sync.
-- <csr-id-2290d006705ff47ad780b009fe58ee422b3285af/> move git_pack::data::Object to git_object::Data, massively alter git_odb::Find trait
-  This will break a lot, but has to happen to prepare these traits for the
-  next generation of object databases.
-- <csr-id-598698b88c194bc0e6ef69539f9fa7246ebfab70/> move loose header manipulation from git-pack to git-object
-
-### Other (BREAKING)
-
-- <csr-id-b46347fd3d50886eeca500e31e1e12b354711309/> `index::write::Outcome::index_kind` -> `::index_version`.
-- <csr-id-591afd56d9862a6348ef8b3af61798004b36aa19/> `bundle::write::Options::index_kind` -> `::index_version`.
-- <csr-id-2f2d856efe733d3cf81110c0e0607d2e7c40d968/> Avoid duplicate module paths in 'tree' and 'commit'
 
 ### Bug Fixes (BREAKING)
 
@@ -2063,23 +2730,9 @@ A maintenance release without user-facing changes.
    work.
  - <csr-id-e8b091943f0c9a26317da0003f7fcdf5a56ef21a/> Rename gix->ein and gixp->gix
 
-### Refactor
-
-- <csr-id-9b9f10ad862b5e097c836c51df1eb98607df5ae1/> remove unnecessary unsafe by using `chunks_mut()`
-  This was probably a left-over from times where there was a static
-  requirement on the chunks processing. Maybe… .
-- <csr-id-e0b8636f96e4bfe1bc72b5aa6ad4c4c8538ff92c/> replace bare u32 `data::Id` typedef
-- <csr-id-71c628d46088ab455b54eb2330d24dcff96c911d/> Use 'cache::Object' trait where it matters
-- <csr-id-8fe461281842b58aa11437445637c6e587bedd63/> split data::output::count::objects into files
-
 ### Performance
 
  - <csr-id-f9232acf8e52f8cd95520d122469e136eb07b39f/> ObjectID specific hashers, using the fact that object ids are hashes
-
-### Other
-
-- <csr-id-e6ff1a885889cf88f6b34b1193aa03d8bce16af5/> :File uses its hash_len parameter
-- <csr-id-f48630ba8f745c2ec61a1e3c51fa63a1789a088c/> :Find implementation for Rc
 
 ### Bug Fixes
 
@@ -2144,12 +2797,6 @@ A maintenance release without user-facing changes.
    
    It's still a good idea to handle these gracefully though, git itself
    seems to ignore them.
-
-### Chore
-
-- <csr-id-f7f136dbe4f86e7dee1d54835c420ec07c96cd78/> uniformize deny attributes
-- <csr-id-25209454d3f7e27e12e8ddca92e43b1ff01d58aa/> upgrade dashmap to 5.1.0 (with security fix)
-- <csr-id-c800fdd331e6d7a0b8d756ba822915259f26e9e8/> remove unused dependencies
 
 ### Documentation
 
@@ -3065,8 +3712,8 @@ A maintenance release without user-facing changes.
 
 ### Other (BREAKING)
 
-- <csr-id-b46347fd3d50886eeca500e31e1e12b354711309/> `index::write::Outcome::index_kind` -> `::index_version`.
-- <csr-id-591afd56d9862a6348ef8b3af61798004b36aa19/> `bundle::write::Options::index_kind` -> `::index_version`.
+ - <csr-id-b46347fd3d50886eeca500e31e1e12b354711309/> `index::write::Outcome::index_kind` -> `::index_version`.
+ - <csr-id-591afd56d9862a6348ef8b3af61798004b36aa19/> `bundle::write::Options::index_kind` -> `::index_version`.
 
 ## 0.23.0 (2022-09-20)
 
@@ -3084,7 +3731,7 @@ Maintenance release without user-facing changes.
 
 ### Chore
 
-- <csr-id-f7f136dbe4f86e7dee1d54835c420ec07c96cd78/> uniformize deny attributes
+ - <csr-id-f7f136dbe4f86e7dee1d54835c420ec07c96cd78/> uniformize deny attributes
 
 ### New Features
 
@@ -3131,7 +3778,7 @@ A maintenance release without user-facing changes.
 
 ### Chore
 
-- <csr-id-25209454d3f7e27e12e8ddca92e43b1ff01d58aa/> upgrade dashmap to 5.1.0 (with security fix)
+ - <csr-id-25209454d3f7e27e12e8ddca92e43b1ff01d58aa/> upgrade dashmap to 5.1.0 (with security fix)
 
 ### New Features
 
@@ -3147,9 +3794,9 @@ A maintenance release without user-facing changes.
 
 ### Refactor
 
-- <csr-id-9b9f10ad862b5e097c836c51df1eb98607df5ae1/> remove unnecessary unsafe by using `chunks_mut()`
-  This was probably a left-over from times where there was a static
-  requirement on the chunks processing. Maybe… .
+ - <csr-id-9b9f10ad862b5e097c836c51df1eb98607df5ae1/> remove unnecessary unsafe by using `chunks_mut()`
+   This was probably a left-over from times where there was a static
+   requirement on the chunks processing. Maybe… .
 
 ## 0.16.1 (2022-02-01)
 
@@ -3170,16 +3817,16 @@ A maintenance release without user-facing changes.
 
 ### Refactor
 
-- <csr-id-e0b8636f96e4bfe1bc72b5aa6ad4c4c8538ff92c/> replace bare u32 `data::Id` typedef
+ - <csr-id-e0b8636f96e4bfe1bc72b5aa6ad4c4c8538ff92c/> replace bare u32 `data::Id` typedef
 
 ### Other
 
-- <csr-id-e6ff1a885889cf88f6b34b1193aa03d8bce16af5/> :File uses its hash_len parameter
-- <csr-id-f48630ba8f745c2ec61a1e3c51fa63a1789a088c/> :Find implementation for Rc
+ - <csr-id-e6ff1a885889cf88f6b34b1193aa03d8bce16af5/> :File uses its hash_len parameter
+ - <csr-id-f48630ba8f745c2ec61a1e3c51fa63a1789a088c/> :Find implementation for Rc
 
 ### Chore
 
-- <csr-id-c800fdd331e6d7a0b8d756ba822915259f26e9e8/> remove unused dependencies
+ - <csr-id-c800fdd331e6d7a0b8d756ba822915259f26e9e8/> remove unused dependencies
 
 ### New Features
 
@@ -3314,8 +3961,8 @@ signalled a breaking change which is one of our dependencies.
 
 ### Refactor
 
-- <csr-id-71c628d46088ab455b54eb2330d24dcff96c911d/> Use 'cache::Object' trait where it matters
-- <csr-id-8fe461281842b58aa11437445637c6e587bedd63/> split data::output::count::objects into files
+ - <csr-id-71c628d46088ab455b54eb2330d24dcff96c911d/> Use 'cache::Object' trait where it matters
+ - <csr-id-8fe461281842b58aa11437445637c6e587bedd63/> split data::output::count::objects into files
 
 ### New Features
 

@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
-use bstr::{BStr, BString, ByteSlice};
+use gix_error::Result;
+
+use bstr::{BStr, BString};
 
 use crate::{
     File,
@@ -17,11 +19,7 @@ impl File {
         section.id = new_section_id;
 
         let lookup_name = section::Name(section.header.name.to_bstring_in(&self.backing));
-        let subsection_name = section
-            .header
-            .subsection_name
-            .as_ref()
-            .map(|name| name.value_in(&self.backing).to_owned());
+        let subsection_name = section.header.subsection_name(&self.backing).map(ToOwned::to_owned);
         self.sections.insert(new_section_id, section);
         let lookup = self.section_lookup_tree.entry(lookup_name).or_default();
         match subsection_name {
@@ -38,11 +36,7 @@ impl File {
         let new_section_id = self.allocate_section_id();
         section.id = new_section_id;
         let lookup_name = section::Name(section.header.name.to_bstring_in(&self.backing));
-        let subsection_name = section
-            .header
-            .subsection_name
-            .as_ref()
-            .map(|name| name.value_in(&self.backing).to_owned());
+        let subsection_name = section.header.subsection_name(&self.backing).map(ToOwned::to_owned);
         self.sections.insert(new_section_id, section);
         self.section_order.insert(before_order + 1, new_section_id);
 
@@ -62,29 +56,29 @@ impl File {
         &'a self,
         section_name: &'a str,
         subsection_name: Option<&BStr>,
-    ) -> Result<impl ExactSizeIterator<Item = SectionId> + DoubleEndedIterator + 'a, lookup::existing::Error> {
+    ) -> Result<impl ExactSizeIterator<Item = SectionId> + DoubleEndedIterator + 'a> {
         let section_name = section::Name::from_str_unchecked(section_name);
         let lookup = self
             .section_lookup_tree
             .get(&section_name)
-            .ok_or(lookup::existing::Error::SectionMissing)?;
+            .ok_or_else(lookup::existing::section_missing)?;
         match subsection_name {
             Some(name) => lookup.by_subsection.get(name),
             None => (!lookup.without_subsection.is_empty()).then_some(&lookup.without_subsection),
         }
-        .ok_or(lookup::existing::Error::SubSectionMissing)
+        .ok_or_else(lookup::existing::subsection_missing)
         .map(|ids| ids.iter().copied())
     }
 
     pub(crate) fn section_ids_by_name<'a>(
         &'a self,
         section_name: &str,
-    ) -> Result<impl Iterator<Item = SectionId> + 'a + use<'a>, lookup::existing::Error> {
+    ) -> Result<impl Iterator<Item = SectionId> + 'a + use<'a>> {
         let lookup_name = section::Name::from_str_unchecked(section_name);
         let lookup = self
             .section_lookup_tree
             .get(&lookup_name)
-            .ok_or(lookup::existing::Error::SectionMissing)?;
+            .ok_or_else(lookup::existing::section_missing)?;
         let mut ids = Vec::with_capacity(self.section_order.len());
         ids.extend_from_slice(&lookup.without_subsection);
         ids.extend(lookup.by_subsection.values().flatten().copied());
@@ -140,29 +134,17 @@ pub(crate) fn set_section_header(
     header: section::HeaderData,
 ) {
     let old_name = section::Name(section_data.header.name.to_bstring_in(backing));
-    let old_subsection_name = section_data
-        .header
-        .subsection_name
-        .as_ref()
-        .map(|name| name.value_in(backing).to_owned());
+    let old_subsection_name = section_data.header.subsection_name(backing);
     let new_name = section::Name(header.name.to_bstring_in(backing));
-    let new_subsection_name = header
-        .subsection_name
-        .as_ref()
-        .map(|name| name.value_in(backing).to_owned());
+    let new_subsection_name = header.subsection_name(backing);
 
     if old_name != new_name || old_subsection_name != new_subsection_name {
-        remove_section_id_from_lookup(
-            lookup_tree,
-            &old_name,
-            old_subsection_name.as_ref().map(|name| name.as_bstr()),
-            section_data.id,
-        );
+        remove_section_id_from_lookup(lookup_tree, &old_name, old_subsection_name, section_data.id);
         insert_section_id_into_lookup(
             lookup_tree,
             section_order,
             new_name,
-            new_subsection_name,
+            new_subsection_name.map(ToOwned::to_owned),
             section_data.id,
         );
     }

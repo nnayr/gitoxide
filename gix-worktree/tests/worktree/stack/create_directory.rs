@@ -1,3 +1,4 @@
+use gix_testtools::TestResult;
 use std::path::Path;
 
 use gix_testtools::tempfile::{TempDir, tempdir};
@@ -8,7 +9,7 @@ const IS_DIR: Option<gix_index::entry::Mode> = Some(gix_index::entry::Mode::DIR)
 const IS_SYMLINK: Option<gix_index::entry::Mode> = Some(gix_index::entry::Mode::SYMLINK);
 
 #[test]
-fn root_is_assumed_to_exist_and_files_in_root_do_not_create_directory() -> crate::Result {
+fn root_is_assumed_to_exist_and_files_in_root_do_not_create_directory() -> TestResult {
     let dir = tempdir()?;
     let mut cache = Stack::new(
         dir.path().join("non-existing-root"),
@@ -47,7 +48,7 @@ fn directory_paths_are_created_in_full() {
 }
 
 #[test]
-fn existing_directories_are_fine() -> crate::Result {
+fn existing_directories_are_fine() -> TestResult {
     let (mut cache, tmp) = new_cache();
     std::fs::create_dir(tmp.path().join("dir"))?;
 
@@ -59,7 +60,7 @@ fn existing_directories_are_fine() -> crate::Result {
 }
 
 #[test]
-fn validation_to_each_component() -> crate::Result {
+fn validation_to_each_component() -> TestResult {
     let (mut cache, tmp) = new_cache();
 
     let err = cache
@@ -71,16 +72,22 @@ fn validation_to_each_component() -> crate::Result {
         "the valid directory was created"
     );
     assert!(tmp.path().join("valid").is_dir(), "it was actually created");
-    assert_eq!(err.to_string(), "The .git name may never be used");
+    insta::assert_debug_snapshot!(err, "validation to each component", @"
+    Custom {
+        kind: Other,
+        error: DotGitDir,
+    }
+    ");
     Ok(())
 }
 
 #[test]
-fn symlinks_or_files_in_path_are_forbidden_or_unlinked_when_forced() -> crate::Result {
+fn symlinks_or_files_in_path_are_forbidden_or_unlinked_when_forced() -> TestResult {
+    let mut inline_error_diagnostics = Vec::new();
     let (mut cache, tmp) = new_cache();
     let forbidden = tmp.path().join("forbidden");
     std::fs::create_dir(&forbidden)?;
-    symlink::symlink_dir(&forbidden, tmp.path().join("link-to-dir"))?;
+    gix_fs::symlink::create(&forbidden, &tmp.path().join("link-to-dir"))?;
     std::fs::write(tmp.path().join("file-in-dir"), [])?;
 
     for dirname in &["file-in-dir", "link-to-dir"] {
@@ -91,13 +98,11 @@ fn symlinks_or_files_in_path_are_forbidden_or_unlinked_when_forced() -> crate::R
             *unlink_on_collision = false;
         }
         let relative_path = format!("{dirname}/file");
-        assert_eq!(
-            cache
-                .at_path(&*relative_path, IS_FILE, &gix_object::find::Never)
-                .unwrap_err()
-                .kind(),
-            std::io::ErrorKind::AlreadyExists
-        );
+        let err = cache
+            .at_path(&*relative_path, IS_FILE, &gix_object::find::Never)
+            .expect_err("the operation must fail");
+        inline_error_diagnostics.push(gix_testtools::redact_debug_snapshot(&err, &[]));
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
     }
     assert_eq!(
         cache.statistics().delegate.num_mkdir_calls,
@@ -124,11 +129,53 @@ fn symlinks_or_files_in_path_are_forbidden_or_unlinked_when_forced() -> crate::R
         4,
         "like before, but it unlinks what's there and tries again"
     );
+    insta::assert_debug_snapshot!(inline_error_diagnostics, "symlinks or files in path are forbidden or unlinked when forced", @"
+    [
+        AlreadyExists,
+        AlreadyExists,
+    ]
+    ");
     Ok(())
 }
 
 #[test]
-fn symlink_cached_as_file_is_revalidated_before_use_as_directory() -> crate::Result {
+#[cfg(windows)]
+fn terminal_symlinks_are_forbidden_without_force() -> TestResult {
+    let (mut cache, tmp) = new_cache();
+    cache.enable_terminal_symlink_check();
+
+    let target = tmp.path().join("target");
+    let link = tmp.path().join("link");
+    std::fs::write(&target, b"untouched")?;
+    std::os::windows::fs::symlink_file(&target, &link)?;
+
+    let err = cache
+        .at_path("link", IS_FILE, &gix_object::find::Never)
+        .expect_err("the operation must fail");
+    insta::assert_debug_snapshot!(err, "the terminal symlink must be rejected", @"
+    Kind(
+        AlreadyExists,
+    )
+    ");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::AlreadyExists,
+        "the terminal symlink must be rejected"
+    );
+    assert!(
+        link.symlink_metadata()?.file_type().is_symlink(),
+        "the terminal symlink must remain in place"
+    );
+    assert_eq!(
+        std::fs::read(&target)?,
+        b"untouched",
+        "the symlink target must stay unchanged"
+    );
+    Ok(())
+}
+
+#[test]
+fn symlink_cached_as_file_is_revalidated_before_use_as_directory() -> TestResult {
     let (mut cache, tmp) = new_cache();
     let forbidden = tmp.path().join("forbidden");
     std::fs::create_dir(&forbidden)?;
@@ -137,11 +184,12 @@ fn symlink_cached_as_file_is_revalidated_before_use_as_directory() -> crate::Res
         .at_path("link", IS_SYMLINK, &gix_object::find::Never)?
         .path()
         .to_owned();
-    symlink::symlink_dir(&forbidden, &link_path)?;
+    gix_fs::symlink::create(&forbidden, &link_path)?;
 
     let err = cache
         .at_path("link/file", IS_SYMLINK, &gix_object::find::Never)
         .unwrap_err();
+    insta::assert_debug_snapshot!(gix_testtools::redact_debug_snapshot(&err, &[]), "symlink cached as file is revalidated before use as directory", @"AlreadyExists");
     assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
     assert!(
         link_path.symlink_metadata()?.file_type().is_symlink(),
@@ -151,7 +199,7 @@ fn symlink_cached_as_file_is_revalidated_before_use_as_directory() -> crate::Res
 }
 
 #[test]
-fn symlink_cached_as_file_is_unlinked_before_use_as_directory_when_forced() -> crate::Result {
+fn symlink_cached_as_file_is_unlinked_before_use_as_directory_when_forced() -> TestResult {
     let (mut cache, tmp) = new_cache();
     let forbidden = tmp.path().join("forbidden");
     std::fs::create_dir(&forbidden)?;
@@ -160,7 +208,7 @@ fn symlink_cached_as_file_is_unlinked_before_use_as_directory_when_forced() -> c
         .at_path("link", IS_SYMLINK, &gix_object::find::Never)?
         .path()
         .to_owned();
-    symlink::symlink_dir(&forbidden, &link_path)?;
+    gix_fs::symlink::create(&forbidden, &link_path)?;
     if let stack::State::CreateDirectoryAndAttributesStack {
         unlink_on_collision, ..
     } = cache.state_mut()
@@ -174,6 +222,106 @@ fn symlink_cached_as_file_is_unlinked_before_use_as_directory_when_forced() -> c
         link_path.symlink_metadata()?.is_dir(),
         "the existing symlink must be replaced with a directory when collisions may be unlinked"
     );
+    Ok(())
+}
+
+#[test]
+fn cached_directory_returned_as_terminal_is_revalidated_before_descending() -> TestResult {
+    let mut inline_error_diagnostics = Vec::new();
+    for relative in ["link", "parent/link", "parent/deeper/link"] {
+        for force in [false, true] {
+            let (mut cache, _tmp) = new_cache();
+            let target = tempdir()?;
+            if let stack::State::CreateDirectoryAndAttributesStack {
+                unlink_on_collision, ..
+            } = cache.state_mut()
+            {
+                *unlink_on_collision = force;
+            }
+
+            let relative = Path::new(relative);
+            let directory_count = relative.components().count();
+            for name in ["first", "sibling"] {
+                let _ = cache.at_path(relative.join(name), IS_FILE, &gix_object::find::Never)?;
+                assert_eq!(
+                    cache.statistics().delegate.num_mkdir_calls,
+                    directory_count,
+                    "sibling entries reuse all cached leading directories"
+                );
+            }
+
+            let link = cache
+                .at_path(relative, IS_SYMLINK, &gix_object::find::Never)?
+                .path()
+                .to_owned();
+            std::fs::remove_dir(&link)?;
+            gix_fs::symlink::create(target.path(), &link)?;
+
+            let result = cache.at_path(relative.join("child"), IS_FILE, &gix_object::find::Never);
+            if force {
+                let child = result?.path();
+                assert!(
+                    link.symlink_metadata()?.is_dir(),
+                    "the returned terminal must be checked again and its symlink replaced"
+                );
+                std::fs::write(child, b"within the worktree")?;
+            } else {
+                let err = result.expect_err("the replaced directory must not remain trusted");
+                inline_error_diagnostics.push(gix_testtools::redact_debug_snapshot(&err, &[]));
+                assert_eq!(
+                    err.kind(),
+                    std::io::ErrorKind::AlreadyExists,
+                    "a symlink collision must be rejected without force"
+                );
+                assert!(
+                    link.symlink_metadata()?.file_type().is_symlink(),
+                    "forbidden collisions leave the symlink in place"
+                );
+            }
+            assert!(
+                target.path().read_dir()?.next().is_none(),
+                "descending through a replaced cached directory must not touch the symlink target"
+            );
+            assert_eq!(
+                cache.statistics().delegate.num_mkdir_calls,
+                directory_count + if force { 2 } else { 1 },
+                "only the returned terminal needs revalidation; its parents remain cached"
+            );
+        }
+    }
+    insta::assert_debug_snapshot!(inline_error_diagnostics, "cached directory returned as terminal is revalidated before descending", @"
+    [
+        AlreadyExists,
+        AlreadyExists,
+        AlreadyExists,
+    ]
+    ");
+    Ok(())
+}
+
+#[test]
+fn cached_terminal_is_revalidated_when_mode_changes() -> TestResult {
+    let mut error_snapshots = Vec::new();
+    let (mut cache, _tmp) = new_cache();
+    for relative in [".gitmodules", "parent/.gitmodules"] {
+        let _ = cache.at_path(relative, IS_FILE, &gix_object::find::Never)?;
+        let err = cache
+            .at_path(relative, IS_SYMLINK, &gix_object::find::Never)
+            .expect_err("a cached file path must still be validated with the new mode");
+        error_snapshots.push(gix_testtools::redact_debug_snapshot(&(err), &[]));
+    }
+    insta::assert_debug_snapshot!(error_snapshots, "cached terminal is revalidated when mode changes", @"
+    [
+        Custom {
+            kind: Other,
+            error: SymlinkedGitModules,
+        },
+        Custom {
+            kind: Other,
+            error: SymlinkedGitModules,
+        },
+    ]
+    ");
     Ok(())
 }
 

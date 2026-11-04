@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
-use super::{Error, Options};
-use crate::{ThreadSafeRepository, bstr::BString, config, open::Permissions};
+use super::Options;
+use crate::{Result, ThreadSafeRepository, bstr::BString, config, open::Permissions};
 
 impl Default for Options {
     fn default() -> Self {
@@ -16,6 +16,10 @@ impl Default for Options {
             open_path_as_is: false,
             api_config_overrides: Vec::new(),
             cli_config_overrides: Vec::new(),
+            git_installation_config_path: None,
+            system_config_path: None,
+            use_repository_local_environment: true,
+            retain_inferred_worktree_when_bare: false,
             current_dir: None,
         }
     }
@@ -27,6 +31,42 @@ impl Options {
     /// accessing the environment or spreading beyond the git repository location.
     pub fn isolated() -> Self {
         Options::default().permissions(Permissions::isolated())
+    }
+
+    /// Clone all options, retaining the trust override for reopening the same repository.
+    pub(crate) fn clone_with_trust(&self) -> Self {
+        Options {
+            object_store_slots: self.object_store_slots,
+            permissions: self.permissions,
+            git_dir_trust: self.git_dir_trust,
+            filter_config_section: self.filter_config_section,
+            lossy_config: self.lossy_config,
+            lenient_config: self.lenient_config,
+            bail_if_untrusted: self.bail_if_untrusted,
+            api_config_overrides: self.api_config_overrides.clone(),
+            cli_config_overrides: self.cli_config_overrides.clone(),
+            git_installation_config_path: self.git_installation_config_path.clone(),
+            system_config_path: self.system_config_path.clone(),
+            use_repository_local_environment: self.use_repository_local_environment,
+            open_path_as_is: self.open_path_as_is,
+            retain_inferred_worktree_when_bare: self.retain_inferred_worktree_when_bare,
+            current_dir: self.current_dir.clone(),
+        }
+    }
+
+    /// Copy options for opening another repository, clearing trust, the captured CWD, and one-shot opening policies.
+    /// Use [`Repository::reload()`][crate::Repository::reload()] or
+    /// [`reload_with()`][crate::Repository::reload_with()] to reopen the same repository.
+    /// Permissions are preserved, but repository-local environment overrides are disabled.
+    pub fn clone_without_trust(&self) -> Self {
+        Options {
+            git_dir_trust: None,
+            current_dir: None,
+            open_path_as_is: false,
+            retain_inferred_worktree_when_bare: false,
+            ..self.clone_with_trust()
+        }
+        .without_repository_environment_overrides()
     }
 }
 
@@ -56,6 +96,28 @@ impl Options {
         self
     }
 
+    /// Use `path` as Git's installation configuration file instead of discovering it.
+    ///
+    /// Common locations are `$(prefix)/etc/gitconfig` on Unix,
+    /// `/Applications/Xcode.app/Contents/Developer/usr/share/git-core/gitconfig` for Apple Git,
+    /// and `C:/Program Files/Git/etc/gitconfig` for Git for Windows.
+    ///
+    /// The file is loaded only when [`permissions.config.git_binary`][Permissions::config] is enabled.
+    pub fn git_installation_config_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.git_installation_config_path = Some(path.into().into_boxed_path());
+        self
+    }
+
+    /// Use `path` as the system configuration file instead of discovering it.
+    ///
+    /// Common locations are `/etc/gitconfig` on Unix and `C:/ProgramData/Git/config` on Windows.
+    ///
+    /// The file is loaded only when [`permissions.config.system`][Permissions::config] is enabled.
+    pub fn system_config_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.system_config_path = Some(path.into().into_boxed_path());
+        self
+    }
+
     /// Set the amount of slots to use for the object database. It's a value that doesn't need changes on the client, typically,
     /// but should be controlled on the server.
     pub fn object_store_slots(mut self, slots: gix_odb::store::init::Slots) -> Self {
@@ -80,28 +142,30 @@ impl Options {
         self
     }
 
-    /// Set the trust level of the `.git` directory we are about to open.
+    /// Set the trust override of the `.git` directory we are about to open, or clear it with `None`.
     ///
     /// This can be set manually to force trust even though otherwise it might
     /// not be fully trusted, leading to limitations in how configuration files
     /// are interpreted.
     ///
-    /// If not called explicitly, it will be determined by looking at its
-    /// ownership via [`gix_sec::Trust::from_path_ownership()`].
+    /// If no override is set, trust is determined via [`gix_sec::Trust::from_path_ownership()`] for the
+    /// candidate path before resolving a possible gitfile, then lowered as needed by ownership checks of the
+    /// resolved git directory, common directory, and existing worktree. Setting trust explicitly bypasses
+    /// these initial ownership checks when opening, but not when discovering a repository.
     ///
     /// # Security Warning
     ///
     /// Use with extreme care and only if it's absolutely known that the repository
-    /// is always controlled by the desired user. Using this capability _only_ saves
-    /// a permission check and only so if the [`open()`][Self::open()] method is used,
-    /// as opposed to discovery.
-    pub fn with(mut self, trust: gix_sec::Trust) -> Self {
+    /// is always controlled by the desired user. This only bypasses the ownership checks described above
+    /// when the [`open()`][Self::open()] method is used, as opposed to discovery. Worktree ownership and
+    /// `safe.directory` are still considered later during opening.
+    pub fn with_trust(mut self, trust: impl Into<Option<gix_sec::Trust>>) -> Self {
         self.git_dir_trust = trust.into();
         self
     }
 
     /// If true, default false, and if the repository's trust level is not `Full`
-    /// (see [`with()`][Self::with()] for more), then the open operation will fail.
+    /// (see [`with_trust()`][Self::with_trust()] for more), then the open operation will fail.
     ///
     /// Use this to mimic `git`s way of handling untrusted repositories. Note that `gitoxide` solves
     /// this by not using configuration from untrusted sources and by generally being secured against
@@ -143,16 +207,20 @@ impl Options {
     }
 
     /// Open a repository at `path` with the options set so far.
-    #[expect(
-        clippy::result_large_err,
-        reason = "will be removed once `gix-error` is used consistently"
-    )]
-    pub fn open(self, path: impl Into<PathBuf>) -> Result<ThreadSafeRepository, Error> {
+    pub fn open(self, path: impl Into<PathBuf>) -> Result<ThreadSafeRepository> {
         ThreadSafeRepository::open_opts(path, self)
     }
 }
 
 impl Options {
+    /// Prevent repository-local environment overrides from being inherited when opening another repository.
+    ///
+    /// To be used when opening a nested repository, like worktrees or submodules.
+    pub(crate) fn without_repository_environment_overrides(mut self) -> Self {
+        self.use_repository_local_environment = false;
+        self
+    }
+
     pub(crate) fn current_dir_or_empty(&self) -> &std::path::Path {
         self.current_dir.as_deref().unwrap_or(std::path::Path::new(""))
     }
@@ -165,6 +233,7 @@ impl gix_sec::trust::DefaultForLevel for Options {
                 object_store_slots: Default::default(),
                 permissions: Permissions::default_for_level(level),
                 git_dir_trust: gix_sec::Trust::Full.into(),
+                retain_inferred_worktree_when_bare: false,
                 filter_config_section: Some(config::section::is_trusted),
                 lossy_config: false,
                 bail_if_untrusted: false,
@@ -172,12 +241,16 @@ impl gix_sec::trust::DefaultForLevel for Options {
                 open_path_as_is: false,
                 api_config_overrides: Vec::new(),
                 cli_config_overrides: Vec::new(),
+                git_installation_config_path: None,
+                system_config_path: None,
+                use_repository_local_environment: true,
                 current_dir: None,
             },
             gix_sec::Trust::Reduced => Options {
                 object_store_slots: gix_odb::store::init::Slots::Given(32), // limit resource usage
                 permissions: Permissions::default_for_level(level),
                 git_dir_trust: gix_sec::Trust::Reduced.into(),
+                retain_inferred_worktree_when_bare: false,
                 filter_config_section: Some(config::section::is_trusted),
                 bail_if_untrusted: false,
                 lenient_config: true,
@@ -185,6 +258,9 @@ impl gix_sec::trust::DefaultForLevel for Options {
                 lossy_config: false,
                 api_config_overrides: Vec::new(),
                 cli_config_overrides: Vec::new(),
+                git_installation_config_path: None,
+                system_config_path: None,
+                use_repository_local_environment: true,
                 current_dir: None,
             },
         }

@@ -1,0 +1,435 @@
+use gix::bstr::ByteSlice;
+use gix_testtools::TestResult;
+use std::io::Write;
+
+use gix::refs::{
+    FullName, Target,
+    transaction::{LogChange, PreviousValue, RefEdit, RefLog},
+};
+
+fn refname(value: &str) -> FullName {
+    value.try_into().expect("test branch names are valid")
+}
+
+#[test]
+fn deletes_a_batch_and_all_of_its_local_config_without_inspecting_commits() -> TestResult {
+    let (mut repo, _tmp) = crate::repo_rw("make_references_repo.sh")?;
+    let direct = refname("refs/heads/delete-direct");
+    let symbolic = refname("refs/heads/delete-symbolic");
+    repo.reference(
+        direct.clone(),
+        repo.object_hash().empty_tree(),
+        PreviousValue::MustNotExist,
+        "create test branch",
+    )?;
+    repo.edit_reference(RefEdit::update_with_log(
+        symbolic.clone(),
+        Target::Symbolic(refname("refs/heads/missing-target")),
+        PreviousValue::MustNotExist,
+        LogChange {
+            mode: RefLog::AndReference,
+            force_create_reflog: true,
+            message: "create broken symbolic test branch".into(),
+        },
+    ))?;
+
+    let included_path = repo.common_dir().join("included-config");
+    std::fs::write(
+        &included_path,
+        br#"[branch "delete-direct"]
+	remote = elsewhere
+"#,
+    )?;
+    let mut config = std::fs::OpenOptions::new()
+        .append(true)
+        .open(repo.common_dir().join("config"))?;
+    let included_path_for_config = gix_path::to_unix_separators_on_windows(gix_path::into_bstr(&included_path)?);
+    write!(
+        config,
+        r#"
+        [branch "delete-direct"]
+            remote = origin
+        [branch "delete-direct"]
+            merge = refs/heads/delete-direct
+        [branch.Delete-Direct]
+            description = remove legacy
+        [branch "Delete-Direct"]
+            description = keep quoted
+        [branch "delete-symbolic"]
+            description = remove me
+        [branch "keep"]
+            remote = origin
+        [include]
+            path = {included_path_for_config}
+        "#
+    )?;
+    drop(config);
+    let work_dir = repo
+        .workdir()
+        .expect("the reference fixture is a non-bare repository")
+        .to_owned();
+    let mut options = crate::restricted();
+    options.permissions.config.includes = true;
+    repo = gix::open_opts(work_dir, options)?;
+    repo.config_snapshot_mut()
+        .append_config(["test.inMemory=retained"], gix_config::Source::Api)?;
+
+    assert_eq!(
+        repo.delete_local_branches([symbolic.clone(), direct.clone(), symbolic.clone()])?,
+        vec![direct.clone(), symbolic.clone()],
+        "loose and dangling symbolic branches are returned once, in name order"
+    );
+
+    assert!(
+        repo.try_find_reference(direct.as_ref())?.is_none(),
+        "the direct branch is gone"
+    );
+    assert!(
+        repo.try_find_reference(symbolic.as_ref())?.is_none(),
+        "broken symbolic branches are deleted without peeling"
+    );
+    let config = gix_testtools::repository::snapshot_config(repo.common_dir(), "config")?;
+    insta::assert_snapshot!(config, "deleting delete-direct removes canonical legacy matches, not the distinct quoted Delete-Direct section", @r#"
+    [core]
+        bare = false
+            [branch "Delete-Direct"]
+                description = keep quoted
+            [branch "keep"]
+                remote = origin
+            [include]
+                path = <normalized>/included-config
+    "#);
+    assert_eq!(
+        std::fs::read_to_string(&included_path)?,
+        r#"[branch "delete-direct"]
+	remote = elsewhere
+"#,
+        "included files are not rewritten"
+    );
+    assert_eq!(
+        repo.branch_names().into_iter().collect::<Vec<_>>(),
+        vec!["Delete-Direct", "delete-direct", "keep"],
+        "only configuration from the local file are deleted, but this one is from the included file"
+    );
+    let config = repo.config_snapshot();
+    assert!(
+        config
+            .string("test.inMemory")
+            .is_some_and(|value| value.as_slice() == b"retained"),
+        "the deleting repository instance retains unrelated in-memory-only configuration, proving it wasn't reloaded"
+    );
+    Ok(())
+}
+
+#[test]
+fn validation_failure_leaves_the_entire_batch_unchanged() -> TestResult {
+    let (mut repo, _tmp) = crate::repo_rw("make_references_repo.sh")?;
+    let work_dir = repo
+        .workdir()
+        .expect("the reference fixture is a non-bare repository")
+        .to_owned();
+    let deletable = refname("refs/heads/d1");
+    let checked_out = refname("refs/heads/main");
+
+    let err = repo
+        .delete_local_branches([deletable.clone(), checked_out.clone()])
+        .expect_err("the checked-out branch prevents the whole batch");
+    insta::assert_debug_snapshot!(gix_testtools::redact_debug_snapshot(&(err), &[(&(work_dir).to_string_lossy(), "<worktree>")]), "validation failure leaves the entire batch unchanged", @r#"The local branch FullName("refs/heads/main") is checked out in ["<worktree>"]"#);
+    let cause = err
+        .downcast_any_ref::<gix::repository::branch::delete::CheckedOutError>()
+        .expect("checked-out branches remain identifiable without parsing the diagnostic");
+    assert_eq!(cause.name, checked_out, "the protected branch is retained");
+    assert_eq!(
+        cause.worktree_dirs.as_slice(),
+        std::slice::from_ref(&work_dir),
+        "the main worktree path is retained"
+    );
+    assert!(repo.try_find_reference(deletable.as_ref())?.is_some());
+
+    let tag = refname("refs/tags/t1");
+    let err = repo
+        .delete_local_branches([tag.clone()])
+        .expect_err("non-local references are rejected");
+    insta::assert_debug_snapshot!(gix_testtools::redact_debug_snapshot(&(err), &[(&(work_dir).to_string_lossy(), "<worktree>")]), "validation failure leaves the entire batch unchanged", @r#"FullName("refs/tags/t1") is not a local branch"#);
+    assert!(repo.try_find_reference(tag.as_ref())?.is_some());
+    Ok(())
+}
+
+#[test]
+fn symbolic_head_chains_protect_every_referent() -> TestResult {
+    let fixture = gix_testtools::scripted_fixture_read_only("make_indirect_head_repos.sh")?;
+    for state in ["committed", "packed", "empty", "staged"] {
+        let occupied_path = fixture.join(state);
+        let mut caller_paths = vec![occupied_path.clone()];
+        if matches!(state, "committed" | "packed") {
+            caller_paths.push(fixture.join(format!("linked-{state}")));
+        }
+        for caller_path in caller_paths {
+            let mut repo = gix::open_opts(caller_path, crate::restricted())?;
+            let head_target = repo.find_reference("HEAD")?.target().into_owned();
+            for name in ["main", "alias", "topic"] {
+                let name = refname(&format!("refs/heads/{name}"));
+                let expected_target = repo
+                    .try_find_reference(&name)?
+                    .map(|reference| reference.target().into_owned());
+                let err = repo
+                    .delete_local_branches([name.clone()])
+                    .expect_err("all references needed by HEAD remain reserved, including an unborn target");
+                let cause = err
+                    .downcast_any_ref::<gix::repository::branch::delete::CheckedOutError>()
+                    .expect("the reference is protected by branch occupancy");
+                assert_eq!(cause.name, name, "{state}: the requested reference is reserved");
+                assert_eq!(cause.worktree_dirs.len(), 1, "the occupied worktree is reported once");
+                assert_eq!(
+                    cause.worktree_dirs[0].canonicalize()?,
+                    occupied_path.canonicalize()?,
+                    "{state}: main and linked callers identify the same occupied worktree"
+                );
+                assert_eq!(
+                    repo.try_find_reference(&name)?
+                        .map(|reference| reference.target().into_owned()),
+                    expected_target,
+                    "{state}: rejecting deletion preserves each symbolic, direct, or missing target"
+                );
+            }
+            assert_eq!(
+                repo.find_reference("HEAD")?.target().into_owned(),
+                head_target,
+                "the caller's HEAD remains unchanged"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn malformed_symbolic_referents_prevent_branch_deletion() -> TestResult {
+    let fixture = gix_testtools::scripted_fixture_read_only("make_indirect_head_repos.sh")?;
+    let mut repo = gix::open_opts(fixture.join("malformed"), crate::restricted())?;
+    assert!(repo.head().is_err(), "HEAD's deeper symbolic referent is malformed");
+    let name = refname("refs/heads/main");
+    let target = repo.find_reference(&name)?.target().into_owned();
+    assert!(
+        repo.delete_local_branches([name.clone()]).is_err(),
+        "failure to inspect the full HEAD chain cannot authorize deleting one of its references"
+    );
+    assert_eq!(
+        repo.find_reference(&name)?.target().into_owned(),
+        target,
+        "the symbolic reference needed by HEAD is preserved"
+    );
+    Ok(())
+}
+
+#[test]
+fn missing_branches_are_successful_and_their_config_is_removed() -> TestResult {
+    let (mut repo, _tmp) = crate::repo_rw("make_references_repo.sh")?;
+    let existing = refname("refs/heads/d1");
+    let missing = refname("refs/heads/does-not-exist");
+    let reserved_for_creation = refname("refs/heads/HEAD");
+    let mut config = std::fs::OpenOptions::new()
+        .append(true)
+        .open(repo.common_dir().join("config"))?;
+    write!(
+        config,
+        "\n[branch \"d1\"]\n\tremote = origin\n\
+         [branch \"does-not-exist\"]\n\tremote = origin\n\
+         [branch \"HEAD\"]\n\tremote = origin\n"
+    )?;
+    drop(config);
+    repo.reload()?;
+    assert_eq!(
+        repo.branch_names().into_iter().collect::<Vec<_>>(),
+        vec!["HEAD", "d1", "does-not-exist"],
+        "all branch sections are loaded before deletion"
+    );
+
+    assert!(
+        !repo.common_dir().join("refs/heads/d1").exists(),
+        "the existing branch is stored only in packed refs"
+    );
+    assert_eq!(
+        repo.delete_local_branches([existing.clone(), missing.clone(), reserved_for_creation.clone()])?,
+        vec![existing.clone()],
+        "only the existing packed branch is reported as deleted"
+    );
+
+    assert!(
+        repo.try_find_reference(existing.as_ref())?.is_none(),
+        "the existing branch is deleted"
+    );
+    assert!(
+        repo.try_find_reference(missing.as_ref())?.is_none(),
+        "the missing branch remains absent"
+    );
+    assert!(
+        repo.try_find_reference(reserved_for_creation.as_ref())?.is_none(),
+        "a valid full name isn't subjected to additional creation-time validation"
+    );
+    let config = gix_testtools::repository::snapshot_config(repo.common_dir(), "config")?;
+    insta::assert_snapshot!(config, "deleting existing, missing, and creation-reserved branch names removes their sections while retaining unrelated configuration", @"
+        [core]
+            bare = false
+        ");
+    assert!(
+        repo.branch_names().is_empty(),
+        "configuration for existing, missing, and creation-reserved branch names is removed from memory"
+    );
+    assert!(
+        repo.delete_local_branches([existing, missing, reserved_for_creation])?
+            .is_empty(),
+        "repeating the deletion reports no branches"
+    );
+    assert!(
+        repo.delete_local_branches([])?.is_empty(),
+        "an empty batch reports no branches"
+    );
+    Ok(())
+}
+
+#[test]
+fn expected_targets_prevent_deleting_a_branch_that_moved() -> gix_testtools::TestResult {
+    let (mut repo, _tmp) = crate::repo_rw("make_references_repo.sh")?;
+    let branch = refname("refs/heads/d1");
+    let original = repo.find_reference(branch.as_ref())?.target().into_owned();
+    let replacement = repo.write_blob(b"replacement target")?.detach();
+    let mut config = std::fs::OpenOptions::new()
+        .append(true)
+        .open(repo.common_dir().join("config"))?;
+    write!(config, "\n[branch \"d1\"]\n\tremote = origin\n")?;
+    drop(config);
+    repo.reference(
+        branch.clone(),
+        replacement,
+        PreviousValue::Any,
+        "move branch after observing it",
+    )?;
+
+    repo.delete_local_branches_if_unchanged([(branch.clone(), original)])
+        .expect_err("a moved branch must not be deleted");
+
+    assert_eq!(
+        repo.find_reference(branch.as_ref())?.target().into_owned(),
+        Target::Object(replacement),
+        "the concurrently moved branch remains"
+    );
+    let config = gix_testtools::repository::snapshot_config(repo.common_dir(), "config")?;
+    insta::assert_snapshot!(config, "refusing to delete a concurrently moved branch retains its section and unrelated configuration", @r#"
+        [core]
+            bare = false
+        [branch "d1"]
+            remote = origin
+        "#);
+    Ok(())
+}
+
+#[test]
+fn expected_targets_delete_the_branch_and_its_config() -> gix_testtools::TestResult {
+    let (mut repo, _tmp) = crate::repo_rw("make_references_repo.sh")?;
+    let branch = refname("refs/heads/d1");
+    let expected = repo.find_reference(branch.as_ref())?.target().into_owned();
+    let mut config = std::fs::OpenOptions::new()
+        .append(true)
+        .open(repo.common_dir().join("config"))?;
+    write!(config, "\n[branch \"d1\"]\n\tremote = origin\n")?;
+    drop(config);
+
+    repo.delete_local_branches_if_unchanged([(branch.clone(), expected)])?;
+
+    assert!(
+        repo.try_find_reference(branch.as_ref())?.is_none(),
+        "the branch is gone"
+    );
+    let config = gix_testtools::repository::snapshot_config(repo.common_dir(), "config")?;
+    insta::assert_snapshot!(config, "deleting a branch whose target still matches removes its section while retaining unrelated configuration", @"
+        [core]
+            bare = false
+        ");
+    Ok(())
+}
+
+#[test]
+fn linked_worktree_branches_are_protected_and_common_config_is_updated() -> TestResult {
+    // `git worktree add --relative-paths`, used by the fixture, was added in Git 2.48.
+    let Some(fixture) = gix_testtools::scripted_fixture_writable_with_args_with_git_version(
+        "make_worktree_relative_linking.sh",
+        None::<String>,
+        gix_testtools::Creation::Execute,
+        |version| version >= (2, 48, 0),
+    )?
+    else {
+        return Ok(());
+    };
+    let main_path = fixture.path().join("main");
+    let linked_path = fixture.path().join("linked");
+    let main = gix::open_opts(&main_path, crate::restricted())?;
+    let target = main.head_id()?.detach();
+    let checked_out = refname("refs/heads/linked");
+    let deletable = refname("refs/heads/delete-from-linked");
+    main.reference(
+        checked_out.clone(),
+        target,
+        PreviousValue::MustNotExist,
+        "create branch to be checked out by the linked worktree",
+    )?;
+    main.reference(
+        deletable.clone(),
+        target,
+        PreviousValue::MustNotExist,
+        "create deletable branch",
+    )?;
+    let linked_repo = gix::open_opts(&linked_path, crate::restricted())?;
+    std::fs::write(linked_repo.git_dir().join("HEAD"), b"ref: refs/heads/linked\n")?;
+
+    let mut main = gix::open_opts(&main_path, crate::restricted())?;
+    let linked_work_dir = main
+        .worktree_proxy_by_id("linked")?
+        .expect("the linked worktree is registered")
+        .base()?;
+    let err = main
+        .delete_local_branches([checked_out.clone()])
+        .expect_err("a linked worktree checkout is protected");
+    insta::assert_debug_snapshot!(gix_testtools::redact_debug_snapshot(&(err), &[(&(fixture.path()).to_string_lossy(), "<fixture>")]), "linked worktree branches are protected and common config is updated", @r#"The local branch FullName("refs/heads/linked") is checked out in ["<fixture>/main/.git/worktrees/linked/../../../../linked"]"#);
+    let cause = err
+        .downcast_any_ref::<gix::repository::branch::delete::CheckedOutError>()
+        .expect("linked worktree checkouts retain the same typed rejection");
+    assert_eq!(cause.name, checked_out, "the protected branch is retained");
+    assert_eq!(
+        cause.worktree_dirs,
+        [linked_work_dir],
+        "the linked worktree path is retained"
+    );
+
+    let mut config = std::fs::OpenOptions::new()
+        .append(true)
+        .open(main.common_dir().join("config"))?;
+    write!(config, "\n[branch \"delete-from-linked\"]\n\tremote = origin\n")?;
+    drop(config);
+    let mut linked_repo = gix::open_opts(&linked_path, crate::restricted())?;
+    assert!(
+        linked_repo.branch_names().contains("delete-from-linked"),
+        "the common branch configuration is loaded into the linked repository"
+    );
+    assert_eq!(
+        linked_repo.delete_local_branches([deletable.clone()])?,
+        vec![deletable.clone()],
+        "linked worktrees report branches deleted from the common store"
+    );
+    assert!(linked_repo.try_find_reference(deletable.as_ref())?.is_none());
+    let config = gix_testtools::repository::snapshot_config(linked_repo.common_dir(), "config")?;
+    let config = gix::config::File::try_from(config.as_bstr())?;
+    assert_eq!(
+        (
+            config.boolean("core.bare")?,
+            config.boolean("extensions.relativeWorktrees")?,
+            config.sections().count(),
+        ),
+        (Some(false), Some(true), 2),
+        "deleting from a linked worktree removes the branch section and retains unrelated settings in either section order"
+    );
+    assert!(
+        !linked_repo.branch_names().contains("delete-from-linked"),
+        "the linked repository's in-memory configuration is updated"
+    );
+    Ok(())
+}

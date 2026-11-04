@@ -13,6 +13,7 @@ bitflags! {
 
 pub(crate) mod function {
     use bstr::{BStr, ByteSlice};
+    use gix_utils::git_is_space;
 
     use crate::wildmatch::Mode;
 
@@ -312,7 +313,7 @@ pub(crate) mod function {
                                             }
                                         }
                                         b"blank" => {
-                                            if t_ch.is_ascii_whitespace() {
+                                            if matches!(t_ch, b' ' | b'\t') {
                                                 matched = true;
                                             }
                                         }
@@ -348,7 +349,7 @@ pub(crate) mod function {
                                             }
                                         }
                                         b"space" => {
-                                            if t_ch == b' ' {
+                                            if git_is_space(t_ch) {
                                                 matched = true;
                                             }
                                         }
@@ -404,7 +405,7 @@ pub(crate) mod function {
     pub fn wildmatch(pattern: &BStr, value: &BStr, mode: Mode) -> bool {
         let res = match_recursive(pattern, value, mode, 0);
         if res == Result::RecursionLimitReached {
-            gix_features::trace::error!("Recursion limit of {} reached for pattern '{pattern}'", RECURSION_LIMIT);
+            gix_trace::error!("Recursion limit of {} reached for pattern '{pattern}'", RECURSION_LIMIT);
         }
         res == Result::Match
     }

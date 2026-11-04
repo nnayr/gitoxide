@@ -1,5 +1,7 @@
 use bstr::{BStr, ByteSlice};
 
+use gix_utils::git_is_space;
+
 use crate::parse::{Comment, Error, Event, MaybeDecoded, Span, error::ParseNode, section};
 
 type ParseResult<T> = Result<T, ()>;
@@ -37,7 +39,7 @@ pub(crate) fn from_bytes(mut input: &[u8], dispatch: &mut dyn FnMut(Event)) -> R
         } else if !input.starts_with(b"[") {
             let mut node = ParseNode::SectionHeader;
             key_value_pair(backing, &mut input, &mut node, dispatch)
-                .map_err(|_| Error::parse(newlines_from(backing, input), node, input.as_bstr().into()))?;
+                .map_err(|()| Error::parse(newlines_from(backing, input), node, input.as_bstr().into()))?;
         }
         if input.len() == before.len() {
             break;
@@ -51,7 +53,7 @@ pub(crate) fn from_bytes(mut input: &[u8], dispatch: &mut dyn FnMut(Event)) -> R
     let mut node = ParseNode::SectionHeader;
     while !input.is_empty() {
         section(backing, &mut input, &mut node, dispatch)
-            .map_err(|_| Error::parse(newlines_from(backing, input), node, input.as_bstr().into()))?;
+            .map_err(|()| Error::parse(newlines_from(backing, input), node, input.as_bstr().into()))?;
     }
     Ok(())
 }
@@ -160,7 +162,7 @@ fn section_header(backing: &[u8], i: &mut &[u8]) -> ParseResult<section::HeaderD
                 separator: name.get(index..=index).map(|sep| Span::new(backing, sep)),
                 subsection_name: name
                     .get(index + 1..)
-                    .map(|name| crate::parse::MaybeDecoded::raw(Span::new(backing, name))),
+                    .map(|name| MaybeDecoded::decoded(Span::new(backing, name), name.to_ascii_lowercase().into())),
             }),
             None => Ok(section::HeaderData {
                 name: Span::new(backing, name.as_bstr()),
@@ -293,9 +295,6 @@ fn config_value(backing: &[u8], i: &mut &[u8], dispatch: &mut dyn FnMut(Event)) 
     if let Some(rest) = i.strip_prefix(b"=") {
         *i = rest;
         dispatch(Event::KeyValueSeparator);
-        if let Ok(whitespace) = take_spaces1(i) {
-            dispatch(Event::Whitespace(Span::new(backing, whitespace)));
-        }
         value(backing, i, dispatch)
     } else {
         dispatch(Event::Value(Span::default()));
@@ -309,98 +308,121 @@ fn config_value(backing: &[u8], i: &mut &[u8], dispatch: &mut dyn FnMut(Event)) 
 /// Double quotes toggle quoted mode for comment handling. Supported escapes are
 /// backslash followed by `n`, `t`, `\`, `b`, `"`, LF, or CRLF. Line continuations
 /// emit [`Event::ValueNotDone`], the continuation newline, and finally [`Event::ValueDone`].
+/// At the start of each physical value chunk, Git whitespace is emitted as [`Event::Whitespace`]
+/// while the logical value is still empty and outside quotes.
 /// If the value ends with a trailing backslash at EOF, it is emitted as
 /// [`Event::ValueNotDone`] followed directly by an empty [`Event::ValueDone`].
-/// Otherwise a single [`Event::Value`] is emitted with trailing ASCII whitespace
+/// Otherwise a single [`Event::Value`] is emitted with trailing Git whitespace
 /// trimmed from the logical value.
 /// On success, `i` is advanced to the first unconsumed delimiter or EOF, and emitted spans refer to `backing`.
 fn value(backing: &[u8], i: &mut &[u8], dispatch: &mut dyn FnMut(Event)) -> ParseResult<()> {
-    let input = *i;
-    let mut cursor = 0usize;
-    let mut value_start = 0usize;
-    let mut value_end = None;
+    let mut remaining = *i;
+    let mut value_start = remaining;
     // While quoted, `;` and `#` remain part of the value instead of starting a comment.
     let mut is_in_quotes = false;
     // Set after a line continuation so the final chunk is emitted as `ValueDone`.
     let mut partial_value_found = false;
+    // Cleared once parsing contributes a logical byte, to know if leading whitespace is still insignificant.
+    let mut value_is_empty_so_far = true;
 
-    while cursor < input.len() {
-        match input[cursor] {
-            b'\n' => {
-                value_end = Some(cursor);
-                break;
-            }
-            b';' | b'#' if !is_in_quotes => {
-                value_end = Some(cursor);
-                break;
-            }
+    loop {
+        if value_is_empty_so_far
+            && !is_in_quotes
+            && remaining.len() == value_start.len()
+            && let Ok(whitespace) = take_git_whitespace1(&mut remaining)
+        {
+            dispatch(Event::Whitespace(Span::new(backing, whitespace)));
+            value_start = remaining;
+            continue;
+        }
+
+        let Some((&byte, rest)) = remaining.split_first() else {
+            break;
+        };
+        match byte {
+            b'\n' => break,
+            b'\r' if rest.starts_with(b"\n") => break,
+            b';' | b'#' if !is_in_quotes => break,
             b'\\' => {
-                let escape_index = cursor;
-                cursor += 1;
-                let mut consumed = 1usize;
-                let Some(mut b) = input.get(cursor).copied() else {
-                    let value = input[value_start..escape_index].as_bstr();
+                let Some((&escaped, after_escape)) = rest.split_first() else {
+                    let value = value_start[..value_start.len() - remaining.len()].as_bstr();
                     dispatch(Event::ValueNotDone(Span::new(backing, value)));
                     dispatch(Event::ValueDone(Span::default()));
-                    *i = &[];
+                    *i = rest;
                     return Ok(());
                 };
-                if b == b'\r' {
-                    cursor += 1;
-                    b = *input.get(cursor).ok_or(())?;
-                    if b != b'\n' {
-                        return Err(());
-                    }
-                    consumed += 1;
+                let after_newline = match escaped {
+                    b'\n' => Some(after_escape),
+                    b'\r' => Some(after_escape.strip_prefix(b"\n").ok_or(())?),
+                    _ => None,
+                };
+                if let Some(after_newline) = after_newline {
+                    partial_value_found = true;
+                    let value = value_start[..value_start.len() - remaining.len()].as_bstr();
+                    dispatch(Event::ValueNotDone(Span::new(backing, value)));
+                    let newline = rest[..rest.len() - after_newline.len()].as_bstr();
+                    dispatch(Event::Newline(Span::new(backing, newline)));
+                    remaining = after_newline;
+                    value_start = remaining;
+                    continue;
                 }
-                match b {
-                    b'\n' => {
-                        partial_value_found = true;
-                        let value = input[value_start..escape_index].as_bstr();
-                        dispatch(Event::ValueNotDone(Span::new(backing, value)));
-                        let nl_start = escape_index + 1;
-                        let nl = input[nl_start..nl_start + consumed].as_bstr();
-                        dispatch(Event::Newline(Span::new(backing, nl)));
-                        cursor += 1;
-                        value_start = cursor;
-                        value_end = None;
-                    }
-                    b'n' | b't' | b'\\' | b'b' | b'"' => cursor += 1,
-                    _ => return Err(()),
+                if !matches!(escaped, b'n' | b't' | b'\\' | b'b' | b'"') {
+                    return Err(());
                 }
+                // Every non-continuation escape contributes a byte to the logical value,
+                // making whitespace after a later continuation significant.
+                value_is_empty_so_far = false;
+                remaining = after_escape;
             }
             b'"' => {
                 is_in_quotes = !is_in_quotes;
-                cursor += 1;
+                remaining = rest;
             }
-            _ => cursor += 1,
+            b if !git_is_space(b) || is_in_quotes => {
+                // Non-whitespace, and even whitespace inside quotes, is value content,
+                // making whitespace after a later continuation significant.
+                value_is_empty_so_far = false;
+                remaining = rest;
+            }
+            _ => remaining = rest,
         }
     }
     if is_in_quotes {
         return Err(());
     }
 
-    let end = value_end.unwrap_or(cursor);
-    if end == value_start {
-        dispatch(Event::Value(Span::default()));
-        *i = &input[cursor..];
-        return Ok(());
-    }
-
-    let value_end_no_trailing_whitespace = input[value_start..end]
+    let untrimmed_value = &value_start[..value_start.len() - remaining.len()];
+    let value_len = untrimmed_value
         .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(idx, b)| (!b.is_ascii_whitespace()).then_some(value_start + idx + 1))
-        .unwrap_or(value_start);
-    let value = input[value_start..value_end_no_trailing_whitespace].as_bstr();
+        .rposition(|b| !git_is_space(*b))
+        .map_or(0, |idx| idx + 1);
+    let value = untrimmed_value[..value_len].as_bstr();
     if partial_value_found {
         dispatch(Event::ValueDone(Span::new(backing, value)));
     } else {
         dispatch(Event::Value(Span::new(backing, value)));
     }
-    *i = &input[value_end_no_trailing_whitespace..];
+    *i = &value_start[value_len..];
     Ok(())
+}
+
+/// Parse one or more Git whitespace bytes without consuming LF or CRLF line endings.
+fn take_git_whitespace1<'i>(i: &mut &'i [u8]) -> ParseResult<&'i BStr> {
+    let input = *i;
+    let mut remaining = input;
+    while let Some((&byte, rest)) = remaining.split_first() {
+        if byte == b'\n' || byte == b'\r' && rest.starts_with(b"\n") || !git_is_space(byte) {
+            break;
+        }
+        remaining = rest;
+    }
+    let len = input.len() - remaining.len();
+    if len == 0 {
+        return Err(());
+    }
+    let whitespace = &input[..len];
+    *i = remaining;
+    Ok(whitespace.as_bstr())
 }
 
 /// Parse one or more spaces or horizontal tabs.
@@ -424,24 +446,23 @@ fn take_spaces1<'i>(i: &mut &'i [u8]) -> ParseResult<&'i BStr> {
 /// at the current cursor. On success, `i` is advanced past the newline run and
 /// the returned [`BStr`] refers to the consumed bytes.
 fn take_newlines1<'i>(i: &mut &'i [u8]) -> ParseResult<&'i BStr> {
-    let mut c = *i;
-    let input = c;
-    let mut cursor = 0usize;
-    while cursor < input.len() {
-        if input[cursor..].starts_with(b"\r\n") {
-            cursor += 2;
-        } else if input[cursor] == b'\n' {
-            cursor += 1;
+    let input = *i;
+    let mut remaining = input;
+    loop {
+        if let Some(rest) = remaining.strip_prefix(b"\r\n") {
+            remaining = rest;
+        } else if let Some(rest) = remaining.strip_prefix(b"\n") {
+            remaining = rest;
         } else {
             break;
         }
     }
-    if cursor == 0 {
+    let len = input.len() - remaining.len();
+    if len == 0 {
         return Err(());
     }
-    c = &input[cursor..];
-    *i = c;
-    Ok(input[..cursor].as_bstr())
+    *i = remaining;
+    Ok(input[..len].as_bstr())
 }
 
 #[cfg(test)]

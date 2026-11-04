@@ -1,3 +1,4 @@
+use gix_error::Result;
 use std::fmt::Display;
 
 use bstr::{BStr, BString};
@@ -6,7 +7,7 @@ use crate::parse::{Event, EventRef};
 
 impl Event {
     /// Shift all backing-buffer spans in this event forward by `offset` bytes.
-    pub(crate) fn rebase(&mut self, offset: usize) -> Result<(), crate::parse::span::Error> {
+    pub(crate) fn rebase(&mut self, offset: usize) -> Result {
         match self {
             Event::Comment(comment) => comment.text.rebase(offset),
             Event::SectionHeader(header) => header.rebase(offset),
@@ -20,11 +21,7 @@ impl Event {
         }
     }
 
-    pub(crate) fn copy_to_backing_in(
-        &self,
-        source: &[u8],
-        target: &mut Vec<u8>,
-    ) -> Result<Event, crate::parse::span::Error> {
+    pub(crate) fn copy_to_backing_in(&self, source: &[u8], target: &mut Vec<u8>) -> Result<Event> {
         Ok(match self {
             Event::Comment(comment) => Event::Comment(comment.copy_to_backing_in(source, target)?),
             Event::SectionHeader(header) => Event::SectionHeader(header.copy_to_backing_in(source, target)?),
@@ -48,10 +45,7 @@ impl Event {
             Event::SectionHeader(header) => EventRef::SectionHeader {
                 name: header.name.as_bstr_in(backing),
                 separator: header.separator.as_ref().map(|separator| separator.as_bstr_in(backing)),
-                subsection_name: header
-                    .subsection_name
-                    .as_ref()
-                    .map(|subsection_name| subsection_name.value_in(backing)),
+                subsection_name: header.subsection_name_original(backing),
             },
             Event::SectionValueName(name) => EventRef::SectionValueName(name.as_bstr_in(backing)),
             Event::Value(bytes) => EventRef::Value(bytes.as_bstr_in(backing)),

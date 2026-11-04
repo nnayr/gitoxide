@@ -108,7 +108,7 @@ git init base
   git branch -D tmp
 )
 
-git clone --shared --depth 2 file://$PWD/base base.shallow
+git clone --shared --depth 2 "file://$PWD/base" base.shallow
 
 
 git clone --shared base clone
@@ -186,6 +186,9 @@ EOF
   } > baseline.git
 )
 
+# Note that the URLs used to make rewrites fail carry no name before the `::`, as `name::address`
+# is the remote-helper syntax documented at https://git-scm.com/docs/gitremote-helpers
+# and parses successfully.
 git init --bare bad-url-rewriting
 (cd bad-url-rewriting
 
@@ -195,7 +198,7 @@ git init --bare bad-url-rewriting
 [remote "origin"]
   pushUrl = "file://dev/null"
 
-[url "invalid:://"]
+[url ":://"]
   pushInsteadOf = "file://"
 
 [url "https://github.com/byron/"]
@@ -230,16 +233,16 @@ git init --bare multiple-bad-url-rewriting
   git config --add remote.origin.url https://github.com/foobar/gitoxide
   git config --add remote.origin.url bad:gitoxide
   git config --add url.https://github.com/byron/.insteadOf https://github.com/foobar/
-  git config --add url.invalid:://.insteadOf bad:
+  git config --add url.:://.insteadOf bad:
 )
 
 git init --bare multiple-urls-with-empty-reset
 (cd multiple-urls-with-empty-reset
 
-  git config --add remote.origin.url invalid:://old
+  git config --add remote.origin.url :://old
   git config --add remote.origin.url ""
   git config --add remote.origin.url alias:new
-  git config --add remote.origin.pushUrl invalid:://push-old
+  git config --add remote.origin.pushUrl :://push-old
   git config --add remote.origin.pushUrl ""
   git config --add remote.origin.pushUrl push:new
 
@@ -272,7 +275,7 @@ git init --bare bad-push-fallback-url-rewriting
 (cd bad-push-fallback-url-rewriting
 
   git config remote.origin.url alias:repo
-  git config url.invalid:://.pushInsteadOf alias:
+  git config url.:://.pushInsteadOf alias:
 )
 
 git init --bare bad-explicit-push-url-rewriting
@@ -280,7 +283,7 @@ git init --bare bad-explicit-push-url-rewriting
 
   git config remote.origin.url alias:repo
   git config remote.origin.pushUrl bad:repo
-  git config url.invalid:://.insteadOf bad:
+  git config url.:://.insteadOf bad:
 )
 
 git clone --shared base protocol_denied
@@ -312,12 +315,12 @@ EOF
 git clone --shared base credential-helpers
 (cd credential-helpers
     export GIT_TERMINAL_PROMPT=0
-    git=$(which git)
+    git=$(command -v git)
     function baseline() {
       local url=${1:?need url}
       {
-        echo $url
-        echo url=$url | GIT_TRACE=1 $git credential fill 2>&1 | grep -E '^[a-z]+:' || :
+        echo "$url"
+        echo "url=$url" | GIT_TRACE=1 "$git" credential fill 2>&1 | grep -E '^[a-z]+:' || :
       } >> baseline.git
     }
 
@@ -411,17 +414,33 @@ function optimize_repo() {
   cd ..
 
   git init -q client && cd client
-    for i in $(seq 8); do
-      git checkout --orphan b$i &&
-      commit b$i.c0
-    done
-
-    for j in $(seq 19); do
-      for i in $(seq 8); do
-        git checkout b$i &&
-        commit b$i.c$j
+    # Import the eight histories in one Git process to avoid per-commit startup costs on Windows.
+    # Orphan checkouts retained earlier root files, so root bN contains b1.c0.t through bN.c0.t.
+    {
+      for ((j = 0; j <= 19; j++)); do
+        for ((i = 1; i <= 8; i++)); do
+          message=b$i.c$j
+          mark=$((j * 8 + i))
+          tick
+          printf 'commit refs/heads/b%s\nmark :%s\n' "$i" "$mark"
+          printf 'author %s <%s> %s\n' "$GIT_AUTHOR_NAME" "$GIT_AUTHOR_EMAIL" "$GIT_AUTHOR_DATE"
+          printf 'committer %s <%s> %s\n' "$GIT_COMMITTER_NAME" "$GIT_COMMITTER_EMAIL" "$GIT_COMMITTER_DATE"
+          printf 'data %s\n%s\n' "$((${#message} + 1))" "$message"
+          if ((j == 0)); then
+            for ((k = 1; k < i; k++)); do
+              root_message=b$k.c0
+              printf 'M 100644 inline %s.t\ndata %s\n%s\n' "$root_message" "$((${#root_message} + 1))" "$root_message"
+            done
+          fi
+          printf 'M 100644 inline %s.t\ndata %s\n%s\n\n' "$message" "$((${#message} + 1))" "$message"
+          printf 'reset refs/tags/%s\nfrom :%s\n\n' "$message" "$mark"
+        done
       done
-    done
+    } >.git/multi-round-import
+    git fast-import --quiet <.git/multi-round-import
+    rm .git/multi-round-import
+    git symbolic-ref HEAD refs/heads/b8
+    git reset --hard
     optimize_repo
   cd ..
   (cd server
@@ -455,4 +474,61 @@ git clone one-commit-with-symref one-commit-with-symref-missing-branch
 git init empty-core-askpass
 (cd empty-core-askpass
   echo "    askpass =" >> .git/config
+)
+
+# `refs/remotes/<remote>/HEAD` records the default branch of a remote. `git clone` points it to the remote-tracking
+# branch of the branch that the `HEAD` of the remote points to, here `refs/remotes/origin/main`.
+# The other remotes change this record like `git remote set-head` does, or map it with special fetch refspecs.
+# None of them is ever fetched, so nothing depends on how a particular Git version lets `git fetch` maintain it.
+git clone --shared base remote-default-branch
+(cd remote-default-branch
+
+  # `HEAD` points to `a`, while the `HEAD` of the remote still points to `main`.
+  git remote add other-head ../base
+  git update-ref refs/remotes/other-head/a origin/a
+  git remote set-head other-head a
+
+  # The fetch refspec stores `main` of the remote as `refs/remotes/renamed/default`.
+  git remote add renamed ../base
+  git config remote.renamed.fetch +refs/heads/main:refs/remotes/renamed/default
+  git update-ref refs/remotes/renamed/default origin/main
+  git remote set-head renamed default
+
+  # A broad glob retains the branch namespace in its destination and can be reversed offline.
+  git remote add broad ../base
+  git config remote.broad.fetch '+refs/*:refs/remotes/broad/*'
+  git update-ref refs/remotes/broad/heads/main origin/main
+  git symbolic-ref refs/remotes/broad/HEAD refs/remotes/broad/heads/main
+
+  # Remote names may contain slashes, which also nest their remote-tracking branches.
+  git remote add team/origin ../base
+  git update-ref refs/remotes/team/origin/main origin/main
+  git remote set-head team/origin main
+
+  # Branches and tags of the remote map to the same remote-tracking branches,
+  # so `refs/remotes/ambiguous/main` could track `refs/heads/main` or `refs/tags/main`.
+  git remote add ambiguous ../base
+  git config --add remote.ambiguous.fetch '+refs/tags/*:refs/remotes/ambiguous/*'
+  git update-ref refs/remotes/ambiguous/main origin/main
+  git remote set-head ambiguous main
+
+  # The remote-tracking branch that `HEAD` points to was deleted.
+  git remote add dangling ../base
+  git update-ref refs/remotes/dangling/main origin/main
+  git remote set-head dangling main
+  git update-ref -d refs/remotes/dangling/main
+
+  # There are remote-tracking branches, but no `HEAD`, as if `git remote set-head no-head --delete` was run.
+  git remote add no-head ../base
+  git update-ref refs/remotes/no-head/main origin/main
+
+  # `HEAD` isn't symbolic, as if `git fetch detached HEAD:refs/remotes/detached/HEAD` wrote it.
+  git remote add detached ../base
+  git update-ref refs/remotes/detached/HEAD origin/main
+
+  # `HEAD` points to a remote-tracking branch that the fetch refspec doesn't produce anymore.
+  git remote add unmapped ../base
+  git update-ref refs/remotes/unmapped/main origin/main
+  git remote set-head unmapped main
+  git remote set-branches unmapped a
 )

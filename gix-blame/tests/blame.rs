@@ -1,3 +1,4 @@
+use gix_error::Result;
 use std::{collections::BTreeMap, path::PathBuf};
 
 use gix_blame::BlameRanges;
@@ -160,22 +161,15 @@ impl Fixture {
         use gix_ref::store::WriteReflog;
 
         let object_hash = fixture_hash_kind();
-        let store = gix_ref::file::Store::at(
+        let store = gix_ref::file::Store::at_opts(
             worktree_path.join(".git"),
+            object_hash,
             gix_ref::store::init::Options {
                 write_reflog: WriteReflog::Disable,
-                object_hash,
                 ..Default::default()
             },
         );
-        let odb = gix_odb::at_opts(
-            worktree_path.join(".git/objects"),
-            Vec::new(),
-            gix_odb::store::init::Options {
-                object_hash,
-                ..Default::default()
-            },
-        )?;
+        let odb = gix_odb::at(worktree_path.join(".git/objects"), object_hash)?;
 
         let mut reference = gix_ref::file::Store::find(&store, "HEAD")?;
 
@@ -204,7 +198,7 @@ impl Fixture {
                     old_root: None,
                     new_root: None,
                 },
-                gix_filter::Pipeline::new(Default::default(), Default::default()),
+                gix_filter::Pipeline::new(Default::default(), gix_testtools::object_hash(), Default::default()),
                 vec![],
                 gix_diff::blob::pipeline::Options {
                     large_file_threshold_bytes: 0,
@@ -221,14 +215,29 @@ impl Fixture {
         })
     }
 
-    fn blame_file(
-        &mut self,
-        source_file_name: &bstr::BStr,
-        options: gix_blame::Options,
-    ) -> Result<gix_blame::Outcome, gix_blame::Error> {
+    fn blame_file(&mut self, source_file_name: &bstr::BStr, options: gix_blame::Options) -> Result<gix_blame::Outcome> {
         gix_blame::file(
             &self.odb,
-            self.suspect,
+            gix_blame::Start::Commit(self.suspect),
+            None,
+            &mut self.resource_cache,
+            source_file_name,
+            options,
+        )
+    }
+
+    fn blame_untracked_changes(
+        &mut self,
+        source_file_name: &bstr::BStr,
+        contents: Vec<u8>,
+        options: gix_blame::Options,
+    ) -> Result<gix_blame::Outcome> {
+        gix_blame::file(
+            &self.odb,
+            gix_blame::Start::Contents {
+                first_suspect: self.suspect,
+                contents: contents.into(),
+            },
             None,
             &mut self.resource_cache,
             source_file_name,
@@ -240,7 +249,7 @@ impl Fixture {
 macro_rules! mktest {
     ($name:ident, $case:expr, $number_of_lines:literal) => {
         #[test]
-        fn $name() -> gix_testtools::Result {
+        fn $name() -> gix_testtools::TestResult {
             let Fixture {
                 odb,
                 mut resource_cache,
@@ -251,7 +260,7 @@ macro_rules! mktest {
 
             let lines_blamed = gix_blame::file(
                 &odb,
-                suspect,
+                gix_blame::Start::Commit(suspect),
                 None,
                 &mut resource_cache,
                 source_file_name.as_ref(),
@@ -340,7 +349,7 @@ fn diff_algorithm_parity() {
 
         let lines_blamed = gix_blame::file(
             &odb,
-            suspect,
+            gix_blame::Start::Commit(suspect),
             None,
             &mut resource_cache,
             source_file_name.as_ref(),
@@ -365,7 +374,7 @@ fn diff_algorithm_parity() {
 }
 
 #[test]
-fn file_that_was_added_in_two_branches() -> gix_testtools::Result {
+fn file_that_was_added_in_two_branches() -> gix_testtools::TestResult {
     let worktree_path = gix_testtools::scripted_fixture_read_only("make_blame_two_roots_repo.sh")?;
 
     let Fixture {
@@ -377,7 +386,7 @@ fn file_that_was_added_in_two_branches() -> gix_testtools::Result {
     let source_file_name = "file-with-two-roots.txt";
     let lines_blamed = gix_blame::file(
         &odb,
-        suspect,
+        gix_blame::Start::Commit(suspect),
         None,
         &mut resource_cache,
         source_file_name.into(),
@@ -396,7 +405,7 @@ fn file_that_was_added_in_two_branches() -> gix_testtools::Result {
 }
 
 #[test]
-fn since() -> gix_testtools::Result {
+fn since() -> gix_testtools::TestResult {
     let Fixture {
         odb,
         mut resource_cache,
@@ -407,16 +416,14 @@ fn since() -> gix_testtools::Result {
 
     let lines_blamed = gix_blame::file(
         &odb,
-        suspect,
+        gix_blame::Start::Commit(suspect),
         None,
         &mut resource_cache,
         source_file_name.as_ref(),
         gix_blame::Options {
             diff_algorithm: gix_diff::blob::Algorithm::Histogram,
             ranges: BlameRanges::default(),
-            since: Some(
-                gix_date::parse("2025-01-31", None).expect("TODO: should be able to to retrieve inner from Exn"),
-            ),
+            since: Some(gix_date::parse("2025-01-31", None)?),
             rewrites: Some(gix_diff::Rewrites::default()),
             debug_track_path: false,
         },
@@ -438,7 +445,7 @@ mod blame_ranges {
     use gix_blame::BlameRanges;
 
     #[test]
-    fn line_range() -> gix_testtools::Result {
+    fn line_range() -> gix_testtools::TestResult {
         let Fixture {
             odb,
             mut resource_cache,
@@ -449,7 +456,7 @@ mod blame_ranges {
 
         let lines_blamed = gix_blame::file(
             &odb,
-            suspect,
+            gix_blame::Start::Commit(suspect),
             None,
             &mut resource_cache,
             source_file_name.as_ref(),
@@ -474,7 +481,7 @@ mod blame_ranges {
     }
 
     #[test]
-    fn multiple_ranges_using_add_range() -> gix_testtools::Result {
+    fn multiple_ranges_using_add_range() -> gix_testtools::TestResult {
         let Fixture {
             odb,
             mut resource_cache,
@@ -492,7 +499,7 @@ mod blame_ranges {
 
         let lines_blamed = gix_blame::file(
             &odb,
-            suspect,
+            gix_blame::Start::Commit(suspect),
             None,
             &mut resource_cache,
             source_file_name.as_ref(),
@@ -520,7 +527,7 @@ mod blame_ranges {
     }
 
     #[test]
-    fn multiple_ranges_using_from_ranges() -> gix_testtools::Result {
+    fn multiple_ranges_using_from_ranges() -> gix_testtools::TestResult {
         let Fixture {
             odb,
             mut resource_cache,
@@ -533,7 +540,7 @@ mod blame_ranges {
 
         let lines_blamed = gix_blame::file(
             &odb,
-            suspect,
+            gix_blame::Start::Commit(suspect),
             None,
             &mut resource_cache,
             source_file_name.as_ref(),
@@ -567,7 +574,7 @@ mod rename_tracking {
     use crate::{Baseline, Fixture};
 
     #[test]
-    fn source_file_name_is_tracked_per_hunk() -> gix_testtools::Result {
+    fn source_file_name_is_tracked_per_hunk() -> gix_testtools::TestResult {
         let worktree_path = gix_testtools::scripted_fixture_read_only("make_blame_rename_tracking_repo.sh")?;
 
         let Fixture {
@@ -579,7 +586,7 @@ mod rename_tracking {
         let source_file_name = "after-rename.txt";
         let lines_blamed = gix_blame::file(
             &odb,
-            suspect,
+            gix_blame::Start::Commit(suspect),
             None,
             &mut resource_cache,
             source_file_name.into(),
@@ -604,7 +611,7 @@ mod rename_tracking {
     }
 
     #[test]
-    fn rename_and_change_in_merge_commit() -> gix_testtools::Result {
+    fn rename_and_change_in_merge_commit() -> gix_testtools::TestResult {
         let worktree_path = gix_testtools::scripted_fixture_read_only("make_blame_rename_tracking_repo.sh")?;
 
         let mut fixture = Fixture::for_worktree_path(worktree_path.to_path_buf())?;
@@ -631,6 +638,166 @@ mod rename_tracking {
         pretty_assertions::assert_eq!(lines_blamed, baseline);
 
         Ok(())
+    }
+}
+
+mod untracked_changes {
+    use gix_blame::BlameRanges;
+
+    use crate::{Baseline, Fixture};
+
+    #[test]
+    fn untracked_lines() -> gix_testtools::TestResult {
+        let worktree_path = gix_testtools::scripted_fixture_read_only("make_blame_repo.sh")?;
+
+        let mut fixture = Fixture::for_worktree_path(worktree_path.to_path_buf())?;
+        let source_file_name = "untracked-lines.txt";
+        let contents = std::fs::read(worktree_path.join(source_file_name))?;
+
+        let lines_blamed = fixture
+            .blame_untracked_changes(
+                source_file_name.into(),
+                contents,
+                gix_blame::Options {
+                    diff_algorithm: gix_diff::blob::Algorithm::Histogram,
+                    ranges: BlameRanges::default(),
+                    since: None,
+                    rewrites: Some(gix_diff::Rewrites::default()),
+                    debug_track_path: false,
+                },
+            )?
+            .entries;
+
+        assert_eq!(lines_blamed.len(), 2);
+
+        let git_dir = worktree_path.join(".git");
+        let baseline = Baseline::collect(git_dir.join("untracked-lines.baseline"), source_file_name.into())?;
+
+        pretty_assertions::assert_eq!(lines_blamed, baseline);
+
+        Ok(())
+    }
+
+    #[test]
+    fn untracked_file() -> gix_testtools::TestResult {
+        let worktree_path = gix_testtools::scripted_fixture_read_only("make_blame_repo.sh")?;
+
+        let mut fixture = Fixture::for_worktree_path(worktree_path.to_path_buf())?;
+        let source_file_name = "untracked-file.txt";
+        let contents = std::fs::read(worktree_path.join(source_file_name))?;
+
+        let lines_blamed = fixture
+            .blame_untracked_changes(
+                source_file_name.into(),
+                contents,
+                gix_blame::Options {
+                    diff_algorithm: gix_diff::blob::Algorithm::Histogram,
+                    ranges: BlameRanges::default(),
+                    since: None,
+                    rewrites: Some(gix_diff::Rewrites::default()),
+                    debug_track_path: false,
+                },
+            )?
+            .entries;
+
+        assert_eq!(lines_blamed.len(), 1);
+
+        let git_dir = worktree_path.join(".git");
+        let baseline = Baseline::collect(git_dir.join("untracked-file.baseline"), source_file_name.into())?;
+
+        pretty_assertions::assert_eq!(lines_blamed, baseline);
+
+        Ok(())
+    }
+
+    #[test]
+    fn untracked_lines_with_ranges() -> gix_testtools::TestResult {
+        let worktree_path = gix_testtools::scripted_fixture_read_only("make_blame_repo.sh")?;
+
+        let mut fixture = Fixture::for_worktree_path(worktree_path.to_path_buf())?;
+        let source_file_name = "untracked-lines.txt";
+        let contents = std::fs::read(worktree_path.join(source_file_name))?;
+
+        let lines_blamed = fixture
+            .blame_untracked_changes(
+                source_file_name.into(),
+                contents,
+                gix_blame::Options {
+                    diff_algorithm: gix_diff::blob::Algorithm::Histogram,
+                    ranges: BlameRanges::from_one_based_inclusive_range(3..=7).unwrap(),
+                    since: None,
+                    rewrites: Some(gix_diff::Rewrites::default()),
+                    debug_track_path: false,
+                },
+            )?
+            .entries;
+
+        assert_eq!(lines_blamed.len(), 2);
+
+        let git_dir = worktree_path.join(".git");
+        let baseline = Baseline::collect(git_dir.join("untracked-lines-ranges.baseline"), source_file_name.into())?;
+
+        pretty_assertions::assert_eq!(lines_blamed, baseline);
+
+        Ok(())
+    }
+}
+
+mod symlinks {
+    use gix_blame::BlameRanges;
+
+    use crate::{Baseline, Fixture};
+
+    fn run_test(source_file_name: &str, baseline_name: &str) -> gix_testtools::TestResult {
+        let worktree_path = gix_testtools::scripted_fixture_read_only("make_blame_symlinks_repo.sh")?;
+        let mut fixture = Fixture::for_worktree_path(worktree_path.to_path_buf())?;
+
+        let lines_blamed = fixture
+            .blame_file(
+                source_file_name.into(),
+                gix_blame::Options {
+                    diff_algorithm: gix_diff::blob::Algorithm::Histogram,
+                    ranges: BlameRanges::default(),
+                    since: None,
+                    rewrites: Some(gix_diff::Rewrites::default()),
+                    debug_track_path: false,
+                },
+            )?
+            .entries;
+
+        assert_eq!(lines_blamed.len(), 1);
+
+        let git_dir = worktree_path.join(".git");
+        let baseline = Baseline::collect(git_dir.join(baseline_name), source_file_name.into())?;
+
+        pretty_assertions::assert_eq!(lines_blamed, baseline);
+
+        Ok(())
+    }
+
+    #[test]
+    fn lines_added_to_file_targeted_by_symlink() -> gix_testtools::TestResult {
+        run_test("symlink", "symlink.baseline")
+    }
+
+    #[test]
+    fn symlink_changing_target() -> gix_testtools::TestResult {
+        run_test("symlink-changing-target", "symlink-changing-target.baseline")
+    }
+
+    #[test]
+    fn symlink_renamed() -> gix_testtools::TestResult {
+        run_test("symlink-after-rename", "symlink-renamed.baseline")
+    }
+
+    #[test]
+    fn file_becomes_symlink() -> gix_testtools::TestResult {
+        run_test("file-then-symlink", "file-becomes-symlink.baseline")
+    }
+
+    #[test]
+    fn symlink_becomes_file() -> gix_testtools::TestResult {
+        run_test("symlink-then-file", "symlink-becomes-file.baseline")
     }
 }
 

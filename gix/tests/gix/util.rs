@@ -1,5 +1,5 @@
-#![allow(clippy::result_large_err)]
 use gix::{Repository, ThreadSafeRepository, open};
+use gix_error::Error;
 pub use gix_testtools::Result;
 use gix_testtools::tempfile;
 use std::collections::HashMap;
@@ -21,6 +21,10 @@ static SHA1_TO_SHA256_HASHES: std::sync::LazyLock<HashMap<&str, &str>> = std::sy
         (
             "134385f6d781b7e97062102c6a483440bfda2a03",
             "5c4c31e0551f0d1fb410b7b9366604b050ea3388b96885063f10ba4c3e2dedd0",
+        ),
+        (
+            "17f2f33324841332c4f6156b36ecde6e44d1bb23",
+            "4253d58569fa7bcdd592aeeac300e01bdc16a0f1976d18558cdfc728b2eaa553",
         ),
         (
             "1a010b1c0f081b2e8901d55307a15c29ff30af0e",
@@ -55,12 +59,12 @@ static SHA1_TO_SHA256_HASHES: std::sync::LazyLock<HashMap<&str, &str>> = std::sy
             "735ec3eb1e74b0815da6d8aeca80ffbffdca25a2b624cc54d5d34caca9bc4dec",
         ),
         (
-            "3a774843723a713a8d361b4d4d98ad4092ef05bd",
-            "f94ec43f5a88d139270047a2517ca02b9e73c79d5da45ede9e370e14f7eae720",
-        ),
-        (
             "362cb5539acbd3c8ca355471f97c6a68d3db0da7",
             "5f0ae0c252472dba8c416420b90ce2aead95561489c1f3d46cc1f8c201a8a7e4",
+        ),
+        (
+            "3a774843723a713a8d361b4d4d98ad4092ef05bd",
+            "f94ec43f5a88d139270047a2517ca02b9e73c79d5da45ede9e370e14f7eae720",
         ),
         (
             "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
@@ -71,12 +75,20 @@ static SHA1_TO_SHA256_HASHES: std::sync::LazyLock<HashMap<&str, &str>> = std::sy
             "2c309d047b92197ef711ba55ab652c42d36750d6571a3e024a7325e324be3033",
         ),
         (
+            "4d979abcde5cea47b079c38850828956c9382a56",
+            "0e5692835b243989fa805b5ccf849b5323daa44f51a64bbbeb7b3f1a96717fe1",
+        ),
+        (
             "82024b2ef7858273337471cbd1ca1cedbdfd5616",
             "125ce6c0ed8fe2d20ba96bb2dd9c15a9ef63fcecdee79728f171dc73881aabdd",
         ),
         (
             "95d09f2b10159347eece71399a7e2e907ea3df4f",
             "fee53a18d32820613c0527aa79be5cb30173c823a9b448fa4817767cc84c6f03",
+        ),
+        (
+            "978f927e6397113757dfec6332e7d9c7e356ac25",
+            "c30b957873fa77bbc4ee995130f609eca81bc56419bf1a7e66291428ce7b2307",
         ),
         (
             "9902e3c3e8f0c569b4ab295ddf473e6de763e1e7",
@@ -139,6 +151,10 @@ static SHA1_TO_SHA256_HASHES: std::sync::LazyLock<HashMap<&str, &str>> = std::sy
             "0e0844f01f6ee495e23f7c5ca0431205e4b547347905df2e4dbd3d6812cb79da",
         ),
         (
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+            "473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813",
+        ),
+        (
             "e7c7273539cfc1a52802fa9d61aa578f6ccebcb4",
             "10d26eeb1167a0cefa12fa0738d36eb4e55adb43e8837dfa3d38e7f8b019140e",
         ),
@@ -194,12 +210,20 @@ pub fn freeze_time() -> gix_testtools::Env<'static> {
         .unset("GIT_COMMITTER_EMAIL")
         .set("GIT_COMMITTER_DATE", frozen_time)
 }
+/// Initialize a repository with default creation options and isolated opening options.
+pub fn init_repo_isolated(
+    path: impl AsRef<std::path::Path>,
+    kind: gix::create::Kind,
+) -> std::result::Result<ThreadSafeRepository, gix::Error> {
+    ThreadSafeRepository::init_opts(path, kind, Default::default(), open::Options::isolated())
+}
+
 pub fn repo(name: &str) -> Result<ThreadSafeRepository> {
     let repo_path = gix_testtools::scripted_fixture_read_only(name)?;
     Ok(ThreadSafeRepository::open_opts(repo_path, restricted())?)
 }
 
-pub fn repo_opts(name: &str, opts: open::Options) -> std::result::Result<ThreadSafeRepository, open::Error> {
+pub fn repo_opts(name: &str, opts: open::Options) -> std::result::Result<ThreadSafeRepository, Error> {
     let repo_path = gix_testtools::scripted_fixture_read_only(name).unwrap();
     ThreadSafeRepository::open_opts(repo_path, opts)
 }
@@ -209,13 +233,9 @@ pub fn named_repo(name: &str) -> Result<Repository> {
     Ok(ThreadSafeRepository::open_opts(repo_path, restricted())?.to_thread_local())
 }
 
-pub fn named_subrepo_opts(
-    fixture: &str,
-    name: &str,
-    opts: open::Options,
-) -> std::result::Result<Repository, gix::open::Error> {
+pub fn named_subrepo_opts(fixture: &str, name: &str, opts: open::Options) -> std::result::Result<Repository, Error> {
     let repo_path = gix_testtools::scripted_fixture_read_only(fixture)
-        .map_err(|err| gix::open::Error::Io(std::io::Error::other(err)))?
+        .map_err(|err| Error::from_boxed(err))?
         .join(name);
     Ok(ThreadSafeRepository::open_opts(repo_path, opts)?.to_thread_local())
 }
@@ -242,7 +262,7 @@ pub fn repo_rw_opts(name: &str, opts: gix::open::Options) -> Result<(Repository,
             repo_path.path(),
             Default::default(),
             gix_sec::trust::Mapping {
-                full: opts.clone(),
+                full: opts.clone_without_trust(),
                 reduced: opts,
             },
         )?
@@ -257,4 +277,45 @@ pub fn basic_repo() -> Result<Repository> {
 
 pub fn basic_rw_repo() -> Result<(Repository, tempfile::TempDir)> {
     repo_rw("make_basic_repo.sh")
+}
+
+/// Request interruption when the checkout engine obtains progress counters, after entry-point checks.
+#[cfg(feature = "worktree-mutation")]
+pub struct InterruptCheckout(pub std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+#[cfg(feature = "worktree-mutation")]
+impl gix::progress::Count for InterruptCheckout {
+    fn set(&self, _: usize) {}
+    fn step(&self) -> usize {
+        0
+    }
+    fn inc_by(&self, _: usize) {}
+    fn counter(&self) -> gix::progress::StepShared {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        gix::progress::Discard.counter()
+    }
+}
+
+#[cfg(feature = "worktree-mutation")]
+impl gix::progress::Progress for InterruptCheckout {
+    fn init(&mut self, _: Option<usize>, _: Option<gix::progress::Unit>) {}
+    fn set_name(&mut self, _: String) {}
+    fn name(&self) -> Option<String> {
+        None
+    }
+    fn id(&self) -> gix::progress::Id {
+        gix::progress::UNKNOWN
+    }
+    fn message(&self, _: gix::progress::MessageLevel, _: String) {}
+}
+
+#[cfg(feature = "worktree-mutation")]
+impl gix::progress::NestedProgress for InterruptCheckout {
+    type SubProgress = Self;
+    fn add_child(&mut self, _: impl Into<String>) -> Self {
+        Self(self.0.clone())
+    }
+    fn add_child_with_id(&mut self, name: impl Into<String>, _: gix::progress::Id) -> Self {
+        self.add_child(name)
+    }
 }

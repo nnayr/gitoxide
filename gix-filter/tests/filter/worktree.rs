@@ -4,23 +4,27 @@ mod encoding {
 
         #[test]
         fn unknown() {
-            assert_eq!(
-                worktree::encoding::for_label("FOO").unwrap_err().to_string(),
-                "An encoding named 'FOO' is not known"
-            );
+            insta::assert_debug_snapshot!(worktree::encoding::for_label("FOO").expect_err("unknown"), "unknown", @"An encoding named 'FOO' is not known");
         }
 
         #[test]
         fn utf32_is_not_supported() {
+            let mut message_diagnostics = Vec::new();
             for enc in ["UTF-32BE", "UTF-32LE", "UTF-32", "UTF-32LE-BOM", "UTF-32BE-BOM"] {
-                assert!(
-                    matches!(
-                        worktree::encoding::for_label(enc).unwrap_err(),
-                        worktree::encoding::for_label::Error::Unknown { .. }
-                    ),
-                    "it's not needed for the web and this crate is meant for use in firefox"
-                );
+                message_diagnostics.push(gix_testtools::redact_debug_snapshot(
+                    &(worktree::encoding::for_label(enc).expect_err("the input must be rejected")),
+                    &[],
+                ));
             }
+            insta::assert_debug_snapshot!(message_diagnostics, "utf32 is not supported", @"
+            [
+                An encoding named 'UTF-32BE' is not known,
+                An encoding named 'UTF-32LE' is not known,
+                An encoding named 'UTF-32' is not known,
+                An encoding named 'UTF-32LE-BOM' is not known,
+                An encoding named 'UTF-32BE-BOM' is not known,
+            ]
+            ");
         }
 
         #[test]
@@ -41,15 +45,19 @@ mod encoding {
 
         #[test]
         fn various_utf_16_with_bom_suffix_are_unsupported() {
+            let mut message_diagnostics = Vec::new();
             for label in ["UTF-16BE-BOM", "UTF-16LE-BOM"] {
-                assert!(
-                    matches!(
-                        worktree::encoding::for_label(label).unwrap_err(),
-                        worktree::encoding::for_label::Error::Unknown { .. }
-                    ),
-                    "git supports these and has special handling, but we have not for now. Git has no tests for that either."
-                );
+                message_diagnostics.push(gix_testtools::redact_debug_snapshot(
+                    &(worktree::encoding::for_label(label).expect_err("the input must be rejected")),
+                    &[],
+                ));
             }
+            insta::assert_debug_snapshot!(message_diagnostics, "various utf 16 with bom suffix are unsupported", @"
+            [
+                An encoding named 'UTF-16BE-BOM' is not known,
+                An encoding named 'UTF-16LE-BOM' is not known,
+            ]
+            ");
         }
 
         #[test]
@@ -67,14 +75,42 @@ mod encoding {
 mod encode_to_git {
     use bstr::ByteSlice;
     use gix_filter::{worktree, worktree::encode_to_git::RoundTripCheck};
+    use gix_testtools::TestResult;
 
     #[test]
-    fn simple() -> crate::Result {
+    fn simple() -> TestResult {
         let input = &b"hello"[..];
         for round_trip in [RoundTripCheck::Skip, RoundTripCheck::Fail] {
-            let mut buf = Vec::new();
+            let mut buf = b"previous content, not UTF-8: \xff".to_vec();
             worktree::encode_to_git(input, encoding_rs::UTF_8, &mut buf, round_trip)?;
-            assert_eq!(buf.as_bstr(), input);
+            assert_eq!(buf.as_bstr(), input, "the previous content of `buf` is replaced");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reuses_large_buffer_for_small_inputs() -> TestResult {
+        let large_input = vec![0x80; 128 * 1024];
+        for round_trip in [RoundTripCheck::Skip, RoundTripCheck::Fail] {
+            let mut buf = Vec::new();
+            worktree::encode_to_git(&large_input, encoding_rs::WINDOWS_1252, &mut buf, round_trip)?;
+            assert_eq!(
+                buf.as_bstr(),
+                "€".repeat(large_input.len()),
+                "decoding can expand the input"
+            );
+            let capacity = buf.capacity();
+            let allocation = buf.as_ptr();
+
+            for _ in 0..32 {
+                for (input, expected) in [(b"\x80".as_slice(), "€"), (b"a".as_slice(), "a"), (b"".as_slice(), "")] {
+                    buf.clear();
+                    worktree::encode_to_git(input, encoding_rs::WINDOWS_1252, &mut buf, round_trip)?;
+                    assert_eq!(buf.as_bstr(), expected, "only the current input is returned");
+                    assert_eq!(buf.capacity(), capacity, "small conversions retain the allocation");
+                    assert_eq!(buf.as_ptr(), allocation, "the allocation is reused, not replaced");
+                }
+            }
         }
         Ok(())
     }
@@ -83,9 +119,10 @@ mod encode_to_git {
 mod encode_to_worktree {
     use bstr::ByteSlice;
     use gix_filter::{worktree, worktree::encode_to_git::RoundTripCheck};
+    use gix_testtools::TestResult;
 
     #[test]
-    fn shift_jis() -> crate::Result {
+    fn shift_jis() -> TestResult {
         let input = "ハローワールド";
         let mut buf = Vec::new();
         worktree::encode_to_worktree(input.as_bytes(), encoding_rs::SHIFT_JIS, &mut buf)?;

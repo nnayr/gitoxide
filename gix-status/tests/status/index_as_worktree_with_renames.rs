@@ -10,6 +10,45 @@ use pretty_assertions::assert_eq;
 use crate::fixture_path;
 
 #[test]
+fn gitlink_type_changes_are_not_also_untracked() -> gix_testtools::TestResult {
+    for (name, worktree_mode) in [
+        ("type-change", gix_index::entry::Mode::FILE),
+        ("type-change-unconfigured-file", gix_index::entry::Mode::FILE),
+        ("type-change-unconfigured-symlink", gix_index::entry::Mode::SYMLINK),
+    ] {
+        let git_dir = fixture_path("status_submodule").join(name).join(".git");
+        if worktree_mode == gix_index::entry::Mode::SYMLINK && git_dir.join("symlinks-unavailable").is_file() {
+            continue;
+        }
+        if worktree_mode == gix_index::entry::Mode::FILE {
+            assert_eq!(
+                std::fs::read_to_string(git_dir.join("status.baseline"))?,
+                " T m1\n",
+                "Git reports only a type change for {name}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(git_dir.join("untracked.baseline"))?,
+            "",
+            "Git does not list the replaced gitlink as untracked for {name}"
+        );
+        fixture_filtered_detailed(
+            "status_submodule.sh",
+            name,
+            &[],
+            &[Expectation::Modification {
+                rela_path: "m1",
+                status: Change::Type { worktree_mode }.into(),
+            }],
+            None,
+            Some(Default::default()),
+            Fixture::ReadOnly,
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn changed_and_untracked_and_renamed() {
     let expectations_with_dirwalk = [
         // Not always will we match the right source to destinations, there is ambiguity.
@@ -88,7 +127,7 @@ fn changed_and_untracked_and_renamed() {
         &expectations_with_dirwalk,
         Some(rewrites),
         Some(Default::default()),
-        Fixture::ReadOnly,
+        Fixture::ReadOnlyNeedsArchive,
     );
     assert_eq!(
         out.rewrites,
@@ -250,6 +289,7 @@ fn unreadable_untracked() {
 
 enum Fixture {
     ReadOnly,
+    ReadOnlyNeedsArchive,
     #[cfg(unix)]
     WritableExecuted,
 }
@@ -275,6 +315,12 @@ fn fixture_filtered_detailed(
         Fixture::ReadOnly => {
             let dir = fixture_path(script).join(subdir);
             (dir, None::<gix_testtools::tempfile::TempDir>)
+        }
+        Fixture::ReadOnlyNeedsArchive => {
+            let dir = gix_testtools::scripted_fixture_read_only_needs_archive(script)
+                .expect("script works")
+                .join(subdir);
+            (dir, None)
         }
         #[cfg(unix)]
         Fixture::WritableExecuted => {
@@ -310,7 +356,7 @@ fn fixture_filtered_detailed(
                 old_root: None,
                 new_root: Some(worktree.to_owned()),
             },
-            gix_filter::Pipeline::new(Default::default(), Default::default()),
+            gix_filter::Pipeline::new(Default::default(), gix_testtools::object_hash(), Default::default()),
             vec![],
             gix_diff::blob::pipeline::Options {
                 large_file_threshold_bytes: 0,
@@ -334,7 +380,6 @@ fn fixture_filtered_detailed(
         },
     };
     let options = Options {
-        object_hash,
         tracked_file_modifications: gix_status::index_as_worktree::Options {
             fs: capabilities,
             stat: crate::index_as_worktree::TEST_OPTIONS,
@@ -355,7 +400,7 @@ fn fixture_filtered_detailed(
         FastEq,
         crate::index_as_worktree::SubmoduleStatusMock { dirty: false },
         objects,
-        &mut gix_features::progress::Discard,
+        &mut gix_utils::progress::Discard,
         context,
         options,
     )

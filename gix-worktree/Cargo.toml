@@ -2,17 +2,21 @@ lints.workspace = true
 
 [package]
 name = "gix-worktree"
-version = "0.54.0"
+version = "0.59.0"
 repository = "https://github.com/GitoxideLabs/gitoxide"
 license = "MIT OR Apache-2.0"
 description = "A crate of the gitoxide project for shared worktree related types and utilities."
 authors = ["Sebastian Thiel <sebastian.thiel@icloud.com>"]
 edition = "2024"
 include = ["/src/**/*", "/LICENSE-*"]
-rust-version = "1.85"
+rust-version = "1.88"
 
 [lib]
 doctest = false
+
+[[bench]]
+name = "sparse"
+harness = false
 
 [features]
 default = ["attributes"]
@@ -20,24 +24,30 @@ default = ["attributes"]
 sha1 = ["gix-hash/sha1"]
 ## Enable support for the SHA-256 hash by enabling the respective feature in the `gix-hash` crate.
 sha256 = ["gix-hash/sha256"]
-## Instantiate stacks that can access `.gitattributes` information.
-attributes = ["dep:gix-attributes", "dep:gix-validate"]
 ## Data structures implement `serde::Serialize` and `serde::Deserialize`.
 serde = ["dep:serde", "bstr/serde", "gix-index/serde", "gix-hash/serde", "gix-object/serde", "gix-attributes?/serde", "gix-ignore/serde"]
-## Enable thread-safety.
-parallel = ["gix-features/parallel", "gix-attributes?/parallel"]
+## Instantiate stacks that can access `.gitattributes` information.
+attributes = ["dep:gix-attributes", "dep:gix-validate"]
+## Add linked worktrees by preparing their administrative files.
+add = ["dep:gix-validate"]
+## Remove linked worktrees recursively, with parallel traversal and deletion.
+remove = ["dep:dua-core", "dep:gix-trace", "gix-utils/progress"]
 
 [dependencies]
-gix-index = { version = "^0.53.0", path = "../gix-index" }
-gix-fs = { version = "^0.21.2", path = "../gix-fs" }
-gix-hash = { version = "^0.25.1", path = "../gix-hash" }
-gix-object = { version = "^0.62.0", path = "../gix-object" }
-gix-glob = { version = "^0.26.1", path = "../gix-glob" }
-gix-path = { version = "^0.12.2", path = "../gix-path" }
-gix-attributes = { version = "^0.33.2", path = "../gix-attributes", optional = true }
-gix-validate = { version = "^0.11.2", path = "../gix-validate", optional = true }
-gix-ignore = { version = "^0.21.1", path = "../gix-ignore" }
-gix-features = { version = "^0.48.1", path = "../gix-features", optional = true }
+gix-trace = { version = "^0.3.1", path = "../gix-trace", optional = true }
+gix-utils = { version = "^0.5.2", path = "../gix-utils", optional = true }
+gix-error = { version = "^0.5.2", path = "../gix-error" }
+gix-index = { version = "^0.58.0", path = "../gix-index" }
+gix-fs = { version = "~1.0.0", path = "../gix-fs", features = ["unstable"] }
+gix-hash = { version = "^0.28.1", path = "../gix-hash" }
+gix-object = { version = "^0.66.1", path = "../gix-object" }
+gix-glob = { version = "^0.29.1", path = "../gix-glob" }
+gix-path = { version = "^0.14.1", path = "../gix-path" }
+gix-attributes = { version = "^0.37.1", path = "../gix-attributes", optional = true }
+gix-validate = { version = "^0.13.1", path = "../gix-validate", optional = true }
+gix-ignore = { version = "^0.24.1", path = "../gix-ignore" }
+dua-core = { version = "4.1.0", optional = true }
+
 
 serde = { version = "1.0.114", optional = true, default-features = false, features = ["derive"] }
 bstr = { version = "1.12.0", default-features = false }
@@ -45,17 +55,24 @@ bstr = { version = "1.12.0", default-features = false }
 document-features = { version = "0.2.0", optional = true }
 
 [dev-dependencies]
-gix-hash = { path = "../gix-hash", features = ["sha1"] }
-gix-testtools = { path = "../tests/tools", default-features = false }
-gix-odb = { path = "../gix-odb" }
+gix-fs = { path = "../gix-fs", features = ["unstable"] }
+criterion = "0.8.2"
+insta = "1.46.3"
+gix-worktree = { path = ".", features = ["add", "remove"] }
+gix-hash = { path = "../gix-hash", features = ["sha1", "sha256"] }
+gix-testtools = { path = "../tests/tools", default-features = false, features = ["sha1", "sha256"] }
+gix-odb = { path = "../gix-odb", features = ["sha1", "sha256"] }
 gix-discover = { path = "../gix-discover" }
-symlink = "0.1.0"
 
 [package.metadata.docs.rs]
 features = ["sha1", "document-features", "serde"]
 
-[package.metadata.cargo-machete]
-ignored = [
-    # Forwarding-only dependency for test feature parity after dissolving gix-worktree-tests.
-    "gix-features",
+[package.metadata.qa]
+checks = [
+    { args = ["--features", "sha1,serde"] },
+    { args = ["--no-default-features", "--features", "sha1"] },
+]
+tests = [
+    { args = ["--features", "gix-parallel/parallel"], packages = ["gix-worktree", "gix-parallel"], env = { GIX_TEST_FIXTURE_HASH = "sha1" } },
+    { args = ["--features", "gix-worktree/sha256,gix-parallel/parallel"], packages = ["gix-worktree", "gix-parallel"], env = { GIX_TEST_FIXTURE_HASH = "sha256" } },
 ]

@@ -4,15 +4,19 @@ use crate::bstr::{BStr, ByteSlice};
 pub fn message_title_and_body(input: &[u8]) -> (&BStr, Option<&BStr>) {
     let mut pos = 0;
     while pos < input.len() {
-        if let Some(first_len) = newline_len(&input[pos..]) {
-            if let Some(second_len) = newline_len(&input[pos + first_len..]) {
-                let body = &input[pos + first_len + second_len..];
-                return (input[..pos].as_bstr(), (!body.is_empty()).then(|| body.as_bstr()));
-            }
+        if let Some(first_len) = newline_len(&input[pos..])
+            && let Some(second_len) = newline_len(&input[pos + first_len..])
+        {
+            let body = &input[pos + first_len + second_len..];
+            return (input[..pos].as_bstr(), (!body.is_empty()).then(|| body.as_bstr()));
         }
         pos += 1;
     }
-    (input.as_bstr(), None)
+    let title = input
+        .strip_suffix(b"\r\n")
+        .or_else(|| input.strip_suffix(b"\n"))
+        .unwrap_or(input);
+    (title.as_bstr(), None)
 }
 
 fn newline_len(input: &[u8]) -> Option<usize> {

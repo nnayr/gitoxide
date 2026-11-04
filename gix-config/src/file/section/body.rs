@@ -1,3 +1,4 @@
+use gix_error::Result;
 use std::{borrow::Cow, iter::FusedIterator, ops::Range, slice};
 
 use bstr::{BStr, BString, ByteSlice, ByteVec};
@@ -213,20 +214,20 @@ impl BodyData {
             // is included in the range
             let value_range = value_range.start..value_range.end + 1;
             let key_range = key_start..value_range.end;
-            (key_range, (value_range.start != key_start + 1).then_some(value_range))
+            let has_separator = self.0[key_start + 1..]
+                .iter()
+                .take_while(|e| matches!(e, Event::Whitespace(_) | Event::KeyValueSeparator))
+                .any(|e| matches!(e, Event::KeyValueSeparator));
+            (key_range, has_separator.then_some(value_range))
         })
     }
 
-    pub(crate) fn copy_to_backing_in(
-        &self,
-        source: &[u8],
-        target: &mut Vec<u8>,
-    ) -> Result<Self, crate::parse::span::Error> {
+    pub(crate) fn copy_to_backing_in(&self, source: &[u8], target: &mut Vec<u8>) -> Result<Self> {
         Ok(BodyData(
             self.0
                 .iter()
                 .map(|event| event.copy_to_backing_in(source, target))
-                .collect::<Result<_, _>>()?,
+                .collect::<std::result::Result<_, _>>()?,
         ))
     }
 }

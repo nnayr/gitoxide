@@ -5,6 +5,13 @@ use std::{
 
 use std::sync::LazyLock;
 
+pub(super) struct WindowsExecutable {
+    pub program: OsString,
+    /// Whether `program` was found in `<git-root>/bin`, where Git for Windows
+    /// installs executable shims.
+    pub is_shim: bool,
+}
+
 /// `usr`-like directory component names that MSYS2 may provide, other than for `/usr` itself.
 ///
 /// These are the values of the "Prefix" column of the "Environments" and "Legacy Environments"
@@ -13,7 +20,7 @@ use std::sync::LazyLock;
 ///
 /// On Windows, we prefer to use `sh` as provided by Git for Windows, when present. To find it, we
 /// run `git --exec-path` to get a path that is usually `<platform>/libexec/git-core` in the Git
-/// for Windows installation, where `<platform>` is something like `mingw64`. It is also acceptable
+/// for Windows installation, where `<platform>` is something like `ucrt64`. It is also acceptable
 /// to find `sh` in an environment not provided by Git for Windows, such as an independent MSYS2
 /// environment in which a `git` package has been installed. However, in an unusual installation,
 /// or if the user has set a custom value of `GIT_EXEC_PATH`, the output of `git --exec-path` may
@@ -41,16 +48,15 @@ use std::sync::LazyLock;
 ///
 /// Conditions for a privilege escalation attack or other serious malfunction seem far-fetched. If
 /// further research finds the risk is low enough, `usr` may be added. But for now it is omitted.
-const MSYS_USR_VARIANTS: &[&str] = &["mingw64", "mingw32", "clangarm64", "clang64", "clang32", "ucrt64"];
+const MSYS_USR_VARIANTS: &[&str] = &["clangarm64", "ucrt64", "mingw64", "mingw32", "clang64", "clang32"];
 
 /// Find a Git for Windows installation directory based on `git --exec-path` output.
 ///
 /// Currently this is used only for finding the path to an `sh.exe` associated with Git. This is
 /// separate from `installation_config()` and `installation_config_prefix()` in `gix_path::env`.
 /// This is *not* suitable for finding the highest-scoped configuration file, because that could be
-/// installed in an unusual place, or customized via `GIT_CONFIG_SYSTEM` or `GIT_CONFIG_NOSYSTEM`,
-/// all of which `installation_config()` should reflect. Likewise, `installation_config_prefix()`
-/// has strong uses, such as to find a directory inside `ProgramData` containing configuration.
+/// installed in an unusual place. Likewise, `installation_config_prefix()` has strong uses, such
+/// as to find a directory inside `ProgramData` containing configuration.
 /// But it is possible that some marginal uses of `installation_config_prefix()`, if they do not
 /// really relate to configuration, could be replaced with `git_for_windows_root()` in the future.
 fn git_for_windows_root() -> Option<&'static Path> {
@@ -84,12 +90,27 @@ const BIN_DIR_FRAGMENTS: &[&str] = &["bin", "usr/bin"];
 /// The resulting path uses only `/` separators so long as the path obtained from `git --exec-path`
 /// does, which is the case unless it is overridden by setting `GIT_EXEC_PATH` to an unusual value.
 ///
-/// This is currently only used (and only heavily exercised in tests) for finding `sh.exe`. It may
-/// be used to find other executables in the future, but may need adjustment. In particular,
-/// depending on desired semantics, it should possibly also check a `cmd` directory; directories
-/// like `<platform>/bin`, for any applicable variants (such as `mingw64`); and `super::core_dir()`
-/// itself, which it could safely check even if its value is not safe for inferring other paths.
-fn find_git_associated_windows_executable(stem: &str) -> Option<OsString> {
+/// This is used for finding `sh.exe` and by [`super::installation_program()`]. Depending on desired
+/// semantics for future callers, it should possibly also check a `cmd` directory; directories like
+/// `<platform>/bin`, for any applicable variants (such as `mingw64`); and `super::core_dir()` itself,
+/// which it could safely check even if its value is not safe for inferring other paths.
+pub(super) fn find_git_associated_windows_executable(stem: &str) -> Option<WindowsExecutable> {
+    #[cfg(windows)]
+    if let Some(bin) = super::git::msys_bin() {
+        // Stay inside the selected MSYS runtime's bin directory. In particular, do not infer
+        // a sibling of an arbitrary `usr` directory from GIT_EXEC_PATH.
+        let program = bin.join(format!("{stem}.exe"));
+        if !program.is_file() {
+            return None;
+        }
+        let program = crate::from_bstr(crate::to_unix_separators(crate::into_bstr(program).ok()?))
+            .ok()?
+            .into_owned();
+        return Some(WindowsExecutable {
+            program: program.into(),
+            is_shim: false,
+        });
+    }
     let git_root = git_for_windows_root()?;
 
     BIN_DIR_FRAGMENTS
@@ -102,17 +123,23 @@ fn find_git_associated_windows_executable(stem: &str) -> Option<OsString> {
             raw_path.push("/");
             raw_path.push(stem);
             raw_path.push(".exe");
-            raw_path
+            WindowsExecutable {
+                program: raw_path,
+                is_shim: *bin_dir_fragment == "bin",
+            }
         })
-        .find(|raw_path| Path::new(raw_path).is_file())
+        .find(|executable| Path::new(&executable.program).is_file())
 }
 
 /// Like `find_associated_windows_executable`, but if not found, fall back to a simple filename.
-pub(super) fn find_git_associated_windows_executable_with_fallback(stem: &str) -> OsString {
+pub(super) fn find_git_associated_windows_executable_with_fallback(stem: &str) -> WindowsExecutable {
     find_git_associated_windows_executable(stem).unwrap_or_else(|| {
         let mut raw_path = OsString::from(stem);
         raw_path.push(".exe");
-        raw_path
+        WindowsExecutable {
+            program: raw_path,
+            is_shim: false,
+        }
     })
 }
 
@@ -124,7 +151,18 @@ mod tests {
     ///
     /// Tests are expected to run with a full Git for Windows installation (not MinGit).
     const SHOULD_FIND: &[&str] = &[
-        "sh", "bash", "dash", "diff", "tar", "less", "sed", "awk", "perl", "cygpath",
+        "sh",
+        "bash",
+        "dash",
+        "diff",
+        "tar",
+        "less",
+        "sed",
+        "awk",
+        "perl",
+        "cygpath",
+        "gpg",
+        "ssh-keygen",
     ];
 
     /// Shouldn't find anything nonexistent, or only in PATH or in `bin`s we don't mean to search.
@@ -154,7 +192,7 @@ mod tests {
     fn find_git_associated_windows_executable_no_extra() {
         for stem in SHOULD_NOT_FIND {
             let path = super::find_git_associated_windows_executable(stem);
-            assert_eq!(path, None, "should not find {stem:?}");
+            assert!(path.is_none(), "should not find {stem:?}");
         }
     }
 
@@ -162,8 +200,8 @@ mod tests {
     #[cfg_attr(not(windows), ignore = "only meaningful on Windows")]
     fn find_git_associated_windows_executable_with_fallback() {
         for stem in SHOULD_FIND {
-            let path = super::find_git_associated_windows_executable_with_fallback(stem);
-            assert!(Path::new(&path).is_absolute(), "should find {stem:?}");
+            let executable = super::find_git_associated_windows_executable_with_fallback(stem);
+            assert!(Path::new(&executable.program).is_absolute(), "should find {stem:?}");
         }
     }
 
@@ -172,6 +210,7 @@ mod tests {
     fn find_git_associated_windows_executable_with_fallback_falls_back() {
         for stem in SHOULD_NOT_FIND {
             let path = super::find_git_associated_windows_executable_with_fallback(stem)
+                .program
                 .to_str()
                 .expect("valid Unicode")
                 .to_owned();

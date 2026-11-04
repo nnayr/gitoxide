@@ -7,6 +7,12 @@ git config core.ignorecase false
 
 while read -r pattern value; do
   echo "$pattern" "$value"
+  if [[ -n ${MSYSTEM:-} && $pattern == "*/\\'" && $value == "XXX/\\'" ]]; then
+    # Git for Windows treats the backslash in this stdin path as a separator,
+    # so reproduce the Git-on-Unix baseline for this repository-relative path.
+    printf '::\t"%s"\n' "${value//\\/\\\\}"
+    continue
+  fi
   echo "$pattern" > .gitignore
   echo "$value" | git check-ignore -vn --stdin 2>&1 || :
 done <<EOF >git-baseline.nmatch
@@ -66,6 +72,7 @@ foo/** foo
 {**/src/**,foo} abc/src/bar
 {**/src/**,foo} foo
 abc[/]def abc/def
+\ anything
 EOF
 
 while read -r pattern value; do
@@ -156,3 +163,17 @@ aBcDeFg  abcdefg
 aBcDeFg  ABCDEFG
 aBcDeFg  AbCdEfG
 EOF
+
+# Preserve whitespace-only paths, including newline, with NUL-delimited input and output.
+# Each record contains the requested pattern followed by Git's source, line, matched pattern and path.
+# Git's [:blank:] accepts space/tab; [:space:] also accepts LF/CR, but neither accepts VT/FF.
+for ignorecase in false true; do
+  git config core.ignorecase "$ignorecase"
+  for pattern in '[[:blank:]]' '[[:space:]]'; do
+    printf '%s\n' "$pattern" > .gitignore
+    for value in ' ' $'\t' $'\n' $'\v' $'\f' $'\r'; do
+      printf '%s\0' "$pattern"
+      printf '%s\0' "$value" | git check-ignore -zvn --stdin || test "$?" = 1
+    done
+  done >"git-baseline.whitespace-$ignorecase"
+done

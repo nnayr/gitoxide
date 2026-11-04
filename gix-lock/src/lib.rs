@@ -18,7 +18,7 @@
 //! ## Examples
 //!
 //! ```
-//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 //! use std::io::Write;
 //!
 //! # let dir = tempfile::tempdir()?;
@@ -28,6 +28,7 @@
 //!     &resource,
 //!     gix_lock::acquire::Fail::Immediately,
 //!     None,
+//!     0,
 //! )?;
 //! lock.write_all(b"new = value\n")?;
 //! let (resource_path, _) = lock.commit()?;
@@ -40,6 +41,7 @@
 
 use std::path::PathBuf;
 
+/// Registered tempfile implementation used by this crate.
 pub use gix_tempfile as tempfile;
 use gix_tempfile::handle::{Closed, Writable};
 
@@ -48,6 +50,8 @@ const DOT_LOCK_SUFFIX: &str = ".lock";
 ///
 pub mod acquire;
 
+/// Backoff implementation from an unstable plumbing crate.
+#[gix_macros::unstable(since = "2023-04-16")]
 pub use gix_utils::backoff;
 ///
 pub mod commit;
@@ -60,6 +64,7 @@ pub mod commit;
 pub struct File {
     inner: gix_tempfile::Handle<Writable>,
     lock_path: PathBuf,
+    resource_path: PathBuf,
 }
 
 /// Locks a resource to allow related resources to be updated using [files][File].
@@ -72,6 +77,7 @@ pub struct Marker {
     inner: gix_tempfile::Handle<Closed>,
     created_from_file: bool,
     lock_path: PathBuf,
+    resource_path: PathBuf,
 }
 
 ///

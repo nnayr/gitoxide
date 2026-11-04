@@ -8,7 +8,8 @@
 //!
 //! This crate implements the building blocks in terms of applying and undoing filters, along with logic to decide whether
 //! or not to apply such a filter.
-#![deny(missing_docs, unsafe_code)]
+#![deny(missing_docs)]
+#![forbid(unsafe_code)]
 
 use bstr::BString;
 /// A forwarding of the `encoding_rs` crate for its types and convenience.
@@ -36,6 +37,8 @@ pub mod pipeline;
 /// It's configuring itself for each provided path based on the path's attributes, implementing the complex logic that governs it.
 #[derive(Clone)]
 pub struct Pipeline {
+    /// The object hash to use when applying the `ident` filter.
+    object_hash: gix_hash::Kind,
     /// Various options that are all defaultable.
     options: pipeline::Options,
     /// Storage for the attributes of each item we should process, configured for use with all attributes that concern us.

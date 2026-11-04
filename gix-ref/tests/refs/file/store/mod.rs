@@ -4,7 +4,7 @@ use gix_ref::{
     Target,
     file::transaction::PackedRefs,
     store::WriteReflog,
-    transaction::{Change, LogChange, PreviousValue, RefEdit},
+    transaction::{PreviousValue, RefEdit},
 };
 
 use crate::file::{
@@ -18,18 +18,94 @@ mod iter;
 mod reflog;
 
 #[test]
-fn precompose_unicode_journey() -> crate::Result {
+#[cfg_attr(not(target_os = "macos"), ignore = "Needs filesystem that folds Unicode composition")]
+fn packed_reference_precomposition_is_component_local() -> gix_testtools::TestResult {
+    let tmp = gix_testtools::tempfile::tempdir()?;
+    let store = gix_ref::file::Store::at_opts(
+        tmp.path().to_owned(),
+        crate::fixture_hash_kind(),
+        gix_ref::store::init::Options {
+            precompose_unicode: true,
+            ..Default::default()
+        },
+    );
+    let mut buf = TimeBuf::default();
+    for (input, precomposed) in [("📹/U\u{308}", "📹/Ü"), ("📹Ü/O\u{308}", "📹Ü/Ö"), ("äO\u{308}", "äÖ")]
+    {
+        let full_name = format!("refs/heads/{input}");
+        store
+            .transaction()
+            .packed_refs(PackedRefs::DeletionsAndNonSymbolicUpdatesRemoveLooseSourceReference(
+                Box::new(EmptyCommit),
+            ))
+            .prepare([create_at(&full_name)], Fail::Immediately, Fail::Immediately)?
+            .commit(committer().to_ref(&mut buf))?;
+
+        let packed = store.find(precomposed)?;
+        assert_eq!(
+            packed.name.shorten(),
+            precomposed,
+            "packing composes the final filename even after an emoji component"
+        );
+        for query in [
+            input.to_owned(),
+            full_name.clone(),
+            format!("main-worktree/{full_name}"),
+        ] {
+            let reference = store.find(query.as_str())?;
+            assert_eq!(
+                reference.name, full_name,
+                "lookup preserves the spelling of untouched components"
+            );
+            assert_eq!(
+                store.find(reference.name.as_ref())?,
+                reference,
+                "a returned reference name must address the same reference"
+            );
+        }
+        let loose_path = tmp.path().join(&full_name);
+        std::fs::create_dir_all(loose_path.parent().expect("a full ref name has parent directories"))?;
+        let commit_id = packed.target.try_id().expect("packed references have object targets");
+        std::fs::write(loose_path, format!("{commit_id}\n"))?;
+        let loose = store.find_loose(input)?;
+        assert_eq!(
+            loose.name, full_name,
+            "loose lookup also preserves the requested spelling"
+        );
+        assert_eq!(
+            store.find_loose(loose.name.as_ref())?,
+            loose,
+            "loose reference names also round-trip"
+        );
+    }
+    let commit_id = crate::hex_to_id("1111111111111111111111111111111111111111");
+    std::fs::write(tmp.path().join("WORKTREE_HEAD"), format!("{commit_id}\n"))?;
+    for (query, expected) in [
+        ("WOR\u{212a}TREE_HEAD", "WORKTREE_HEAD"),
+        ("main-worktree/WOR\u{212a}TREE_HEAD", "main-worktree/WORKTREE_HEAD"),
+    ] {
+        assert_eq!(
+            store.find(query)?.name,
+            expected,
+            "canonicalization that selects a pseudo-ref must preserve that qualification"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn precompose_unicode_journey() -> gix_testtools::TestResult {
     let tmp = gix_testtools::tempfile::TempDir::new()?;
     let precomposed_a = "ä";
     let decomposed_a = "a\u{308}";
     let root = tmp.path().join(decomposed_a);
     std::fs::create_dir(&root)?;
 
-    let store_decomposed = gix_ref::file::Store::at(
+    let store_decomposed = gix_ref::file::Store::at_opts(
         root,
+        crate::fixture_hash_kind(),
         gix_ref::store::init::Options {
             write_reflog: WriteReflog::Always,
-            object_hash: crate::fixture_hash_kind(),
             precompose_unicode: false,
             ..Default::default()
         },
@@ -44,7 +120,7 @@ fn precompose_unicode_journey() -> crate::Result {
         .commit(committer().to_ref(&mut buf))?;
 
     let r = store_decomposed.iter()?.all()?.next().expect("created one ref")?;
-    assert_eq!(r.name.as_bstr(), decomposed_ref, "no transformation happens by default");
+    assert_eq!(r.name, decomposed_ref, "no transformation happens by default");
 
     // For some reason, `tmpfs` can qualify as decomposing, but it then doesn't really work the same as expected here
     // to the point where the precomposed iteration can't find a single reference.
@@ -54,11 +130,11 @@ fn precompose_unicode_journey() -> crate::Result {
         return Ok(());
     }
 
-    let store_precomposed = gix_ref::file::Store::at(
+    let store_precomposed = gix_ref::file::Store::at_opts(
         tmp.path().join(precomposed_a), // it's important that root paths are also precomposed then.
+        crate::fixture_hash_kind(),
         gix_ref::store::init::Options {
             write_reflog: WriteReflog::Always,
-            object_hash: crate::fixture_hash_kind(),
             precompose_unicode: true,
             ..Default::default()
         },
@@ -67,18 +143,17 @@ fn precompose_unicode_journey() -> crate::Result {
     let precomposed_ref = format!("refs/heads/{precomposed_a}");
     let r = store_precomposed.iter()?.all()?.next().expect("created one ref")?;
     assert_eq!(
-        r.name.as_bstr(),
-        precomposed_ref,
+        r.name, precomposed_ref,
         "it transforms all refs it sees to precomposed format, in order to unify it with what we store in packed-refs (precomposed)"
     );
 
     assert_eq!(
-        store_precomposed.find(precomposed_a)?.name.as_bstr(),
+        store_precomposed.find(precomposed_a)?,
         precomposed_ref,
         "can find as precomposed, even though on disk is decomposed it is decomposed"
     );
     assert_eq!(
-        store_precomposed.find(decomposed_a)?.name.as_bstr(),
+        store_precomposed.find(decomposed_a)?,
         decomposed_ref,
         "can find as decomposed, and it keeps it as is to not violate expectations of the returned name being equal to the input (when comparing as bytes)"
     );
@@ -90,8 +165,7 @@ fn precompose_unicode_journey() -> crate::Result {
         .prepare(Some(create_at(&decomposed_ref)), Fail::Immediately, Fail::Immediately)?
         .commit(committer().to_ref(&mut buf))?;
     assert_eq!(
-        edits[0].name.as_bstr(),
-        decomposed_ref,
+        edits[0].name, decomposed_ref,
         "it doesn't alter the composition style to allow input and output to remain unchanged"
     );
 
@@ -121,15 +195,7 @@ fn precompose_unicode_journey() -> crate::Result {
             store_decomposed
                 .loose_iter()?
                 .filter_map(|r| r.ok().filter(|r| r.kind() == gix_ref::Kind::Object))
-                .map(|r| RefEdit {
-                    change: Change::Update {
-                        log: LogChange::default(),
-                        expected: PreviousValue::MustExistAndMatch(r.target.clone()),
-                        new: r.target,
-                    },
-                    name: r.name,
-                    deref: false,
-                }),
+                .map(|r| RefEdit::update(r.name, r.target.clone(), PreviousValue::MustExistAndMatch(r.target), "")),
             Fail::Immediately,
             Fail::Immediately,
         )?
@@ -182,21 +248,18 @@ fn precompose_unicode_journey() -> crate::Result {
         .transaction()
         .prepare(
             // A symref pointing to a decomposed name.
-            Some(RefEdit {
-                change: Change::Update {
-                    log: LogChange::default(),
-                    expected: PreviousValue::MustNotExist,
-                    new: Target::Symbolic(decomposed_ref.clone().try_into().expect("valid name")),
-                },
-                name: "HEAD".try_into().expect("valid name"),
-                deref: false,
-            }),
+            Some(RefEdit::update(
+                "HEAD".try_into().expect("valid name"),
+                Target::Symbolic(decomposed_ref.clone().try_into().expect("valid name")),
+                PreviousValue::MustNotExist,
+                "",
+            )),
             Fail::Immediately,
             Fail::Immediately,
         )?
         .commit(committer().to_ref(&mut buf))?;
     assert_eq!(
-        edits[0].change.new_value().unwrap().try_name().unwrap().as_bstr(),
+        edits[0].change.new_value().unwrap().try_name().unwrap(),
         decomposed_ref,
         "the composition doesn't change, it matches the original edit"
     );
@@ -206,8 +269,7 @@ fn precompose_unicode_journey() -> crate::Result {
             .expect("exists")
             .target
             .try_name()
-            .unwrap()
-            .as_bstr(),
+            .unwrap(),
         decomposed_ref,
         "on disk it's stored in the original format as well"
     );

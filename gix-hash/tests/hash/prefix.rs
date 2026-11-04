@@ -1,3 +1,20 @@
+mod hex_output {
+    use crate::hex_to_id;
+
+    #[test]
+    fn writes_only_the_significant_hex_digits() -> gix_testtools::TestResult {
+        let prefix = gix_hash::Prefix::new(&hex_to_id("abcdefabcdefabcdefabcdefabcdefabcdefabcd"), 7)?;
+        let mut buf = [0; 7];
+        assert_eq!(prefix.hex_to_buf(&mut buf), "abcdefa");
+        assert_eq!(prefix.to_string(), "abcdefa");
+
+        let mut written = Vec::new();
+        prefix.write_hex_to(&mut written)?;
+        assert_eq!(written, b"abcdefa");
+        Ok(())
+    }
+}
+
 mod cmp_oid {
     use std::cmp::Ordering;
 
@@ -138,26 +155,21 @@ mod new {
     #[test]
     fn errors_if_hex_len_is_longer_than_oid_len_in_hex() {
         let kind = Kind::Sha1;
-        assert!(matches!(
-            gix_hash::Prefix::new(&ObjectId::null(kind), kind.len_in_hex() + 1),
-            Err(gix_hash::prefix::Error::TooLong { .. })
-        ));
+        insta::assert_debug_snapshot!(gix_hash::Prefix::new(&ObjectId::null(kind), kind.len_in_hex() + 1)
+                .expect_err("errors if hex len is longer than oid len in hex"), "errors if hex len is longer than oid len in hex", @"An object of kind sha1 cannot be larger than 40 in hex, but 41 was requested");
     }
 
     #[test]
     fn errors_if_hex_len_is_too_short() {
         let kind = Kind::Sha1;
-        assert!(matches!(
-            gix_hash::Prefix::new(&ObjectId::null(kind), 3),
-            Err(gix_hash::prefix::Error::TooShort { .. })
-        ));
+        insta::assert_debug_snapshot!(gix_hash::Prefix::new(&ObjectId::null(kind), 3).expect_err("errors if hex len is too short"), "errors if hex len is too short", @"The minimum hex length of a short object id is 4, got 3");
     }
 }
 
 mod try_from {
     use std::cmp::Ordering;
 
-    use gix_hash::{Prefix, prefix::from_hex::Error};
+    use gix_hash::Prefix;
 
     use crate::hex_to_id;
 
@@ -183,41 +195,49 @@ mod try_from {
     #[test]
     fn id_to_short() {
         let input = "ab";
-        let expected = Error::TooShort { hex_len: 2 };
         let actual = Prefix::try_from(input).unwrap_err();
-        assert_eq!(actual, expected);
+        assert_eq!(
+            actual.to_string(),
+            "The minimum hex length of a short object id is 4, got 2"
+        );
     }
 
     #[test]
     #[cfg(all(not(feature = "sha256"), feature = "sha1"))]
     fn id_too_long() {
         let input = "abcdefabcdefabcdefabcdefabcdefabcdefabcd123123123123123123";
-        let expected = Error::TooLong { hex_len: 58 };
         let actual = Prefix::try_from(input).unwrap_err();
-        assert_eq!(actual, expected);
+        assert_eq!(
+            actual.to_string(),
+            "An id cannot be larger than 40 chars in hex, but 58 was requested"
+        );
     }
 
     #[test]
     fn id_always_too_long() {
         let input = "abcdefabcdefabcdefabcdefabcdefabcdefabcd123123123123123123123123123123";
-        let expected = Error::TooLong { hex_len: 70 };
         let actual = Prefix::try_from(input).unwrap_err();
-        assert_eq!(actual, expected);
+        assert_eq!(
+            actual.to_string(),
+            format!(
+                "An id cannot be larger than {} chars in hex, but 70 was requested",
+                gix_hash::Kind::longest().len_in_hex()
+            )
+        );
     }
 
     #[test]
     fn invalid_chars() {
         let input = "abcdfOsd";
-        let expected = Error::Invalid;
         let actual = Prefix::try_from(input).unwrap_err();
-        assert_eq!(actual, expected);
+        assert_eq!(actual.to_string(), "Invalid hex character");
     }
 }
 
 mod from_hex_nonempty {
     use std::cmp::Ordering;
 
-    use gix_hash::{Prefix, prefix::from_hex::Error};
+    use gix_hash::Prefix;
 
     use crate::hex_to_id;
 
@@ -256,25 +276,67 @@ mod from_hex_nonempty {
     #[test]
     fn id_empty() {
         let input = "";
-        let expected = Error::TooShort { hex_len: 0 };
         let actual = Prefix::from_hex_nonempty(input).unwrap_err();
-        assert_eq!(actual, expected);
+        assert_eq!(
+            actual.to_string(),
+            "The minimum hex length of a short object id is 4, got 0"
+        );
     }
 
     #[test]
     #[cfg(all(not(feature = "sha256"), feature = "sha1"))]
     fn id_too_long() {
         let input = "abcdefabcdefabcdefabcdefabcdefabcdefabcd123123123123123123";
-        let expected = Error::TooLong { hex_len: 58 };
         let actual = Prefix::from_hex_nonempty(input).unwrap_err();
-        assert_eq!(actual, expected);
+        assert_eq!(
+            actual.to_string(),
+            "An id cannot be larger than 40 chars in hex, but 58 was requested"
+        );
     }
 
     #[test]
     fn id_always_too_long() {
         let input = "abcdefabcdefabcdefabcdefabcdefabcdefabcd123123123123123123123123123123";
-        let expected = Error::TooLong { hex_len: 70 };
         let actual = Prefix::from_hex_nonempty(input).unwrap_err();
-        assert_eq!(actual, expected);
+        assert_eq!(
+            actual.to_string(),
+            format!(
+                "An id cannot be larger than {} chars in hex, but 70 was requested",
+                gix_hash::Kind::longest().len_in_hex()
+            )
+        );
+    }
+}
+
+mod reverse_hex {
+    use std::cmp::Ordering;
+
+    use gix_hash::{ChangeId, Prefix};
+
+    #[test]
+    fn matches_change_ids_at_odd_nibbles() -> gix_testtools::TestResult {
+        let full = "zzyxwvutsrqponmlkzyxwvutsrqponmlkzyxwvut";
+        let change_id = ChangeId::from_reverse_hex(full.as_bytes())?;
+        let prefix = Prefix::from_reverse_hex_nonempty("zzy")?;
+
+        assert_eq!(prefix.cmp_oid(&change_id), Ordering::Equal, "zzy matches zzyx...");
+        assert_eq!(prefix.to_reverse_hex().to_string(), "zzy");
+        assert_eq!(Prefix::from(change_id).to_reverse_hex().to_string(), full);
+        Ok(())
+    }
+
+    #[test]
+    fn validates_reverse_hex_like_forward_hex() -> gix_testtools::TestResult {
+        insta::assert_debug_snapshot!(Prefix::from_reverse_hex("zzy")
+                .expect_err("three digits are below the safe minimum"), "validates reverse hex like forward hex", @"The minimum hex length of a short object id is 4, got 3");
+        let prefix = Prefix::from_reverse_hex("ZZYX")?;
+        assert_eq!(
+            prefix.to_reverse_hex().to_string(),
+            "zzyx",
+            "output is canonical lowercase"
+        );
+        insta::assert_debug_snapshot!(Prefix::from_reverse_hex_nonempty("jj")
+                .expect_err("j is outside the reverse alphabet"), "validates reverse hex like forward hex", @"Invalid hex character");
+        Ok(())
     }
 }

@@ -163,11 +163,10 @@ fn split_time_and_offset(input: &str) -> (&str, &str) {
     }
 
     // Look for + or - that indicates timezone (not part of time)
-    // Time format is HH:MM:SS or HHMMSS, so offset starts after that
-    // Find the last + or - that's after position 5 (minimum for HH:MM)
+    // The time never contains a sign, so an offset starts no earlier than after `HH`.
     let mut offset_start = None;
     for (i, c) in input.char_indices().rev() {
-        if (c == '+' || c == '-') && i >= 5 {
+        if (c == '+' || c == '-') && i >= 2 {
             // Check if this looks like an offset (followed by digits)
             let after = &input[i + 1..];
             if after.chars().next().is_some_and(|c| c.is_ascii_digit()) {
@@ -178,12 +177,12 @@ fn split_time_and_offset(input: &str) -> (&str, &str) {
     }
 
     // Also handle space-separated offset
-    if let Some(space_pos) = input.rfind(' ') {
-        if space_pos > 5 {
-            let potential_offset = input[space_pos + 1..].trim();
-            if potential_offset.starts_with('+') || potential_offset.starts_with('-') || potential_offset == "Z" {
-                return (&input[..space_pos], potential_offset);
-            }
+    if let Some(space_pos) = input.rfind(' ')
+        && space_pos > 5
+    {
+        let potential_offset = input[space_pos + 1..].trim();
+        if potential_offset.starts_with('+') || potential_offset.starts_with('-') || potential_offset == "Z" {
+            return (&input[..space_pos], potential_offset);
         }
     }
 
