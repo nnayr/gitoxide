@@ -1,4 +1,4 @@
-//! Push support for [`Remote`][crate::Remote]s, mirroring [`fetch`][crate::remote::fetch] for the
+//! Push support for [`Remote`][crate::Remote]s, mirroring [`fetch`] for the
 //! send (`git push`) direction: where fetch **receives** a pack, push **sends** one via
 //! `gix_protocol::push`.
 //!
@@ -24,9 +24,9 @@ pub use super::connection::push::plan;
 pub use super::connection::push::plan::{
     Force, Lease, LeasePolicy, Mapping, PlannedUpdates, Source, SpecIndex, Verdict,
 };
-/// The orchestration surface (`gpx08`): the [`Prepare`](super::connection::push::send_pack::Prepare)
+/// The orchestration surface (`gpx08`): the [`Prepare`]
 /// builder returned by [`Connection::prepare_push`](crate::remote::Connection::prepare_push), and the
-/// [`Outcome`](super::connection::push::send_pack::Outcome)/[`Status`](super::connection::push::send_pack::Status)
+/// [`Outcome`]/[`Status`]
 /// it produces. `refs` (the tracking-ref bookkeeping) lands with `gpx09`.
 #[cfg(any(feature = "blocking-network-client", feature = "async-network-client"))]
 pub use super::connection::push::send_pack::{Outcome, Prepare, Status};
