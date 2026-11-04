@@ -7,7 +7,7 @@ file = "docs/review/layout.md"
 lenses = ["placement"]
 
 [overlay]
-upstream = "origin/main"
+upstream = "upstream/main"
 integration = "main"
 prefix = "gix"
 
