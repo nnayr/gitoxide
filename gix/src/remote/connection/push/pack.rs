@@ -384,7 +384,10 @@ where
             return Err(Error::Interrupted);
         }
         let written = written.map_err(|err| {
-            if err.iter_errors().any(|cause| cause.is::<EntryGenerationFailed>()) {
+            if err
+                .iter_errors()
+                .any(<dyn std::error::Error>::is::<EntryGenerationFailed>)
+            {
                 Error::IterEntries(err)
             } else {
                 Error::PackWrite(err)
