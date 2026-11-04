@@ -10,7 +10,7 @@ use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use bstr::BString;
-use gix_features::progress::DynNestedProgress;
+use gix_utils::progress::DynNestedProgress;
 
 use crate::push::{Outcome, RefUpdate, response::parse_report};
 use crate::transport::client::async_io::{ExtendedBufRead, HandleProgress};

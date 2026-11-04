@@ -13,7 +13,6 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicBool;
 
 use bstr::{BStr, ByteSlice};
-use gix_features::progress::{Discard, DynNestedProgress};
 use gix_hash::ObjectId;
 use gix_protocol::Handshake;
 use gix_protocol::handshake::Ref;
@@ -26,6 +25,7 @@ use gix_protocol::transport::packetline::PacketLineRef;
 #[cfg(feature = "blocking-client")]
 use gix_protocol::transport::packetline::blocking_io::StreamingPeekableIter;
 use gix_protocol::transport::{Protocol, Service};
+use gix_utils::progress::{Discard, DynNestedProgress};
 
 pub const REF: &str = "refs/rolfdb/data";
 
@@ -245,10 +245,7 @@ impl TransportWithoutIO for MockTransport {
     fn connection_persists_across_multiple_requests(&self) -> bool {
         false
     }
-    fn configure(
-        &mut self,
-        _config: &dyn std::any::Any,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    fn configure(&mut self, _config: &dyn std::any::Any) -> gix_error::Result<()> {
         Ok(())
     }
 }
@@ -421,20 +418,20 @@ impl CaptureProgress {
 }
 
 #[cfg(feature = "blocking-client")]
-impl gix_features::progress::Count for CaptureProgress {
+impl gix_utils::progress::Count for CaptureProgress {
     fn set(&self, _step: usize) {}
     fn step(&self) -> usize {
         0
     }
     fn inc_by(&self, _step: usize) {}
-    fn counter(&self) -> gix_features::progress::StepShared {
+    fn counter(&self) -> gix_utils::progress::StepShared {
         std::sync::Arc::new(std::sync::atomic::AtomicUsize::default())
     }
 }
 
 #[cfg(feature = "blocking-client")]
-impl gix_features::progress::Progress for CaptureProgress {
-    fn init(&mut self, _max: Option<usize>, _unit: Option<gix_features::progress::Unit>) {
+impl gix_utils::progress::Progress for CaptureProgress {
+    fn init(&mut self, _max: Option<usize>, _unit: Option<gix_utils::progress::Unit>) {
         self.record("init", String::new());
     }
     fn set_max(&mut self, _max: Option<usize>) -> Option<usize> {
@@ -446,21 +443,21 @@ impl gix_features::progress::Progress for CaptureProgress {
     fn name(&self) -> Option<String> {
         None
     }
-    fn id(&self) -> gix_features::progress::Id {
-        gix_features::progress::UNKNOWN
+    fn id(&self) -> gix_utils::progress::Id {
+        gix_utils::progress::UNKNOWN
     }
-    fn message(&self, level: gix_features::progress::MessageLevel, message: String) {
+    fn message(&self, level: gix_utils::progress::MessageLevel, message: String) {
         self.record(&format!("msg:{level:?}"), message);
     }
 }
 
 #[cfg(feature = "blocking-client")]
-impl gix_features::progress::NestedProgress for CaptureProgress {
+impl gix_utils::progress::NestedProgress for CaptureProgress {
     type SubProgress = Self;
     fn add_child(&mut self, _name: impl Into<String>) -> Self {
         self.clone()
     }
-    fn add_child_with_id(&mut self, _name: impl Into<String>, _id: gix_features::progress::Id) -> Self {
+    fn add_child_with_id(&mut self, _name: impl Into<String>, _id: gix_utils::progress::Id) -> Self {
         self.clone()
     }
 }
@@ -478,7 +475,7 @@ pub fn run_push_ok_opts_with_progress<P>(
     progress: P,
 ) -> Outcome
 where
-    P: gix_features::progress::NestedProgress,
+    P: gix_utils::progress::NestedProgress,
     P::SubProgress: 'static,
 {
     let mut hs = handshake(capabilities, refs);
@@ -655,10 +652,7 @@ impl TransportWithoutIO for AsyncMockTransport {
     fn connection_persists_across_multiple_requests(&self) -> bool {
         false
     }
-    fn configure(
-        &mut self,
-        _config: &dyn std::any::Any,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    fn configure(&mut self, _config: &dyn std::any::Any) -> gix_error::Result<()> {
         Ok(())
     }
 }
@@ -1587,7 +1581,9 @@ pub fn remote_has_ref(remote: &Path, refname: &str) -> bool {
 #[cfg(feature = "blocking-client")]
 pub fn handshake_over_url(
     url: &str,
-    auth: impl FnMut(gix_protocol::credentials::helper::Action) -> gix_protocol::credentials::protocol::Result,
+    auth: impl FnMut(
+        gix_protocol::credentials::helper::Action,
+    ) -> gix_error::Result<Option<gix_protocol::credentials::protocol::Outcome>>,
 ) -> Handshake {
     use gix_protocol::transport::client::blocking_io::connect;
     let mut transport = connect::connect(
@@ -1611,7 +1607,9 @@ pub fn push_over_url(
     updates: &[RefUpdate],
     pack: Option<Vec<u8>>,
     opts: Options,
-    mut auth: impl FnMut(gix_protocol::credentials::helper::Action) -> gix_protocol::credentials::protocol::Result,
+    mut auth: impl FnMut(
+        gix_protocol::credentials::helper::Action,
+    ) -> gix_error::Result<Option<gix_protocol::credentials::protocol::Outcome>>,
 ) -> Result<Outcome, Error> {
     use gix_protocol::transport::client::blocking_io::connect;
     let mut transport = connect::connect(
@@ -1652,7 +1650,9 @@ pub fn push_over_url(
 
 /// The panicking auth closure for transports that must never request credentials (git://, file://).
 #[cfg(feature = "blocking-client")]
-pub fn no_auth(_action: gix_protocol::credentials::helper::Action) -> gix_protocol::credentials::protocol::Result {
+pub fn no_auth(
+    _action: gix_protocol::credentials::helper::Action,
+) -> gix_error::Result<Option<gix_protocol::credentials::protocol::Outcome>> {
     unreachable!("this transport must not request credentials")
 }
 
@@ -2432,7 +2432,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(push_https_test)]
 pub fn static_credentials(
     action: gix_protocol::credentials::helper::Action,
-) -> gix_protocol::credentials::protocol::Result {
+) -> gix_error::Result<Option<gix_protocol::credentials::protocol::Outcome>> {
     use gix_protocol::credentials::helper::Action;
     match action {
         Action::Get(ctx) => Ok(Some(gix_protocol::credentials::protocol::Outcome {

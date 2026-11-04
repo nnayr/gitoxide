@@ -2,7 +2,7 @@
 
 use std::sync::atomic::AtomicBool;
 
-use gix_features::progress::DynNestedProgress;
+use gix_utils::progress::DynNestedProgress;
 
 use crate::push::{Context, Error, Options, Outcome, RefUpdate, command, response};
 use crate::transport::client::{self, blocking_io::Transport};
@@ -33,7 +33,7 @@ pub fn push<P, T, E>(
     opts: Options,
 ) -> Result<Outcome, Error>
 where
-    P: gix_features::progress::NestedProgress,
+    P: gix_utils::progress::NestedProgress,
     P::SubProgress: 'static,
     T: Transport,
     E: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,

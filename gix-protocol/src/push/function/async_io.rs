@@ -11,7 +11,7 @@
 
 use std::sync::atomic::AtomicBool;
 
-use gix_features::progress::DynNestedProgress;
+use gix_utils::progress::DynNestedProgress;
 
 use crate::futures_lite::AsyncWriteExt;
 use crate::push::{Context, Error, Options, Outcome, RefUpdate, command, response};
@@ -45,7 +45,7 @@ pub async fn push<P, T, E>(
     opts: Options,
 ) -> Result<Outcome, Error>
 where
-    P: gix_features::progress::NestedProgress,
+    P: gix_utils::progress::NestedProgress,
     P::SubProgress: 'static,
     T: Transport,
     E: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,

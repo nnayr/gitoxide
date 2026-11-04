@@ -17,7 +17,7 @@
 //! type-checks them (including the concrete `AsyncFnOnce` instantiation), which is the whole proof.
 //!
 //! NOTE on the progress arg: the real M1 signature's middle parameter is
-//! `&mut dyn gix_features::progress::DynNestedProgress`. `gix-features` is a normal (non-dev)
+//! `&mut dyn gix_utils::progress::DynNestedProgress`. `gix-utils` is a normal (non-dev)
 //! dependency of `gix-protocol`, so it is not nameable from an integration test, and adding it as
 //! a dev-dependency would break the additive-only fork invariant (§4.3). We substitute a nameable
 //! stand-in (`&mut dyn std::io::Write`) so the closure keeps L7's exact 3-arg arity; the async

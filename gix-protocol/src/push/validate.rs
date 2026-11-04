@@ -35,10 +35,9 @@ pub struct Advertised {
 }
 
 /// The error returned by [`plan_from_advertisement`].
-#[derive(Debug, thiserror::Error)]
-#[allow(missing_docs)]
+#[derive(Debug)]
+#[expect(missing_docs)]
 pub enum Error {
-    #[error("stale lease for {name}: expected the server to advertise {expected:?}, but it advertised {actual:?}")]
     StaleLease {
         name: FullName,
         expected: Option<ObjectId>,
@@ -46,9 +45,22 @@ pub enum Error {
     },
 }
 
-impl crate::transport::IsSpuriousError for Error {
-    fn is_spurious(&self) -> bool {
-        false
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::StaleLease { name, expected, actual } => write!(
+                f,
+                "stale lease for {name}: expected the server to advertise {expected:?}, but it advertised {actual:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::StaleLease { .. } => Some(const { &gix_error::ClassificationMarker::CONFLICT }),
+        }
     }
 }
 

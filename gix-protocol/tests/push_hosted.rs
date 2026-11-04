@@ -35,7 +35,7 @@ mod push {
 
         fn hosted_credentials(
             action: gix_protocol::credentials::helper::Action,
-        ) -> gix_protocol::credentials::protocol::Result {
+        ) -> gix_error::Result<Option<gix_protocol::credentials::protocol::Outcome>> {
             use gix_protocol::credentials::helper::Action;
             match action {
                 Action::Get(ctx) => Ok(Some(gix_protocol::credentials::protocol::Outcome {

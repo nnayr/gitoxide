@@ -27,7 +27,7 @@ pub(crate) use async_io::parse;
 /// The progress id for the `remote` child progress a side-band-64k report demux routes band 2 (and
 /// band 3, as an error) into (§3.5, M3) — the push analogue of fetch's `ProgressId::RemoteProgress`.
 #[allow(dead_code)] // consumed by the sideband reader twins only
-pub(crate) const REMOTE_PROGRESS_ID: gix_features::progress::Id = *b"PSRP";
+pub(crate) const REMOTE_PROGRESS_ID: gix_utils::progress::Id = *b"PSRP";
 
 /// Extra per-ref detail from report-status-v2 `option` lines — informational, never branched on.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -41,22 +41,43 @@ pub struct RefUpdateDetails {
 }
 
 /// The error returned by the report-status parser.
-#[derive(Debug, thiserror::Error)]
-#[allow(missing_docs)]
+#[derive(Debug)]
+#[expect(missing_docs)]
 pub enum Error {
-    #[error("the report-status did not begin with an 'unpack' line")]
     MissingUnpackStatus,
-    #[error("could not parse the report-status line {line:?}")]
     Malformed { line: BString },
-    #[error("the per-ref status for {name:?} is missing, or a status was reported for a ref that was never sent")]
     MissingRefStatus { name: BString },
-    #[error("an I/O error occurred while reading the report-status")]
-    Io(#[from] std::io::Error),
+    Io(std::io::Error),
 }
 
-impl crate::transport::IsSpuriousError for Error {
-    fn is_spurious(&self) -> bool {
-        false
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::MissingUnpackStatus => f.write_str("the report-status did not begin with an 'unpack' line"),
+            Error::Malformed { line } => write!(f, "could not parse the report-status line {line:?}"),
+            Error::MissingRefStatus { name } => write!(
+                f,
+                "the per-ref status for {name:?} is missing, or a status was reported for a ref that was never sent"
+            ),
+            Error::Io(_) => f.write_str("an I/O error occurred while reading the report-status"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::MissingUnpackStatus | Error::Malformed { .. } | Error::MissingRefStatus { .. } => {
+                Some(const { &gix_error::ClassificationMarker::CORRUPTION })
+            }
+            Error::Io(err) => Some(err),
+        }
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Self {
+        Error::Io(err)
     }
 }
 
