@@ -250,7 +250,8 @@ pub(crate) mod function {
         Ok(match name_or_url {
             Some(name) => match repo.try_find_remote(name).and_then(std::result::Result::ok) {
                 Some(remote) => remote,
-                None => repo.remote_at(gix::url::parse(name)?)?,
+                None => repo
+                    .remote_at(gix::url::parse(name).or_raise(|| message("remote name could not be parsed as URL"))?)?,
             },
             None => repo
                 .head()?
@@ -1787,6 +1788,18 @@ refs/heads/done:refs/heads/done
             assert_eq!(
                 remote.url(gix::remote::Direction::Push).map(gix::Url::to_bstring),
                 Some(BString::from("https://example.com/explicit"))
+            );
+        }
+
+        #[test]
+        fn defaulting_unparsable_remote_argument_says_it_could_not_be_parsed_as_url() {
+            let (_g, repo) = TmpRepo::new("");
+            let err =
+                by_name_or_url_for_push(&repo, Some("")).expect_err("an empty remote is neither a name nor a URL");
+            assert!(
+                error_chain(&err).contains("remote name could not be parsed as URL"),
+                "mirrors `find_fetch_remote`'s context for the same failure: {}",
+                error_chain(&err)
             );
         }
 
