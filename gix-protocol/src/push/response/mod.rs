@@ -144,10 +144,10 @@ pub(crate) fn parse_report(
             last_ok = None;
         } else if let Some(rest) = payload.strip_prefix(b"option ") {
             // report-status-v2 telemetry — attach to the most recent `ok`, tolerate otherwise.
-            if let Some(idx) = last_ok {
-                if let RefUpdateStatus::Ok { details, .. } = &mut statuses[idx] {
-                    apply_option(details.get_or_insert_with(RefUpdateDetails::default), rest);
-                }
+            if let Some(idx) = last_ok
+                && let RefUpdateStatus::Ok { details, .. } = &mut statuses[idx]
+            {
+                apply_option(details.get_or_insert_with(RefUpdateDetails::default), rest);
             }
         } else {
             // Unknown/trailing lines are tolerated for forward-compatibility (git's lenient client).
