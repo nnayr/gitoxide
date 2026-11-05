@@ -1297,9 +1297,12 @@ mod tests {
     #[test]
     fn erased_pack_errors_render_their_causes_on_one_line() {
         use gix_error::ErrorExt;
-        let cause = gix_error::message("root cause")
-            .raise()
-            .and_raise(gix_error::message("outer context"));
+        let build_nested_error = || {
+            gix_error::message("root cause")
+                .raise()
+                .and_raise(gix_error::message("outer context"))
+        };
+        let cause = build_nested_error();
         for err in [
             Error::Find(cause),
             Error::PackWrite(gix_error::message("root cause").raise()),
@@ -1308,11 +1311,11 @@ mod tests {
             assert!(!text.contains('\n'), "a single line in every error mode: {text:?}");
             assert!(text.contains("root cause"), "the cause is named: {text:?}");
         }
-        let nested = Error::Find(
-            gix_error::message("root cause")
-                .raise()
-                .and_raise(gix_error::message("outer context")),
+        let nested = Error::Find(build_nested_error());
+        assert_eq!(
+            nested.to_string(),
+            "outer context: root cause",
+            "an erased error renders its causes as one `: `-joined line"
         );
-        assert_eq!(nested.to_string(), "outer context: root cause");
     }
 }
