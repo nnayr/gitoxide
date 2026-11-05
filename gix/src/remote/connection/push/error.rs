@@ -41,7 +41,7 @@ pub enum Error {
     /// `gix_protocol::push` closure and re-raises the closure's typed error through a side channel
     /// (the plumbing itself erases it into `WritePack(Box<dyn Error>)`, which `send()` replaces with the
     /// typed error). This includes a failure while streaming the pack bytes to the transport, which is
-    /// [`pack::Error::PackWrite`](super::pack::Error::PackWrite). Never classified as retryable: every
+    /// `pack::Error::PackWrite`. Never classified as retryable: every
     /// `pack::Error` hides its cause from classification.
     Pack(super::pack::Error),
     /// A dedicated pack-capable object store could not be opened to build the pack (see
